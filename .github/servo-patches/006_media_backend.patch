@@ -305,10 +305,10 @@ index 0000000..ed1f9fe
 +}
 diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
 new file mode 100644
-index 0000000..83d19f3
+index 0000000..4e0bb60
 --- /dev/null
 +++ b/components/media/backends/android/android_impl/player.rs
-@@ -0,0 +1,1367 @@
+@@ -0,0 +1,1409 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -328,8 +328,10 @@ index 0000000..83d19f3
 +//!
 +//! Deliberate limitations of this milestone:
 +//! - Playback rates other than 1.0 are rejected with an error.
-+//! - Android audio focus and audio-route changes are NOT handled: playback
-+//!   does not duck or pause for other apps, calls or output switches.
++//! - Audio focus / becoming-noisy are handled by `crate::focus` (pause on
++//!   loss, auto-resume only after a transient loss, duck to 20% gain). The
++//!   AudioManager request lives app-side (MediaFocus.kt). Output-device
++//!   routing beyond becoming-noisy is left to the system default route.
 +//! - MSE/EME/WebRTC/MediaStreams are out of scope (dummy/stubbed).
 +//! - Video frames reach the CPU through an AImageReader surface in
 +//!   YUV_420_888 and are read with explicit plane row/pixel strides (the
@@ -352,6 +354,7 @@ index 0000000..83d19f3
 +use yuv::{YuvPlanarImage, YuvRange, YuvStandardMatrix, yuv420_to_bgra};
 +
 +use crate::buffer::SharedBuffer;
++use crate::focus::{self, Action as FocusAction, FocusTracker, Hold};
 +use super::source::MediaSourceWrapper;
 +use super::sys;
 +use crate::yuv_pack::{Planes, pack_i420};
@@ -730,7 +733,6 @@ index 0000000..83d19f3
 +struct TrackDecoder {
 +    codec: *mut sys::AMediaCodec,
 +    track_index: usize,
-+    is_video: bool,
 +    /// Video only: the decoder renders into this reader's surface; frames are
 +    /// read back as AImage with explicit plane strides. Null for audio.
 +    image_reader: *mut sys::AImageReader,
@@ -814,6 +816,8 @@ index 0000000..83d19f3
 +    pending_sample: Option<(usize, usize, i64)>, // (track_index, len, pts); bytes in staging
 +    extractor_eos: bool,
 +    last_position_event: Instant,
++    focus: FocusTracker,
++    focus_counted: bool,
 +}
 +
 +impl Pipeline {
@@ -840,6 +844,8 @@ index 0000000..83d19f3
 +            pending_sample: None,
 +            extractor_eos: false,
 +            last_position_event: Instant::now(),
++            focus: FocusTracker::new(focus::noisy_epoch()),
++            focus_counted: false,
 +        }
 +    }
 +
@@ -938,7 +944,7 @@ index 0000000..83d19f3
 +        }
 +
 +        warn!(
-+            "android media backend: audio focus, audio route changes and playback rates other than 1.0 are not handled in this milestone"
++            "android media backend: playback rates other than 1.0 are not handled in this milestone"
 +        );
 +
 +        // Create and start decoders. The track's own AMediaFormat carries the
@@ -1064,7 +1070,6 @@ index 0000000..83d19f3
 +        let decoder = TrackDecoder {
 +            codec,
 +            track_index,
-+            is_video,
 +            image_reader,
 +            sample_rate: if is_video {
 +                0
@@ -1092,7 +1097,8 @@ index 0000000..83d19f3
 +                    return; // Shutdown
 +                }
 +            }
-+            if self.shared.get().paused {
++            self.focus_tick();
++            if self.shared.get().paused || self.focus.hold != Hold::None {
 +                // Blocked wait on the shared condvar for resume/shutdown; the
 +                // shared state update signals it. Also poll the command
 +                // channel so seek-while-paused works.
@@ -1127,11 +1133,43 @@ index 0000000..83d19f3
 +        }
 +    }
 +
++    /// Applies audio-focus / route policy and publishes whether this player
++    /// currently wants audio focus (read by the app-side MediaFocus bridge).
++    fn focus_tick(&mut self) {
++        let st = self.shared.get();
++        match self
++            .focus
++            .step(st.paused, focus::focus(), focus::noisy_epoch())
++        {
++            FocusAction::Pause => {
++                self.clock.pause();
++                if !self.aaudio.is_null() {
++                    unsafe { sys::AAudioStream_requestStop(self.aaudio) };
++                }
++                send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Paused));
++            },
++            FocusAction::Resume => {
++                self.clock.resume();
++                if !self.aaudio.is_null() {
++                    unsafe { sys::AAudioStream_requestStart(self.aaudio) };
++                }
++                send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Playing));
++            },
++            FocusAction::None => {},
++        }
++        let silent = st.muted || st.volume <= 0.0;
++        let want = self
++            .focus
++            .wants_focus(st.paused, silent, self.audio.is_some());
++        focus::set_counted(&mut self.focus_counted, want);
++    }
++
 +    /// Returns false when the pipeline should exit.
 +    fn handle_cmd(&mut self, cmd: PipelineCmd) -> bool {
 +        match cmd {
 +            PipelineCmd::Shutdown => return false,
 +            PipelineCmd::Play => {
++                self.focus.page_command();
 +                self.clock.resume();
 +                if !self.aaudio.is_null() {
 +                    unsafe { sys::AAudioStream_requestStart(self.aaudio) };
@@ -1139,6 +1177,7 @@ index 0000000..83d19f3
 +                send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Playing));
 +            },
 +            PipelineCmd::Pause => {
++                self.focus.page_command();
 +                self.clock.pause();
 +                if !self.aaudio.is_null() {
 +                    unsafe { sys::AAudioStream_requestStop(self.aaudio) };
@@ -1190,11 +1229,12 @@ index 0000000..83d19f3
 +            )
 +        };
 +        self.clock.rebase(target_us);
-+        if self.shared.get().paused {
++        let held = self.focus.hold != Hold::None;
++        if self.shared.get().paused || held {
 +            // rebase restarts the wall clock; freeze it again while paused.
 +            self.clock.pause();
 +        }
-+        if !self.aaudio.is_null() && !self.shared.get().paused {
++        if !self.aaudio.is_null() && !self.shared.get().paused && !held {
 +            unsafe { sys::AAudioStream_requestStart(self.aaudio) };
 +        }
 +        send_event(&self.sender, PlayerEvent::SeekDone(time));
@@ -1510,10 +1550,11 @@ index 0000000..83d19f3
 +                let st = self.shared.get();
 +                let samples: Vec<i16> = if st.muted || st.volume <= 0.0 {
 +                    vec![0i16; pcm.len()]
-+                } else if (st.volume - 1.0).abs() > f64::EPSILON {
++                } else if (st.volume as f32 * focus::gain() - 1.0).abs() > f32::EPSILON {
++                    let gain = st.volume as f32 * focus::gain();
 +                    pcm.iter()
 +                        .map(|s| {
-+                            (*s as f32 * st.volume as f32)
++                            (*s as f32 * gain)
 +                                .round()
 +                                .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 +                        })
@@ -1642,6 +1683,7 @@ index 0000000..83d19f3
 +        // Unblock any readAt still waiting in an extractor thread before
 +        // tearing the extractor down.
 +        self.buffer.cancel();
++        focus::set_counted(&mut self.focus_counted, false);
 +        if let Some(video) = self.video.take() {
 +            unsafe {
 +                sys::AMediaCodec_stop(video.codec);
@@ -2105,10 +2147,10 @@ index 0000000..e7a3f78
 +pub const AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED: media_status_t = -30002;
 diff --git a/components/media/backends/android/buffer.rs b/components/media/backends/android/buffer.rs
 new file mode 100644
-index 0000000..7a717ac
+index 0000000..b5b8231
 --- /dev/null
 +++ b/components/media/backends/android/buffer.rs
-@@ -0,0 +1,395 @@
+@@ -0,0 +1,391 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -2250,10 +2292,6 @@ index 0000000..7a717ac
 +        let mut st = self.state.lock().unwrap();
 +        st.cancelled = true;
 +        self.cond.notify_all();
-+    }
-+
-+    pub fn is_cancelled(&self) -> bool {
-+        self.state.lock().unwrap().cancelled
 +    }
 +
 +    /// Buffered window as (head, len) for buffered() reporting.
@@ -2504,6 +2542,261 @@ index 0000000..7a717ac
 +        assert_eq!(d2, None, "no duplicate NeedData while request active");
 +    }
 +}
+diff --git a/components/media/backends/android/focus.rs b/components/media/backends/android/focus.rs
+new file mode 100644
+index 0000000..037ec08
+--- /dev/null
++++ b/components/media/backends/android/focus.rs
+@@ -0,0 +1,249 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Audio-focus and audio-route policy for the Android media backend.
++//!
++//! Android audio focus is a Java-only API (AudioManager), so the policy is
++//! split: the app side (`MediaFocus.kt`) owns the AudioManager request and
++//! forwards focus changes and ACTION_AUDIO_BECOMING_NOISY through the three
++//! JNI entry points below; this module owns process-wide state and a pure
++//! per-player decision machine (`FocusTracker`) that is host-tested.
++//!
++//! The app side learns whether it should hold focus by reading
++//! `active_audio_players()`: the number of players that currently want to
++//! make sound (not paused by the page, not muted, not permanently displaced).
++
++use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
++
++pub const FOCUS_GRANTED: u8 = 0;
++pub const FOCUS_LOST_TRANSIENT: u8 = 1;
++pub const FOCUS_LOST: u8 = 2;
++pub const FOCUS_DUCK: u8 = 3;
++
++/// Output gain while another app asked us to duck.
++pub const DUCK_GAIN: f32 = 0.2;
++
++static FOCUS: AtomicU8 = AtomicU8::new(FOCUS_GRANTED);
++static NOISY_EPOCH: AtomicU32 = AtomicU32::new(0);
++static ACTIVE_AUDIO: AtomicUsize = AtomicUsize::new(0);
++
++pub fn set_focus(state: u8) {
++    FOCUS.store(state.min(FOCUS_DUCK), Ordering::SeqCst);
++}
++
++pub fn focus() -> u8 {
++    FOCUS.load(Ordering::SeqCst)
++}
++
++pub fn signal_noisy() {
++    NOISY_EPOCH.fetch_add(1, Ordering::SeqCst);
++}
++
++pub fn noisy_epoch() -> u32 {
++    NOISY_EPOCH.load(Ordering::SeqCst)
++}
++
++pub fn active_audio_players() -> usize {
++    ACTIVE_AUDIO.load(Ordering::SeqCst)
++}
++
++pub fn gain() -> f32 {
++    if focus() == FOCUS_DUCK { DUCK_GAIN } else { 1.0 }
++}
++
++/// Adjusts the active-player count; `counted` is the caller's own flag so a
++/// player can never contribute twice or leak a count on drop.
++pub fn set_counted(counted: &mut bool, want: bool) {
++    if *counted == want {
++        return;
++    }
++    *counted = want;
++    if want {
++        ACTIVE_AUDIO.fetch_add(1, Ordering::SeqCst);
++    } else {
++        ACTIVE_AUDIO.fetch_sub(1, Ordering::SeqCst);
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Hold {
++    None,
++    /// Paused for a transient loss; resumes by itself on regain.
++    Transient,
++    /// Paused for a permanent loss or route change; only the page resumes.
++    Permanent,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Action {
++    None,
++    Pause,
++    Resume,
++}
++
++/// Per-player decision machine. Feed it the current inputs on every loop
++/// turn; it returns the one transition to apply.
++pub struct FocusTracker {
++    pub hold: Hold,
++    seen_noisy: u32,
++}
++
++impl FocusTracker {
++    pub fn new(noisy_epoch: u32) -> Self {
++        FocusTracker { hold: Hold::None, seen_noisy: noisy_epoch }
++    }
++
++    /// The page paused or resumed explicitly: that overrides any hold.
++    pub fn page_command(&mut self) {
++        self.hold = Hold::None;
++    }
++
++    /// Whether this player wants focus (and so should count as active).
++    pub fn wants_focus(&self, page_paused: bool, silent: bool, has_audio: bool) -> bool {
++        has_audio && !silent && !page_paused && self.hold != Hold::Permanent
++    }
++
++    pub fn step(&mut self, page_paused: bool, focus: u8, noisy_epoch: u32) -> Action {
++        let noisy = noisy_epoch != self.seen_noisy;
++        self.seen_noisy = noisy_epoch;
++        if page_paused {
++            return Action::None;
++        }
++        if noisy && self.hold != Hold::Permanent {
++            let was_held = self.hold != Hold::None;
++            self.hold = Hold::Permanent;
++            return if was_held { Action::None } else { Action::Pause };
++        }
++        match (focus, self.hold) {
++            (FOCUS_LOST_TRANSIENT, Hold::None) => {
++                self.hold = Hold::Transient;
++                Action::Pause
++            },
++            (FOCUS_LOST, Hold::None) => {
++                self.hold = Hold::Permanent;
++                Action::Pause
++            },
++            (FOCUS_LOST, Hold::Transient) => {
++                self.hold = Hold::Permanent;
++                Action::None
++            },
++            (FOCUS_GRANTED | FOCUS_DUCK, Hold::Transient) => {
++                self.hold = Hold::None;
++                Action::Resume
++            },
++            _ => Action::None,
++        }
++    }
++}
++
++// JNI entry points for me.ik.argon.MediaFocus. Plain C ABI on raw pointers:
++// no jni crate dependency, the env/class arguments are unused.
++#[cfg(target_os = "android")]
++mod jni_exports {
++    use std::ffi::c_void;
++
++    #[unsafe(no_mangle)]
++    pub extern "system" fn Java_me_ik_argon_MediaFocus_nativeActiveAudioPlayers(
++        _env: *mut c_void,
++        _class: *mut c_void,
++    ) -> i32 {
++        super::active_audio_players().min(i32::MAX as usize) as i32
++    }
++
++    #[unsafe(no_mangle)]
++    pub extern "system" fn Java_me_ik_argon_MediaFocus_nativeSetFocus(
++        _env: *mut c_void,
++        _class: *mut c_void,
++        state: i32,
++    ) {
++        super::set_focus(state.clamp(0, 3) as u8);
++    }
++
++    #[unsafe(no_mangle)]
++    pub extern "system" fn Java_me_ik_argon_MediaFocus_nativeBecomingNoisy(
++        _env: *mut c_void,
++        _class: *mut c_void,
++    ) {
++        super::signal_noisy();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn transient_loss_pauses_then_auto_resumes() {
++        let mut t = FocusTracker::new(0);
++        assert_eq!(t.step(false, FOCUS_LOST_TRANSIENT, 0), Action::Pause);
++        assert_eq!(t.step(false, FOCUS_LOST_TRANSIENT, 0), Action::None);
++        assert!(t.wants_focus(false, false, true));
++        assert_eq!(t.step(false, FOCUS_GRANTED, 0), Action::Resume);
++        assert_eq!(t.hold, Hold::None);
++    }
++
++    #[test]
++    fn permanent_loss_never_auto_resumes() {
++        let mut t = FocusTracker::new(0);
++        assert_eq!(t.step(false, FOCUS_LOST, 0), Action::Pause);
++        assert!(!t.wants_focus(false, false, true));
++        assert_eq!(t.step(false, FOCUS_GRANTED, 0), Action::None);
++        assert_eq!(t.hold, Hold::Permanent);
++        t.page_command();
++        assert_eq!(t.hold, Hold::None);
++    }
++
++    #[test]
++    fn transient_then_permanent_stays_paused() {
++        let mut t = FocusTracker::new(0);
++        assert_eq!(t.step(false, FOCUS_LOST_TRANSIENT, 0), Action::Pause);
++        assert_eq!(t.step(false, FOCUS_LOST, 0), Action::None);
++        assert_eq!(t.step(false, FOCUS_GRANTED, 0), Action::None);
++        assert_eq!(t.hold, Hold::Permanent);
++    }
++
++    #[test]
++    fn becoming_noisy_pauses_without_auto_resume() {
++        let mut t = FocusTracker::new(5);
++        assert_eq!(t.step(false, FOCUS_GRANTED, 5), Action::None);
++        assert_eq!(t.step(false, FOCUS_GRANTED, 6), Action::Pause);
++        assert_eq!(t.step(false, FOCUS_GRANTED, 6), Action::None);
++        assert_eq!(t.hold, Hold::Permanent);
++    }
++
++    #[test]
++    fn page_paused_player_ignores_focus_and_noise() {
++        let mut t = FocusTracker::new(0);
++        assert_eq!(t.step(true, FOCUS_LOST, 3), Action::None);
++        assert_eq!(t.hold, Hold::None);
++    }
++
++    #[test]
++    fn duck_does_not_pause_and_does_not_resume_early() {
++        let mut t = FocusTracker::new(0);
++        assert_eq!(t.step(false, FOCUS_DUCK, 0), Action::None);
++        assert_eq!(t.step(false, FOCUS_LOST_TRANSIENT, 0), Action::Pause);
++        assert_eq!(t.step(false, FOCUS_DUCK, 0), Action::Resume);
++    }
++
++    #[test]
++    fn silent_or_video_only_players_do_not_want_focus() {
++        let t = FocusTracker::new(0);
++        assert!(!t.wants_focus(false, true, true));
++        assert!(!t.wants_focus(false, false, false));
++        assert!(!t.wants_focus(true, false, true));
++    }
++
++    #[test]
++    fn counter_never_double_counts_or_leaks() {
++        let before = active_audio_players();
++        let mut c = false;
++        set_counted(&mut c, true);
++        set_counted(&mut c, true);
++        assert_eq!(active_audio_players(), before + 1);
++        set_counted(&mut c, false);
++        set_counted(&mut c, false);
++        assert_eq!(active_audio_players(), before);
++    }
++}
 diff --git a/components/media/backends/android/hosttest/.gitignore b/components/media/backends/android/hosttest/.gitignore
 new file mode 100644
 index 0000000..ea8c4bf
@@ -2592,10 +2885,10 @@ index 0000000..fe267fe
 +dimensions, ImageReader-decoder compatibility, A/V sync, audio focus/routes.
 diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
 new file mode 100644
-index 0000000..7ea79be
+index 0000000..8dfb8f9
 --- /dev/null
 +++ b/components/media/backends/android/hosttest/src/lib.rs
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,11 @@
 +//! Host-test harness: includes the backend's pure modules by path so the
 +//! tests compile and run the exact sources shipped in the Android build.
 +#[path = "../../buffer.rs"]
@@ -2604,12 +2897,15 @@ index 0000000..7ea79be
 +pub mod mime_table;
 +#[path = "../../yuv_pack.rs"]
 +pub mod yuv_pack;
++
++#[path = "../../focus.rs"]
++pub mod focus;
 diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
 new file mode 100644
-index 0000000..8d33fc9
+index 0000000..05cb5a5
 --- /dev/null
 +++ b/components/media/backends/android/lib.rs
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,27 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -2623,10 +2919,11 @@ index 0000000..8d33fc9
 +//! when the `media_android_backend_enabled` pref is true; otherwise the dummy
 +//! backend is used, exactly as before. Milestone-1 scope is progressive
 +//! <video>/<audio> playback; MSE/EME/WebRTC/MediaStreams remain stubbed, and
-+//! Android audio focus / route changes are not handled yet.
++//! Audio focus / route changes are handled through focus.rs + the app-side MediaFocus bridge.
 +
 +// Pure logic, host-testable: hosttest/ #[path]-includes these exact files and
 +// runs their unit tests on the host.
++pub mod focus;
 +mod buffer;
 +mod mime_table;
 +mod yuv_pack;

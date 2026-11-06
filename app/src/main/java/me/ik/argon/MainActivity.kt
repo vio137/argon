@@ -152,6 +152,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        MediaFocus.start(this)
         prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         adblock = prefs.getBoolean("adblock", true)
         experimental = prefs.getBoolean("experimental", false)
@@ -629,5 +630,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
         if (!omniboxFocused) {
             urlState.edit { replace(0, length, hostOf(displayableUrl(url))) }
         }
+    }
+
+    override fun onDestroy() {
+        MediaFocus.stop()
+        super.onDestroy()
     }
 }
