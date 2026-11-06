@@ -138,18 +138,35 @@ fun Servo(
                     }
 
                     val action = motionEvent.actionMasked
-                    val pointerIndex = motionEvent.actionIndex
-                    val pointerId = motionEvent.getPointerId(pointerIndex)
-                    val x = motionEvent.getX(pointerIndex)
-                    val y = motionEvent.getY(pointerIndex)
 
                     when (action) {
                         MotionEvent.ACTION_DOWN,
-                        MotionEvent.ACTION_POINTER_DOWN -> servo.touchDown(x, y, pointerId)
-                        MotionEvent.ACTION_MOVE -> servo.touchMove(x, y, pointerId)
+                        MotionEvent.ACTION_POINTER_DOWN -> {
+                            val i = motionEvent.actionIndex
+                            servo.touchDown(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i))
+                        }
+                        // MOVE carries EVERY active pointer (actionIndex is
+                        // meaningless here); deliver each pointer's latest
+                        // position. Values are copied out - the MotionEvent is
+                        // recycled by the framework after dispatch.
+                        MotionEvent.ACTION_MOVE -> {
+                            for (i in 0 until motionEvent.pointerCount) {
+                                servo.touchMove(
+                                    motionEvent.getX(i),
+                                    motionEvent.getY(i),
+                                    motionEvent.getPointerId(i),
+                                )
+                            }
+                        }
                         MotionEvent.ACTION_UP,
-                        MotionEvent.ACTION_POINTER_UP -> servo.touchUp(x, y, pointerId)
-                        MotionEvent.ACTION_CANCEL -> servo.touchCancel(x, y, pointerId)
+                        MotionEvent.ACTION_POINTER_UP -> {
+                            val i = motionEvent.actionIndex
+                            servo.touchUp(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i))
+                        }
+                        MotionEvent.ACTION_CANCEL -> {
+                            val i = motionEvent.actionIndex.coerceAtMost(motionEvent.pointerCount - 1)
+                            servo.touchCancel(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i))
+                        }
                     }
 
                     true

@@ -484,24 +484,47 @@ class InputFlowsTest {
 
             // (a) Viewport sanity: data: page reports CSS-pixel viewport size
             // and devicePixelRatio through the title bridge and paints it.
+            // Explicit width=device-width meta: layout viewport MUST equal the
+            // device-independent width. Measure every viewport signal so the
+            // failure mode (density vs meta handling) is identifiable.
             val probe =
                 "data:text/html,<!DOCTYPE html><meta name=viewport content='width=device-width,initial-scale=1'>" +
                     "<body style='margin:0;background:%23fff;color:%23000'>" +
-                    "<div id=v style='font-size:70px;padding:40px'>measuring</div>" +
-                    "<script>var s=window.innerWidth+'x'+window.innerHeight+' dpr='+window.devicePixelRatio;" +
+                    "<div id=v style='font-size:60px;padding:30px'>measuring</div>" +
+                    "<script>var s='iw='+window.innerWidth+' vv='+Math.round(window.visualViewport.width)" +
+                    "+' cw='+document.documentElement.clientWidth+' sw='+screen.width" +
+                    "+' ow='+(document.documentElement.scrollWidth>window.innerWidth)" +
+                    "+' dpr='+window.devicePixelRatio;" +
                     "document.title='VW:'+s;document.getElementById('v').textContent=s;</script>"
             navigateViaOmnibox(probe)
             Thread.sleep(3_000)
             evidence("t9a-viewport-probe")
             val title = me.ik.argon.MainActivity.lastTitleForTest
             Log.i(TAG, "VIEWPORT_TITLE='$title'")
-            val m = Regex("VW:(\\d+)x(\\d+) dpr=([\\d.]+)").find(title)
-            assertNotNull("viewport probe reported CSS size via title (got '$title')", m)
-            val cssW = m!!.groupValues[1].toInt()
-            val dpr = m.groupValues[3].toFloat()
-            Log.i(TAG, "VIEWPORT_CSS_WIDTH=$cssW DPR=$dpr")
-            assertTrue("CSS viewport width is a sane phone width (got ${'$'}cssW)", cssW in 300..620)
+            val m = Regex("VW:iw=(\\d+) vv=(\\d+) cw=(\\d+) sw=(\\d+) ow=(\\w+) dpr=([\\d.]+)").find(title)
+            assertNotNull("viewport probe reported measurements via title (got '$title')", m)
+            val iw = m!!.groupValues[1].toInt()
+            val vv = m.groupValues[2].toInt()
+            val cw = m.groupValues[3].toInt()
+            val sw = m.groupValues[4].toInt()
+            val overflow = m.groupValues[5] == "true"
+            val dpr = m.groupValues[6].toFloat()
+            Log.i(TAG, "VIEWPORT iw=$iw vv=$vv cw=$cw sw=$sw overflow=$overflow dpr=$dpr")
+            // Explicit-meta case only: layout viewport must be device-width-ish.
+            assertTrue("innerWidth is device-independent phone width (got $iw)", iw in 300..620)
+            assertTrue("visualViewport.width tracks innerWidth (got $vv vs $iw)", kotlin.math.abs(vv - iw) <= 2)
+            assertTrue("clientWidth tracks innerWidth (got $cw vs $iw)", kotlin.math.abs(cw - iw) <= 2)
+            assertTrue("no horizontal overflow on explicit-meta page", !overflow)
             assertTrue("devicePixelRatio in phone range (got $dpr)", dpr in 1.5f..4.5f)
+            // No-meta page: a WIDE layout viewport (e.g. ~980 fallback) is
+            // correct compatibility behavior, not a density failure. Logged
+            // for information, not asserted.
+            val probe2 =
+                "data:text/html,<!DOCTYPE html><body style='margin:0'>" +
+                    "<script>document.title='VWNM:iw='+window.innerWidth+' sw='+screen.width+' dpr='+window.devicePixelRatio;</script>"
+            navigateViaOmnibox(probe2)
+            Thread.sleep(2_000)
+            Log.i(TAG, "VIEWPORT_NOMETA='" + me.ik.argon.MainActivity.lastTitleForTest + "'")
 
             // (b) YouTube: reproduce the user-reported SendRequest failure and
             // capture the engine's INNER error line (net::http_loader) plus a
