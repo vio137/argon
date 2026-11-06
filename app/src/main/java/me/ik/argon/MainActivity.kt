@@ -106,6 +106,15 @@ class MainActivity : ComponentActivity(), Servo.Client {
     companion object {
         private const val ENGINE_UA =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Mobile Safari/537.36"
+
+        /** Build-time pref arm (two-APK A/B). Empty in control builds; the
+         * precache variant sets listOf("--pref", "gfx_precache_shaders=true").
+         * Never populated from intents or other runtime input. */
+        private val ENGINE_PREFS: List<String> = emptyList()
+
+        private fun org.json.JSONArray.putAll(items: List<String>) {
+            for (item in items) put(item)
+        }
     }
     private var searchEngine by mutableStateOf(SearchEngine.GOOGLE)
     private var omniboxFocused by mutableStateOf(false)
@@ -130,19 +139,14 @@ class MainActivity : ComponentActivity(), Servo.Client {
         // from the device's own font files (bounded size; no default-family
         // replacement). Null when no usable fonts found.
         val fontCssPath = FontCss.write(this)
-        // Test-harness isolation hook: the instrumentation runner can force-stop
-        // and relaunch with --es argon_engine_args_append '["--pref","key=value"]'
-        // to A/B engine prefs in fresh processes of the SAME build: the extra is
-        // APPENDED to the defaults, so arms differ only by the pref under test.
+        // Engine args are FIXED at build time: MainActivity is exported
+        // (launcher/VIEW), so any intent-extra arg hook would let other apps
+        // inject engine flags. Pref A/B uses separate build variants instead.
         val engineArgs =
             org.json.JSONArray().apply {
                 put("--user-agent"); put(ENGINE_UA)
                 if (fontCssPath != null) { put("--user-stylesheet"); put(fontCssPath) }
-                val append = intent?.getStringExtra("argon_engine_args_append")
-                if (append != null) {
-                    val extra = org.json.JSONArray(append)
-                    for (i in 0 until extra.length()) put(extra.getString(i))
-                }
+                putAll(ENGINE_PREFS)
             }.toString()
         android.util.Log.i("ArgonNav", "ENGINE_ARGS_EFFECTIVE $engineArgs")
         enableEdgeToEdge()
