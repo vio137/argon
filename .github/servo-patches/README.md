@@ -1,4 +1,4 @@
-# Servo font fallback patch (font_list.patch)
+# Servo engine patches
 
 Target: servo/servo @ b6c9df76, file `components/fonts/platform/freetype/android/font_list.rs`.
 
@@ -25,4 +25,18 @@ Known follow-ups (deliberately not in this patch):
   "NotoSansCJK"; call sites should include the synthetic base name too.
 - Not upstreamed; upstreaming needs a proper design discussion.
 
-Apply: `git apply .github/servo-font-patch/font_list.patch` inside a servo checkout.
+Apply: `git apply .github/servo-patches/font_list.patch` inside a servo checkout.
+
+## net_http1_only.patch
+
+Target: `components/net/connector.rs`. Disables HTTP/2 (ALPN offers HTTP/1.1 only).
+
+Problem (user-reported on Argon 1.0.7; upstream servo/servo#39785 reproduced on
+nightly 20261101, Android and desktop): Google front ends (youtube.com,
+gemini.google.com, ...) reset the first h2 stream with PROTOCOL_ERROR, logged as
+`hyper::Error(Http2, Reset(StreamId(1), PROTOCOL_ERROR))` and surfaced to the
+user as "Could not load the requested page: client error (SendRequest)".
+
+Trade-off: all HTTPS sites lose h2 multiplexing until the upstream h2
+incompatibility is understood and fixed (follow-up: h1 retry on that specific
+error instead of a blanket disable).

@@ -61,10 +61,14 @@ jobs:
           sudo chmod -R a+rx "$ANDROID_SDK_ROOT"
           df -h /
 
-      - name: Install Rust
+      - name: Install Rust and uv
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # mach shells out to uv for its Python environment
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/uv" --version
 
       - name: Fetch servo at the pin and apply the font patch
         run: |
@@ -73,7 +77,7 @@ jobs:
           git init -q
           git fetch -q --depth 1 https://github.com/servo/servo.git "${{ steps.sha.outputs.full }}"
           git checkout -q FETCH_HEAD
-          git apply "$GITHUB_WORKSPACE/.github/servo-font-patch/font_list.patch"
+          git apply -v $GITHUB_WORKSPACE/.github/servo-patches/*.patch
           git diff --stat
           df -h /
 
