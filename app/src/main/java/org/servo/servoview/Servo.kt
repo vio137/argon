@@ -131,7 +131,11 @@ fun Servo(
                     }
                 }
                 .pointerInteropFilter(null) { motionEvent ->
-                    focusRequester.requestFocus()
+                    // Focus churn is main-thread work; request once per gesture,
+                    // not on every batched MOVE (up to ~120/s while scrolling).
+                    if (motionEvent.actionMasked == MotionEvent.ACTION_DOWN) {
+                        focusRequester.requestFocus()
+                    }
 
                     val action = motionEvent.actionMasked
                     val pointerIndex = motionEvent.actionIndex
@@ -376,20 +380,52 @@ internal constructor(
         scope.launch(glDispatcher) { jni.keyup(keyCode, event.unicodeChar) }
     }
 
+    // Touch coalescing: ACTION_MOVE streams (up to ~120/s during scroll) share
+    // the single GL executor with frame rendering; uncoalesced, queued moves
+    // serialize behind doFrame calls and scroll input lags whole frames.
+    // Per-pointer latest-wins: tasks remove their pointer's newest pending move
+    // and exit when superseded. Down/up/cancel flush pending moves first, so
+    // ordering against gesture state transitions is preserved (pinch keeps each
+    // pointer's latest position).
+    private class MoveEvent(val x: Float, val y: Float, val pointerId: Int)
+    private val pendingMoves = java.util.concurrent.ConcurrentHashMap<Int, MoveEvent>()
+
+    private fun flushPendingMoves() {
+        if (pendingMoves.isEmpty()) return
+        val snapshot = pendingMoves.values.toList()
+        pendingMoves.clear()
+        for (move in snapshot) {
+            runCatching { jni.touchMove(move.x, move.y, move.pointerId) }
+        }
+    }
+
     fun touchDown(x: Float, y: Float, pointerId: Int) {
-        scope.launch(glDispatcher) { jni.touchDown(x, y, pointerId) }
+        scope.launch(glDispatcher) {
+            flushPendingMoves()
+            jni.touchDown(x, y, pointerId)
+        }
     }
 
     fun touchMove(x: Float, y: Float, pointerId: Int) {
-        scope.launch(glDispatcher) { jni.touchMove(x, y, pointerId) }
+        pendingMoves[pointerId] = MoveEvent(x, y, pointerId)
+        scope.launch(glDispatcher) {
+            val move = pendingMoves.remove(pointerId) ?: return@launch // superseded
+            runCatching { jni.touchMove(move.x, move.y, move.pointerId) }
+        }
     }
 
     fun touchUp(x: Float, y: Float, pointerId: Int) {
-        scope.launch(glDispatcher) { jni.touchUp(x, y, pointerId) }
+        scope.launch(glDispatcher) {
+            flushPendingMoves()
+            jni.touchUp(x, y, pointerId)
+        }
     }
 
     fun touchCancel(x: Float, y: Float, pointerId: Int) {
-        scope.launch(glDispatcher) { jni.touchCancel(x, y, pointerId) }
+        scope.launch(glDispatcher) {
+            flushPendingMoves()
+            jni.touchCancel(x, y, pointerId)
+        }
     }
 
     fun pausePainting() {
