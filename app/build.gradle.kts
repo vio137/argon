@@ -12,8 +12,8 @@ android {
         applicationId = "me.ik.argon"
         minSdk = 29
         targetSdk = 37
-        versionCode = 8
-        versionName = "1.0.7"
+        versionCode = 10
+        versionName = "1.0.9"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += listOf("arm64-v8a") }
     }

@@ -73,6 +73,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -101,6 +102,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var showAbout by mutableStateOf(false)
     private var adblock by mutableStateOf(true)
     private var experimental by mutableStateOf(false)
+
+    companion object {
+        private const val ENGINE_UA =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Mobile Safari/537.36"
+        private val ENGINE_ARGS: String =
+            org.json.JSONArray().apply { put("--user-agent"); put(ENGINE_UA) }.toString()
+    }
     private var searchEngine by mutableStateOf(SearchEngine.GOOGLE)
     private var omniboxFocused by mutableStateOf(false)
     private var restartDialog by mutableStateOf(false)
@@ -129,7 +137,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 Box(Modifier.fillMaxSize().background(ArgonColors.Bg)) {
                     Servo(
                         experimentalModeEnabled = experimental,
-                        args = null,
+                        // Engine init args (JSON array, parsed by servoshell's CLI).
+                        // UA: Chrome's reduced mobile string (frozen Android 10 / K
+                        // model + major version), so sites serve their standard
+                        // mobile experience. Verified website-visible in tests.
+                        args = ENGINE_ARGS,
                         initialUrl = intentUrl ?: startPageUrl,
                         logStr = null,
                         client = this@MainActivity,
@@ -323,7 +335,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 )
                 Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                     if (urlState.text.isEmpty()) {
-                        Text("Search or enter address", color = ArgonColors.Text3, fontSize = 17.sp)
+                        Text(
+                            "Search or enter address",
+                            color = ArgonColors.Text3,
+                            fontSize = 17.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                     BasicTextField(
                         state = urlState,

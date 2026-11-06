@@ -94,7 +94,7 @@ fun Servo(
     }
     LaunchedEffect(Unit) {
         while (true) {
-            withFrameNanos { servo.onDoFrame() }
+            withFrameNanos { frameTs -> servo.onDoFrame(frameTs) }
         }
     }
     LaunchedEffect(servo, navigator) { navigator.consumeNavigationEvents(servo) }
@@ -417,9 +417,13 @@ internal constructor(
         scope.launch(glDispatcher) { jni.setExperimentalMode(enable) }
     }
 
-    fun onDoFrame() {
+    fun onDoFrame(frameTs: Long = 0L) {
         scope.launch(glDispatcher) {
-            if (paintingActive.get()) jni.doFrame()
+            if (paintingActive.get()) {
+                val t0 = System.nanoTime()
+                jni.doFrame()
+                me.ik.argon.PerfStats.recordFrame(frameTs, System.nanoTime() - t0)
+            }
         }
     }
 
