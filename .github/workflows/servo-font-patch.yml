@@ -86,6 +86,11 @@ jobs:
           set -ex
           cd servo
           export PATH="$HOME/.cargo/bin:$PATH"
+          # mach expects the NDK dir itself, not the SDK root
+          export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          export ANDROID_NDK="$ANDROID_NDK_ROOT"
+          export ANDROID_SDK_HOME="$ANDROID_SDK_ROOT"
+          test -f "$ANDROID_NDK_ROOT/source.properties"
           ./mach build --android --release
           df -h /
           find target -name '*.so' -path '*android*' | head -20
