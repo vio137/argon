@@ -72,873 +72,242 @@ index 0000000..44b9984
 +
 +[lints]
 +workspace = true
-diff --git a/components/media/backends/android/buffer.rs b/components/media/backends/android/buffer.rs
+diff --git a/components/media/backends/android/android_impl/mod.rs b/components/media/backends/android/android_impl/mod.rs
 new file mode 100644
-index 0000000..7a717ac
+index 0000000..ed1f9fe
 --- /dev/null
-+++ b/components/media/backends/android/buffer.rs
-@@ -0,0 +1,395 @@
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++++ b/components/media/backends/android/android_impl/mod.rs
+@@ -0,0 +1,225 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 +
-+//! Progressive-download playback buffer (pure logic, host-testable).
-+//!
-+//! Ported from the OHOS backend's PlaybackBuffer
-+//! (components/media/backends/ohos/ohos_media/source.rs) with one deliberate
-+//! difference: instead of returning 0 bytes when data is not yet available
-+//! (which AMediaExtractor does not tolerate well), readers block on a
-+//! condition variable until data arrives, the stream ends, or the source is
-+//! cancelled. Cancellation (player stop/shutdown) always unblocks readers.
-+//!
-+//! Three threads interact with the buffer:
-+//! 1. The media element's fetch thread pushes downloaded bytes (push_data).
-+//! 2. AMediaExtractor reader threads call readAt (read_at).
-+//! 3. The pipeline thread cancels on shutdown (cancel).
++//! Android-only NDK parts of the backend (compiled only for Android targets).
++mod player;
++mod source;
++mod sys;
 +
-+use std::sync::{Condvar, Mutex};
-+use std::time::Duration;
++use std::any::Any;
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, Weak, mpsc};
++use std::thread;
 +
-+use log::debug;
++use log::warn;
++use servo_base::generic_channel::GenericCallback;
++use servo_media::{
++    Backend, BackendInit, BackendMsg, ClientContextId, MediaInstance, SupportsMediaType,
++};
++use servo_media_audio::context::AudioContextOptions;
++use servo_media_audio::sink::AudioSinkError;
++use servo_media_player::audio::AudioRenderer;
++use servo_media_player::context::PlayerGLContext;
++use servo_media_player::video::VideoFrameRenderer;
++use servo_media_player::{Player, PlayerEvent, StreamType};
++use servo_media_streams::capture::MediaTrackConstraintSet;
++use servo_media_streams::device_monitor::{MediaDeviceInfo, MediaDeviceMonitor};
++use servo_media_streams::registry::MediaStreamId;
++use servo_media_streams::{MediaOutput, MediaSocket, MediaStreamType};
++use servo_media_webrtc::{WebRtcController, WebRtcSignaller};
 +
-+const DEFAULT_CACHE_SIZE: usize = 8 * 1024 * 1024; // 8MB
-+/// Re-request data from the fetcher when fewer bytes than this remain buffered.
-+const LOW_WATER_MARK: usize = DEFAULT_CACHE_SIZE / 4;
-+/// Bytes kept before the current read position when sliding the window, to
-+/// tolerate small backwards reads without a full refetch.
-+const BACK_BUFFER: usize = 64 * 1024;
++use super::mime_table;
++use player::AndroidPlayer;
 +
-+/// A request the readAt callback must dispatch *after* releasing the buffer
-+/// lock. The seek closure blocks on IPC with the script thread, so holding
-+/// the buffer lock while calling it would deadlock against a concurrent
-+/// push_data (which also acquires this lock).
-+#[derive(Debug, Clone, Copy, PartialEq)]
-+pub enum Dispatch {
-+    /// The extractor needs bytes from a position outside the buffered window;
-+    /// the fetcher must restart its download at this byte offset.
-+    Seek(u64),
-+    /// The buffer ran below the low-water mark; ask the fetcher for more data.
-+    NeedData,
++type MediaInstanceMap = HashMap<usize, (ClientContextId, Weak<Mutex<AndroidPlayer>>)>;
++
++pub struct AndroidBackend {
++    instances: Arc<Mutex<MediaInstanceMap>>,
++    backend_chan: mpsc::Sender<BackendMsg>,
++    next_id: AtomicUsize,
 +}
 +
-+struct BufferState {
-+    buffer: Vec<u8>,
-+    /// Byte offset in the media resource of buffer[0].
-+    buffer_data_head: i64,
-+    has_active_request: bool,
-+    is_seeking: bool,
-+    /// True once end_of_stream was signalled by the fetcher: no more data will
-+    /// ever arrive.
-+    is_eos: bool,
-+    /// True once the source is torn down; readers must bail out immediately.
-+    cancelled: bool,
-+    /// Total resource size in bytes, 0 when not (yet) known.
-+    total_size: i64,
-+}
-+
-+pub struct SharedBuffer {
-+    state: Mutex<BufferState>,
-+    cond: Condvar,
-+}
-+
-+impl Default for SharedBuffer {
-+    fn default() -> Self {
-+        Self::new()
++impl BackendInit for AndroidBackend {
++    fn init() -> Box<dyn Backend> {
++        let instances: Arc<Mutex<MediaInstanceMap>> = Arc::new(Mutex::new(HashMap::new()));
++        let instances_ = instances.clone();
++        let (backend_chan, recvr) = mpsc::channel::<BackendMsg>();
++        thread::Builder::new()
++            .name("AndroidMediaBackend ShutdownThread".to_owned())
++            .spawn(move || {
++                while let Ok(msg) = recvr.recv() {
++                    match msg {
++                        BackendMsg::Shutdown {
++                            context: _,
++                            id,
++                            tx_ack,
++                        } => {
++                            instances_.lock().unwrap().remove(&id);
++                            let _ = tx_ack.send(());
++                        },
++                    }
++                }
++            })
++            .expect("couldn't spawn AndroidMediaBackend ShutdownThread");
++        Box::new(AndroidBackend {
++            instances,
++            backend_chan,
++            next_id: AtomicUsize::new(1),
++        })
 +    }
 +}
 +
-+impl SharedBuffer {
-+    pub fn new() -> Self {
-+        SharedBuffer {
-+            state: Mutex::new(BufferState {
-+                buffer: Vec::with_capacity(DEFAULT_CACHE_SIZE),
-+                buffer_data_head: 0,
-+                has_active_request: false,
-+                is_seeking: false,
-+                is_eos: false,
-+                cancelled: false,
-+                total_size: 0,
-+            }),
-+            cond: Condvar::new(),
-+        }
-+    }
-+
-+    pub fn set_total_size(&self, size: i64) {
-+        let mut st = self.state.lock().unwrap();
-+        if st.total_size == 0 {
-+            st.total_size = size;
-+        }
-+    }
-+
-+    pub fn total_size(&self) -> i64 {
-+        self.state.lock().unwrap().total_size
-+    }
-+
-+    pub fn notify_seek_done(&self) {
-+        let mut st = self.state.lock().unwrap();
-+        st.is_seeking = false;
-+        self.cond.notify_all();
-+    }
-+
-+    /// Append fetched bytes. Returns false when the buffer is full, in which
-+    /// case the fetcher should stop until more data is requested (the caller
-+    /// is expected to surface EnoughData to the media element).
-+    pub fn push_data(&self, data: &[u8]) -> bool {
-+        let mut st = self.state.lock().unwrap();
-+        // Reject data while a seek is in progress. Between the buffer being
-+        // cleared/reset for a new seek position and the old fetch being
-+        // cancelled, stale data from the previous fetch could arrive and
-+        // corrupt the buffer (it would be appended as if it started at the
-+        // new seek position). Silently discard it.
-+        if st.is_seeking {
-+            return true;
-+        }
-+        if st.buffer.len() + data.len() > st.buffer.capacity() {
-+            debug!(
-+                "Playback buffer full: head {}, len {}, incoming {}",
-+                st.buffer_data_head,
-+                st.buffer.len(),
-+                data.len()
-+            );
-+            st.has_active_request = false;
-+            return false;
-+        }
-+        st.buffer.extend_from_slice(data);
-+        self.cond.notify_all();
-+        true
-+    }
-+
-+    pub fn end_of_stream(&self) {
-+        let mut st = self.state.lock().unwrap();
-+        st.is_eos = true;
-+        st.has_active_request = false;
-+        self.cond.notify_all();
-+    }
-+
-+    pub fn cancel(&self) {
-+        let mut st = self.state.lock().unwrap();
-+        st.cancelled = true;
-+        self.cond.notify_all();
-+    }
-+
-+    pub fn is_cancelled(&self) -> bool {
-+        self.state.lock().unwrap().cancelled
-+    }
-+
-+    /// Buffered window as (head, len) for buffered() reporting.
-+    pub fn buffered_window(&self) -> (i64, i64) {
-+        let st = self.state.lock().unwrap();
-+        (st.buffer_data_head, st.buffer.len() as i64)
-+    }
-+
-+    /// Serve a readAt request for `pos`. May block waiting for data.
-+    ///
-+    /// AMediaDataSource readAt contract: return the number of bytes read, 0
-+    /// if `size` was 0, or -1 to indicate end of stream. We never return a
-+    /// short read for "no data yet"; we wait instead.
-+    pub fn read_at(&self, dest: &mut [u8], pos: i64) -> (isize, Option<Dispatch>) {
-+        if dest.is_empty() {
-+            return (0, None);
-+        }
-+        let mut st = self.state.lock().unwrap();
-+        loop {
-+            if st.cancelled {
-+                return (-1, None);
-+            }
-+            if st.is_seeking {
-+                // A byte-range refetch is being set up; wait for the first
-+                // bytes from the new position (or cancellation).
-+                st = self.cond.wait(st).unwrap();
++impl AndroidBackend {
++    fn media_instance_action(&self, id: &ClientContextId, cb: &dyn Fn(&dyn MediaInstance)) {
++        let instances = self.instances.lock().unwrap();
++        for (context, instance) in instances.values() {
++            if context != id {
 +                continue;
 +            }
-+            let pos_offset = pos - st.buffer_data_head;
-+            let available = st.buffer.len() as i64 - pos_offset;
-+            if pos_offset < 0 {
-+                // Reader moved backwards outside the buffered window.
-+                st.buffer.clear();
-+                st.buffer_data_head = pos.max(0);
-+                st.has_active_request = true;
-+                st.is_seeking = true;
-+                return (0, Some(Dispatch::Seek(pos.max(0) as u64)));
++            if let Some(instance) = instance.upgrade() {
++                cb(&*instance.lock().unwrap());
 +            }
-+            if available > 0 {
-+                let n = available.min(dest.len() as i64) as usize;
-+                dest[..n].copy_from_slice(
-+                    &st.buffer[pos_offset as usize..pos_offset as usize + n],
-+                );
-+                // Slide the window forward: drop consumed prefix bytes (keep
-+                // a small back-buffer for the extractor's occasional small
-+                // backwards peeks, e.g. box re-reads during init) so the 8MB
-+                // window does not fill up and stall the download.
-+                if pos_offset as usize > BACK_BUFFER {
-+                    let drop = pos_offset as usize - BACK_BUFFER;
-+                    st.buffer.drain(..drop);
-+                    st.buffer_data_head += drop as i64;
-+                }
-+                let remaining =
-+                    (st.buffer.len() as i64) - (pos + n as i64 - st.buffer_data_head);
-+                let need_data = !st.is_eos &&
-+                    !st.has_active_request &&
-+                    remaining < LOW_WATER_MARK as i64;
-+                if need_data {
-+                    st.has_active_request = true;
-+                }
-+                let dispatch = if need_data {
-+                    Some(Dispatch::NeedData)
-+                } else {
-+                    None
-+                };
-+                return (n as isize, dispatch);
-+            }
-+            if st.is_eos {
-+                // True end of the resource.
-+                return (-1, None);
-+            }
-+            if !st.has_active_request {
-+                // No fetch in flight: restart the download at pos. (An active
-+                // fetch streams forward from the current window end and will
-+                // cover any later position, so we simply wait for it.)
-+                debug!(
-+                    "read_at: need refetch at {} (head {}, len {})",
-+                    pos,
-+                    st.buffer_data_head,
-+                    st.buffer.len()
-+                );
-+                st.buffer.clear();
-+                st.buffer_data_head = pos;
-+                st.has_active_request = true;
-+                st.is_seeking = true;
-+                return (0, Some(Dispatch::Seek(pos as u64)));
-+            }
-+            // A fetch is in flight and will cover this position: wait.
-+            st = self
-+                .cond
-+                .wait_timeout(st, Duration::from_secs(2))
-+                .unwrap()
-+                .0;
 +        }
 +    }
 +}
 +
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use std::sync::Arc;
-+
-+    fn buf_with(size: usize) -> SharedBuffer {
-+        let b = SharedBuffer::new();
-+        b.set_total_size(size as i64);
-+        b
++impl Backend for AndroidBackend {
++    fn create_player(
++        &self,
++        context_id: &ClientContextId,
++        stream_type: StreamType,
++        sender: GenericCallback<PlayerEvent>,
++        video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
++        _audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
++        _gl_context: Box<dyn PlayerGLContext>,
++    ) -> Arc<Mutex<dyn Player>> {
++        // Audio is self-rendered through AAudio (same model as the OHOS
++        // backend), so the audio_renderer is intentionally unused.
++        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
++        let player = AndroidPlayer::new(
++            id,
++            *context_id,
++            stream_type,
++            sender,
++            video_renderer,
++            self.backend_chan.clone(),
++        );
++        self.instances
++            .lock()
++            .unwrap()
++            .insert(id, (*context_id, Arc::downgrade(&player)));
++        player
 +    }
 +
-+    #[test]
-+    fn sequential_read_and_slide() {
-+        let b = buf_with(1_000_000_000);
-+        let chunk = vec![7u8; 3 * 1024 * 1024]; // 3MB: above the low-water mark
-+        assert!(b.push_data(&chunk));
-+        let mut dest = vec![0u8; 100_000];
-+        let (n, d) = b.read_at(&mut dest, 0);
-+        assert_eq!((n, d), (100_000, None));
-+        assert!(dest.iter().all(|&x| x == 7));
-+        // Beyond the back-buffer: window slides so head advances.
-+        let (n, d) = b.read_at(&mut dest, 100_000);
-+        assert_eq!((n, d), (100_000, None));
-+        let (head, len) = b.buffered_window();
-+        assert!(head > 0, "window should slide forward, head={head}");
-+        assert!(len <= 3 * 1024 * 1024);
++    fn create_audiostream(&self) -> MediaStreamId {
++        warn!("AndroidBackend: create_audiostream not supported");
++        MediaStreamId::new()
 +    }
 +
-+    #[test]
-+    fn read_past_available_waits_then_unblocks_on_push() {
-+        let b = Arc::new(buf_with(64 * 1024 * 1024));
-+        let big = vec![5u8; DEFAULT_CACHE_SIZE];
-+        assert!(b.push_data(&big));
-+        // Drain in 1MB chunks (the slide frees capacity as we go) until the
-+        // low-water mark marks a fetch in flight.
-+        let mut pos = 0i64;
-+        let mut chunk = vec![0u8; 1024 * 1024];
-+        loop {
-+            let (n, d) = b.read_at(&mut chunk, pos);
-+            pos += n as i64;
-+            if d == Some(Dispatch::NeedData) {
-+                break;
-+            }
-+            assert!(n > 0, "must not hit EOS/seek during drain");
++    fn create_videostream(&self) -> MediaStreamId {
++        warn!("AndroidBackend: create_videostream not supported");
++        MediaStreamId::new()
++    }
++
++    fn create_stream_output(&self) -> Box<dyn MediaOutput> {
++        warn!("AndroidBackend: create_stream_output not supported");
++        Box::new(AndroidMediaOutput)
++    }
++
++    fn create_stream_and_socket(
++        &self,
++        _ty: MediaStreamType,
++    ) -> (Box<dyn MediaSocket>, MediaStreamId) {
++        warn!("AndroidBackend: create_stream_and_socket not supported");
++        (Box::new(AndroidMediaSocket), MediaStreamId::new())
++    }
++
++    fn create_audioinput_stream(
++        &self,
++        _set: MediaTrackConstraintSet,
++    ) -> Option<MediaStreamId> {
++        warn!("AndroidBackend: create_audioinput_stream not supported");
++        None
++    }
++
++    fn create_videoinput_stream(
++        &self,
++        _set: MediaTrackConstraintSet,
++    ) -> Option<MediaStreamId> {
++        warn!("AndroidBackend: create_videoinput_stream not supported");
++        None
++    }
++
++    fn create_audio_context(
++        &self,
++        _id: &ClientContextId,
++        _options: AudioContextOptions,
++    ) -> Result<Arc<Mutex<servo_media_audio::context::AudioContext>>, AudioSinkError> {
++        warn!("AndroidBackend: create_audio_context not supported");
++        Err(AudioSinkError::Backend(
++            "AudioContext not supported by the experimental Android backend".to_owned(),
++        ))
++    }
++
++    fn create_webrtc(&self, _signaller: Box<dyn WebRtcSignaller>) -> WebRtcController {
++        todo!()
++    }
++
++    fn can_play_type(&self, media_type: &str) -> SupportsMediaType {
++        // Conservative by construction: this backend never answers
++        // Probably without per-device codec capability evidence.
++        match mime_table::can_play_type(media_type) {
++            mime_table::Support::Maybe => SupportsMediaType::Maybe,
++            mime_table::Support::No => SupportsMediaType::No,
 +        }
-+        // Finish draining what remains.
-+        let mut remaining_buf = vec![0u8; DEFAULT_CACHE_SIZE];
-+        let (n, _) = b.read_at(&mut remaining_buf[..(DEFAULT_CACHE_SIZE - pos as usize)], pos);
-+        assert!(n > 0);
-+        let end_pos = pos + n as i64;
-+        let b2 = b.clone();
-+        let reader = std::thread::spawn(move || {
-+            let mut small = vec![0u8; 1024];
-+            // Buffer empty, fetch in flight, no EOS: must block, not seek.
-+            b2.read_at(&mut small, end_pos).0
++    }
++
++    fn mute(&self, id: &ClientContextId, val: bool) {
++        self.media_instance_action(id, &move |instance: &dyn MediaInstance| {
++            let _ = instance.mute(val);
 +        });
-+        std::thread::sleep(Duration::from_millis(100));
-+        assert!(
-+            !reader.is_finished(),
-+            "reader must block while a fetch is in flight"
-+        );
-+        assert!(b.push_data(&vec![6u8; 4096]));
-+        let n = reader.join().unwrap();
-+        assert_eq!(n, 1024);
 +    }
 +
-+    #[test]
-+    fn read_before_head_requests_seek() {
-+        let b = buf_with(1_000_000);
-+        assert!(b.push_data(&vec![3u8; 300_000]));
-+        // Read at 200_000: pos_offset exceeds BACK_BUFFER, so the window
-+        // slides and head advances to 200_000 - BACK_BUFFER.
-+        let mut dest = vec![0u8; 100_000];
-+        let (n, _) = b.read_at(&mut dest, 200_000);
-+        assert_eq!(n, 100_000);
-+        let (head, _) = b.buffered_window();
-+        assert_eq!(head, 200_000 - BACK_BUFFER as i64);
-+        // Position 0 is now before the window: a byte-range refetch is needed.
-+        let mut small = vec![0u8; 4096];
-+        let (_, d) = b.read_at(&mut small, 0);
-+        assert_eq!(d, Some(Dispatch::Seek(0)));
-+    }
-+
-+    #[test]
-+    fn full_buffer_rejects_push_and_eos_ends_reads() {
-+        let b = buf_with(64 * 1024 * 1024);
-+        let big = vec![9u8; DEFAULT_CACHE_SIZE];
-+        assert!(b.push_data(&big));
-+        assert!(!b.push_data(&[1u8; 1]), "full buffer must reject");
-+        b.end_of_stream();
-+        let mut dest = vec![0u8; 1024];
-+        // Drain everything, then EOS must yield -1.
-+        let mut pos = 0i64;
-+        loop {
-+            let (n, _) = b.read_at(&mut dest, pos);
-+            if n <= 0 {
-+                assert_eq!(n, -1);
-+                break;
-+            }
-+            pos += n as i64;
-+            assert!(pos <= DEFAULT_CACHE_SIZE as i64 + 1024);
-+        }
-+    }
-+
-+    #[test]
-+    fn cancel_unblocks_blocked_reader() {
-+        let b = Arc::new(buf_with(64 * 1024 * 1024));
-+        assert!(b.push_data(&vec![5u8; DEFAULT_CACHE_SIZE]));
-+        // Drain past the low-water mark so a fetch is in flight.
-+        let mut chunk = vec![0u8; 1024 * 1024];
-+        let mut pos = 0i64;
-+        loop {
-+            let (n, d) = b.read_at(&mut chunk, pos);
-+            pos += n as i64;
-+            if d == Some(Dispatch::NeedData) {
-+                break;
-+            }
-+            assert!(n > 0);
-+        }
-+        let b2 = b.clone();
-+        let reader = std::thread::spawn(move || {
-+            let mut dest = vec![0u8; 1024];
-+            // Read past the buffered end with a fetch in flight: blocks.
-+            b2.read_at(&mut dest, DEFAULT_CACHE_SIZE as i64).0
++    fn resume(&self, id: &ClientContextId) {
++        self.media_instance_action(id, &move |instance: &dyn MediaInstance| {
++            let _ = instance.resume();
 +        });
-+        std::thread::sleep(Duration::from_millis(100));
-+        assert!(!reader.is_finished(), "reader must be blocked on the fetch");
-+        b.cancel();
-+        let n = reader.join().unwrap();
-+        assert_eq!(n, -1, "cancelled read must bail out with -1");
 +    }
 +
-+    #[test]
-+    fn low_water_marks_need_data_once() {
-+        let b = buf_with(64 * 1024 * 1024);
-+        // Fill the buffer completely.
-+        let big = vec![5u8; DEFAULT_CACHE_SIZE];
-+        assert!(b.push_data(&big)); // has_active_request stays false, buffer full
-+        // Read down past the low-water mark: first such read must dispatch
-+        // NeedData exactly once, subsequent reads must not repeat it while a
-+        // request is already active.
-+        let mut dest = vec![0u8; DEFAULT_CACHE_SIZE - LOW_WATER_MARK - 1024];
-+        let (n, d) = b.read_at(&mut dest, 0);
-+        assert_eq!(n as usize, dest.len());
-+        assert_eq!(d, None, "still above low-water right after read");
-+        let mut small = vec![0u8; 2048];
-+        let pos = dest.len() as i64;
-+        let (_, d1) = b.read_at(&mut small, pos);
-+        assert_eq!(d1, Some(Dispatch::NeedData));
-+        let (_, d2) = b.read_at(&mut small, pos + 2048);
-+        assert_eq!(d2, None, "no duplicate NeedData while request active");
-+    }
-+}
-diff --git a/components/media/backends/android/hosttest/.gitignore b/components/media/backends/android/hosttest/.gitignore
-new file mode 100644
-index 0000000..ea8c4bf
---- /dev/null
-+++ b/components/media/backends/android/hosttest/.gitignore
-@@ -0,0 +1 @@
-+/target
-diff --git a/components/media/backends/android/hosttest/Cargo.lock b/components/media/backends/android/hosttest/Cargo.lock
-new file mode 100644
-index 0000000..93424ad
---- /dev/null
-+++ b/components/media/backends/android/hosttest/Cargo.lock
-@@ -0,0 +1,23 @@
-+# This file is automatically @generated by Cargo.
-+# It is not intended for manual editing.
-+version = 4
-+
-+[[package]]
-+name = "log"
-+version = "0.4.35"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
-+
-+[[package]]
-+name = "mime"
-+version = "0.3.18"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
-+
-+[[package]]
-+name = "servo-media-android-hosttest"
-+version = "0.0.0"
-+dependencies = [
-+ "log",
-+ "mime",
-+]
-diff --git a/components/media/backends/android/hosttest/Cargo.toml b/components/media/backends/android/hosttest/Cargo.toml
-new file mode 100644
-index 0000000..baa83e9
---- /dev/null
-+++ b/components/media/backends/android/hosttest/Cargo.toml
-@@ -0,0 +1,14 @@
-+[package]
-+name = "servo-media-android-hosttest"
-+version = "0.0.0"
-+edition = "2021"
-+publish = false
-+
-+# Standalone workspace: this test crate is NOT part of the servo workspace.
-+# It #[path]-includes the backend's pure-logic modules verbatim so host tests
-+# exercise the exact code the Android build compiles.
-+[workspace]
-+
-+[dependencies]
-+log = "0.4"
-+mime = "0.3"
-diff --git a/components/media/backends/android/hosttest/README.md b/components/media/backends/android/hosttest/README.md
-new file mode 100644
-index 0000000..fe267fe
---- /dev/null
-+++ b/components/media/backends/android/hosttest/README.md
-@@ -0,0 +1,24 @@
-+# Host tests for the Android media backend
-+
-+The pure logic of the backend (buffering, MIME table, YUV packing) is
-+host-testable. This harness compiles the exact shipped files on the host via
-+#[path] includes and runs their unit tests. The NDK-dependent code
-+(sys.rs/source.rs/player.rs) is compiled only for Android targets.
-+
-+## Invocation
-+
-+    cd components/media/backends/android/hosttest
-+    cargo test
-+
-+Requires any stable Rust toolchain (verified with 1.99.1). No Servo checkout,
-+no Android SDK/NDK needed. The own [workspace] in Cargo.toml keeps this out of
-+the Servo workspace when the crate is vendored into it.
-+
-+## Results (2026-11-06)
-+
-+    test result: ok. 13 passed; 0 failed
-+
-+Covered: SharedBuffer windows/seeks (6), mime_table answers (3),
-+yuv_pack packing incl. row/pixel strides (4). NOT covered (need device
-+evidence): codec format negotiation, crop/rotation/color changes, odd
-+dimensions, ImageReader-decoder compatibility, A/V sync, audio focus/routes.
-diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
-new file mode 100644
-index 0000000..7ea79be
---- /dev/null
-+++ b/components/media/backends/android/hosttest/src/lib.rs
-@@ -0,0 +1,8 @@
-+//! Host-test harness: includes the backend's pure modules by path so the
-+//! tests compile and run the exact sources shipped in the Android build.
-+#[path = "../../buffer.rs"]
-+pub mod buffer;
-+#[path = "../../mime_table.rs"]
-+pub mod mime_table;
-+#[path = "../../yuv_pack.rs"]
-+pub mod yuv_pack;
-diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
-new file mode 100644
-index 0000000..c5c173c
---- /dev/null
-+++ b/components/media/backends/android/lib.rs
-@@ -0,0 +1,250 @@
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-+
-+//! Experimental Android media backend for Servo, implemented directly on the
-+//! NDK media APIs (AMediaExtractor + AMediaCodec into an AImageReader surface
-+//! + AAudio), fed by Servo's own progressive media fetch through an
-+//! AMediaDataSource.
-+//!
-+//! This backend is compiled for Android builds but only selected at runtime
-+//! when the `media_android_backend_enabled` pref is true; otherwise the dummy
-+//! backend is used, exactly as before. Milestone-1 scope is progressive
-+//! <video>/<audio> playback; MSE/EME/WebRTC/MediaStreams remain stubbed, and
-+//! Android audio focus / route changes are not handled yet.
-+
-+// Pure logic, host-testable: hosttest/ #[path]-includes these exact files and
-+// runs their unit tests on the host.
-+mod buffer;
-+mod mime_table;
-+mod yuv_pack;
-+
-+#[cfg(target_os = "android")]
-+mod android_impl {
-+    #[path = "../player.rs"]
-+    mod player;
-+    #[path = "../source.rs"]
-+    mod source;
-+    #[path = "../sys.rs"]
-+    mod sys;
-+
-+    use std::any::Any;
-+    use std::collections::HashMap;
-+    use std::sync::atomic::{AtomicUsize, Ordering};
-+    use std::sync::{Arc, Mutex, Weak, mpsc};
-+    use std::thread;
-+
-+    use log::warn;
-+    use servo_base::generic_channel::GenericCallback;
-+    use servo_media::{
-+        Backend, BackendInit, BackendMsg, ClientContextId, MediaInstance, SupportsMediaType,
-+    };
-+    use servo_media_audio::context::AudioContextOptions;
-+    use servo_media_audio::sink::AudioSinkError;
-+    use servo_media_player::audio::AudioRenderer;
-+    use servo_media_player::context::PlayerGLContext;
-+    use servo_media_player::video::VideoFrameRenderer;
-+    use servo_media_player::{Player, PlayerEvent, StreamType};
-+    use servo_media_streams::capture::MediaTrackConstraintSet;
-+    use servo_media_streams::device_monitor::{MediaDeviceInfo, MediaDeviceMonitor};
-+    use servo_media_streams::registry::MediaStreamId;
-+    use servo_media_streams::{MediaOutput, MediaSocket, MediaStreamType};
-+    use servo_media_webrtc::{WebRtcController, WebRtcSignaller};
-+
-+    use super::mime_table;
-+    use player::AndroidPlayer;
-+
-+    type MediaInstanceMap = HashMap<usize, (ClientContextId, Weak<Mutex<AndroidPlayer>>)>;
-+
-+    pub struct AndroidBackend {
-+        instances: Arc<Mutex<MediaInstanceMap>>,
-+        backend_chan: mpsc::Sender<BackendMsg>,
-+        next_id: AtomicUsize,
++    fn suspend(&self, id: &ClientContextId) {
++        self.media_instance_action(id, &move |instance: &dyn MediaInstance| {
++            let _ = instance.suspend();
++        });
 +    }
 +
-+    impl BackendInit for AndroidBackend {
-+        fn init() -> Box<dyn Backend> {
-+            let instances: Arc<Mutex<MediaInstanceMap>> = Arc::new(Mutex::new(HashMap::new()));
-+            let instances_ = instances.clone();
-+            let (backend_chan, recvr) = mpsc::channel::<BackendMsg>();
-+            thread::Builder::new()
-+                .name("AndroidMediaBackend ShutdownThread".to_owned())
-+                .spawn(move || {
-+                    while let Ok(msg) = recvr.recv() {
-+                        match msg {
-+                            BackendMsg::Shutdown {
-+                                context: _,
-+                                id,
-+                                tx_ack,
-+                            } => {
-+                                instances_.lock().unwrap().remove(&id);
-+                                let _ = tx_ack.send(());
-+                            },
-+                        }
-+                    }
-+                })
-+                .expect("couldn't spawn AndroidMediaBackend ShutdownThread");
-+            Box::new(AndroidBackend {
-+                instances,
-+                backend_chan,
-+                next_id: AtomicUsize::new(1),
-+            })
-+        }
-+    }
-+
-+    impl AndroidBackend {
-+        fn media_instance_action(&self, id: &ClientContextId, cb: &dyn Fn(&dyn MediaInstance)) {
-+            let instances = self.instances.lock().unwrap();
-+            for (context, instance) in instances.values() {
-+                if context != id {
-+                    continue;
-+                }
-+                if let Some(instance) = instance.upgrade() {
-+                    cb(&*instance.lock().unwrap());
-+                }
-+            }
-+        }
-+    }
-+
-+    impl Backend for AndroidBackend {
-+        fn create_player(
-+            &self,
-+            context_id: &ClientContextId,
-+            stream_type: StreamType,
-+            sender: GenericCallback<PlayerEvent>,
-+            video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
-+            _audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
-+            _gl_context: Box<dyn PlayerGLContext>,
-+        ) -> Arc<Mutex<dyn Player>> {
-+            // Audio is self-rendered through AAudio (same model as the OHOS
-+            // backend), so the audio_renderer is intentionally unused.
-+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-+            let player = AndroidPlayer::new(
-+                id,
-+                *context_id,
-+                stream_type,
-+                sender,
-+                video_renderer,
-+                self.backend_chan.clone(),
-+            );
-+            self.instances
-+                .lock()
-+                .unwrap()
-+                .insert(id, (*context_id, Arc::downgrade(&player)));
-+            player
-+        }
-+
-+        fn create_audiostream(&self) -> MediaStreamId {
-+            warn!("AndroidBackend: create_audiostream not supported");
-+            MediaStreamId::new()
-+        }
-+
-+        fn create_videostream(&self) -> MediaStreamId {
-+            warn!("AndroidBackend: create_videostream not supported");
-+            MediaStreamId::new()
-+        }
-+
-+        fn create_stream_output(&self) -> Box<dyn MediaOutput> {
-+            warn!("AndroidBackend: create_stream_output not supported");
-+            Box::new(AndroidMediaOutput)
-+        }
-+
-+        fn create_stream_and_socket(
-+            &self,
-+            _ty: MediaStreamType,
-+        ) -> (Box<dyn MediaSocket>, MediaStreamId) {
-+            warn!("AndroidBackend: create_stream_and_socket not supported");
-+            (Box::new(AndroidMediaSocket), MediaStreamId::new())
-+        }
-+
-+        fn create_audioinput_stream(
-+            &self,
-+            _set: MediaTrackConstraintSet,
-+        ) -> Option<MediaStreamId> {
-+            warn!("AndroidBackend: create_audioinput_stream not supported");
-+            None
-+        }
-+
-+        fn create_videoinput_stream(
-+            &self,
-+            _set: MediaTrackConstraintSet,
-+        ) -> Option<MediaStreamId> {
-+            warn!("AndroidBackend: create_videoinput_stream not supported");
-+            None
-+        }
-+
-+        fn create_audio_context(
-+            &self,
-+            _id: &ClientContextId,
-+            _options: AudioContextOptions,
-+        ) -> Result<Arc<Mutex<servo_media_audio::context::AudioContext>>, AudioSinkError> {
-+            warn!("AndroidBackend: create_audio_context not supported");
-+            Err(AudioSinkError::Backend(
-+                "AudioContext not supported by the experimental Android backend".to_owned(),
-+            ))
-+        }
-+
-+        fn create_webrtc(&self, _signaller: Box<dyn WebRtcSignaller>) -> WebRtcController {
-+            todo!()
-+        }
-+
-+        fn can_play_type(&self, media_type: &str) -> SupportsMediaType {
-+            // Conservative by construction: this backend never answers
-+            // Probably without per-device codec capability evidence.
-+            match mime_table::can_play_type(media_type) {
-+                mime_table::Support::Maybe => SupportsMediaType::Maybe,
-+                mime_table::Support::No => SupportsMediaType::No,
-+            }
-+        }
-+
-+        fn mute(&self, id: &ClientContextId, val: bool) {
-+            self.media_instance_action(id, &move |instance: &dyn MediaInstance| {
-+                let _ = instance.mute(val);
-+            });
-+        }
-+
-+        fn resume(&self, id: &ClientContextId) {
-+            self.media_instance_action(id, &move |instance: &dyn MediaInstance| {
-+                let _ = instance.resume();
-+            });
-+        }
-+
-+        fn suspend(&self, id: &ClientContextId) {
-+            self.media_instance_action(id, &move |instance: &dyn MediaInstance| {
-+                let _ = instance.suspend();
-+            });
-+        }
-+
-+        fn get_device_monitor(&self) -> Box<dyn MediaDeviceMonitor> {
-+            warn!("AndroidBackend: get_device_monitor not supported");
-+            Box::new(AndroidDeviceMonitor)
-+        }
-+    }
-+
-+    struct AndroidMediaOutput;
-+
-+    impl MediaOutput for AndroidMediaOutput {
-+        fn add_stream(&mut self, _stream: &MediaStreamId) {
-+            warn!("AndroidBackend: add_stream not supported");
-+        }
-+    }
-+
-+    struct AndroidMediaSocket;
-+
-+    impl MediaSocket for AndroidMediaSocket {
-+        fn as_any(&self) -> &dyn Any {
-+            self
-+        }
-+    }
-+
-+    struct AndroidDeviceMonitor;
-+
-+    impl MediaDeviceMonitor for AndroidDeviceMonitor {
-+        fn enumerate_devices(&self) -> Option<Vec<MediaDeviceInfo>> {
-+            Some(vec![])
-+        }
++    fn get_device_monitor(&self) -> Box<dyn MediaDeviceMonitor> {
++        warn!("AndroidBackend: get_device_monitor not supported");
++        Box::new(AndroidDeviceMonitor)
 +    }
 +}
 +
-+#[cfg(target_os = "android")]
-+pub use android_impl::AndroidBackend;
-diff --git a/components/media/backends/android/mime_table.rs b/components/media/backends/android/mime_table.rs
-new file mode 100644
-index 0000000..bfeb44f
---- /dev/null
-+++ b/components/media/backends/android/mime_table.rs
-@@ -0,0 +1,99 @@
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++struct AndroidMediaOutput;
 +
-+//! Conservative canPlayType table (pure logic, host-testable).
-+//!
-+//! This backend never answers "probably": without querying the actual
-+//! device's MediaCodecList we cannot claim a specific codec decodes on this
-+//! device, so known container + known codec family tops out at Maybe, and
-+//! anything unrecognized is No.
-+
-+/// Support estimate for a MIME type string. Mirrors
-+/// servo_media::SupportsMediaType minus `Probably`, which this backend never
-+/// returns (see module docs).
-+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-+pub enum Support {
-+    Maybe,
-+    No,
-+}
-+
-+const KNOWN_CONTAINERS: [&str; 10] = [
-+    "video/mp4",
-+    "application/mp4",
-+    "audio/mp4",
-+    "audio/x-m4a",
-+    "audio/mpeg",
-+    "audio/aac",
-+    "video/webm",
-+    "audio/webm",
-+    "video/3gpp",
-+    "audio/3gpp",
-+];
-+
-+const KNOWN_CODECS: [&str; 13] = [
-+    "avc1", "avc3", "hvc1", "hev1", "vp8", "vp08", "vp9", "vp09", "av01", "mp4a", "opus",
-+    "vorbis", "mp3",
-+];
-+
-+pub fn can_play_type(media_type: &str) -> Support {
-+    let Ok(mime) = media_type.parse::<mime::Mime>() else {
-+        return Support::No;
-+    };
-+    let mime_type = mime.type_().as_str().to_owned() + "/" + mime.subtype().as_str();
-+    if !KNOWN_CONTAINERS.contains(&mime_type.as_str()) {
-+        return Support::No;
-+    }
-+    match mime.get_param("codecs") {
-+        None => Support::Maybe,
-+        Some(codecs) => {
-+            // The mime crate keeps surrounding quotes on quoted-string
-+            // parameter values; strip them per codec token.
-+            let all_known = codecs
-+                .as_str()
-+                .split(',')
-+                .map(|c| c.trim().trim_matches('"'))
-+                .all(|c| KNOWN_CODECS.iter().any(|k| c.starts_with(k)));
-+            if all_known {
-+                Support::Maybe
-+            } else {
-+                Support::No
-+            }
-+        },
++impl MediaOutput for AndroidMediaOutput {
++    fn add_stream(&mut self, _stream: &MediaStreamId) {
++        warn!("AndroidBackend: add_stream not supported");
 +    }
 +}
 +
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
++struct AndroidMediaSocket;
 +
-+    #[test]
-+    fn common_types_are_maybe() {
-+        assert_eq!(can_play_type("video/mp4"), Support::Maybe);
-+        assert_eq!(can_play_type("audio/mpeg"), Support::Maybe);
-+        assert_eq!(
-+            can_play_type("video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\""),
-+            Support::Maybe
-+        );
-+        assert_eq!(can_play_type("video/webm; codecs=\"vp9, opus\""), Support::Maybe);
-+        assert_eq!(can_play_type("audio/mp4; codecs=\"mp4a.40.5\""), Support::Maybe);
-+    }
-+
-+    #[test]
-+    fn unknown_container_or_codec_is_no() {
-+        assert_eq!(can_play_type("video/ogg"), Support::No);
-+        assert_eq!(can_play_type("application/x-mpegURL"), Support::No);
-+        assert_eq!(can_play_type("video/mp4; codecs=\"ac-3\""), Support::No);
-+        assert_eq!(can_play_type("not a mime"), Support::No);
-+        assert_eq!(can_play_type(""), Support::No);
-+    }
-+
-+    #[test]
-+    fn mixed_codec_list_is_no() {
-+        // One unknown codec in the list must not get a free pass.
-+        assert_eq!(
-+            can_play_type("video/mp4; codecs=\"avc1.42E01E, ac-3\""),
-+            Support::No
-+        );
++impl MediaSocket for AndroidMediaSocket {
++    fn as_any(&self) -> &dyn Any {
++        self
 +    }
 +}
-diff --git a/components/media/backends/android/player.rs b/components/media/backends/android/player.rs
++
++struct AndroidDeviceMonitor;
++
++impl MediaDeviceMonitor for AndroidDeviceMonitor {
++    fn enumerate_devices(&self) -> Option<Vec<MediaDeviceInfo>> {
++        Some(vec![])
++    }
++}
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
 new file mode 100644
 index 0000000..83d19f3
 --- /dev/null
-+++ b/components/media/backends/android/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
 @@ -0,0 +1,1367 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -2307,11 +1676,11 @@ index 0000000..83d19f3
 +        }
 +    }
 +}
-diff --git a/components/media/backends/android/source.rs b/components/media/backends/android/source.rs
+diff --git a/components/media/backends/android/android_impl/source.rs b/components/media/backends/android/android_impl/source.rs
 new file mode 100644
 index 0000000..76f9701
 --- /dev/null
-+++ b/components/media/backends/android/source.rs
++++ b/components/media/backends/android/android_impl/source.rs
 @@ -0,0 +1,136 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -2449,11 +1818,11 @@ index 0000000..76f9701
 +        }
 +    }
 +}
-diff --git a/components/media/backends/android/sys.rs b/components/media/backends/android/sys.rs
+diff --git a/components/media/backends/android/android_impl/sys.rs b/components/media/backends/android/android_impl/sys.rs
 new file mode 100644
 index 0000000..e7a3f78
 --- /dev/null
-+++ b/components/media/backends/android/sys.rs
++++ b/components/media/backends/android/android_impl/sys.rs
 @@ -0,0 +1,279 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -2734,6 +2103,644 @@ index 0000000..e7a3f78
 +/// media_status_t values from media/NdkMediaError.h (verified).
 +pub const AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE: media_status_t = -30001;
 +pub const AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED: media_status_t = -30002;
+diff --git a/components/media/backends/android/buffer.rs b/components/media/backends/android/buffer.rs
+new file mode 100644
+index 0000000..7a717ac
+--- /dev/null
++++ b/components/media/backends/android/buffer.rs
+@@ -0,0 +1,395 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Progressive-download playback buffer (pure logic, host-testable).
++//!
++//! Ported from the OHOS backend's PlaybackBuffer
++//! (components/media/backends/ohos/ohos_media/source.rs) with one deliberate
++//! difference: instead of returning 0 bytes when data is not yet available
++//! (which AMediaExtractor does not tolerate well), readers block on a
++//! condition variable until data arrives, the stream ends, or the source is
++//! cancelled. Cancellation (player stop/shutdown) always unblocks readers.
++//!
++//! Three threads interact with the buffer:
++//! 1. The media element's fetch thread pushes downloaded bytes (push_data).
++//! 2. AMediaExtractor reader threads call readAt (read_at).
++//! 3. The pipeline thread cancels on shutdown (cancel).
++
++use std::sync::{Condvar, Mutex};
++use std::time::Duration;
++
++use log::debug;
++
++const DEFAULT_CACHE_SIZE: usize = 8 * 1024 * 1024; // 8MB
++/// Re-request data from the fetcher when fewer bytes than this remain buffered.
++const LOW_WATER_MARK: usize = DEFAULT_CACHE_SIZE / 4;
++/// Bytes kept before the current read position when sliding the window, to
++/// tolerate small backwards reads without a full refetch.
++const BACK_BUFFER: usize = 64 * 1024;
++
++/// A request the readAt callback must dispatch *after* releasing the buffer
++/// lock. The seek closure blocks on IPC with the script thread, so holding
++/// the buffer lock while calling it would deadlock against a concurrent
++/// push_data (which also acquires this lock).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub enum Dispatch {
++    /// The extractor needs bytes from a position outside the buffered window;
++    /// the fetcher must restart its download at this byte offset.
++    Seek(u64),
++    /// The buffer ran below the low-water mark; ask the fetcher for more data.
++    NeedData,
++}
++
++struct BufferState {
++    buffer: Vec<u8>,
++    /// Byte offset in the media resource of buffer[0].
++    buffer_data_head: i64,
++    has_active_request: bool,
++    is_seeking: bool,
++    /// True once end_of_stream was signalled by the fetcher: no more data will
++    /// ever arrive.
++    is_eos: bool,
++    /// True once the source is torn down; readers must bail out immediately.
++    cancelled: bool,
++    /// Total resource size in bytes, 0 when not (yet) known.
++    total_size: i64,
++}
++
++pub struct SharedBuffer {
++    state: Mutex<BufferState>,
++    cond: Condvar,
++}
++
++impl Default for SharedBuffer {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl SharedBuffer {
++    pub fn new() -> Self {
++        SharedBuffer {
++            state: Mutex::new(BufferState {
++                buffer: Vec::with_capacity(DEFAULT_CACHE_SIZE),
++                buffer_data_head: 0,
++                has_active_request: false,
++                is_seeking: false,
++                is_eos: false,
++                cancelled: false,
++                total_size: 0,
++            }),
++            cond: Condvar::new(),
++        }
++    }
++
++    pub fn set_total_size(&self, size: i64) {
++        let mut st = self.state.lock().unwrap();
++        if st.total_size == 0 {
++            st.total_size = size;
++        }
++    }
++
++    pub fn total_size(&self) -> i64 {
++        self.state.lock().unwrap().total_size
++    }
++
++    pub fn notify_seek_done(&self) {
++        let mut st = self.state.lock().unwrap();
++        st.is_seeking = false;
++        self.cond.notify_all();
++    }
++
++    /// Append fetched bytes. Returns false when the buffer is full, in which
++    /// case the fetcher should stop until more data is requested (the caller
++    /// is expected to surface EnoughData to the media element).
++    pub fn push_data(&self, data: &[u8]) -> bool {
++        let mut st = self.state.lock().unwrap();
++        // Reject data while a seek is in progress. Between the buffer being
++        // cleared/reset for a new seek position and the old fetch being
++        // cancelled, stale data from the previous fetch could arrive and
++        // corrupt the buffer (it would be appended as if it started at the
++        // new seek position). Silently discard it.
++        if st.is_seeking {
++            return true;
++        }
++        if st.buffer.len() + data.len() > st.buffer.capacity() {
++            debug!(
++                "Playback buffer full: head {}, len {}, incoming {}",
++                st.buffer_data_head,
++                st.buffer.len(),
++                data.len()
++            );
++            st.has_active_request = false;
++            return false;
++        }
++        st.buffer.extend_from_slice(data);
++        self.cond.notify_all();
++        true
++    }
++
++    pub fn end_of_stream(&self) {
++        let mut st = self.state.lock().unwrap();
++        st.is_eos = true;
++        st.has_active_request = false;
++        self.cond.notify_all();
++    }
++
++    pub fn cancel(&self) {
++        let mut st = self.state.lock().unwrap();
++        st.cancelled = true;
++        self.cond.notify_all();
++    }
++
++    pub fn is_cancelled(&self) -> bool {
++        self.state.lock().unwrap().cancelled
++    }
++
++    /// Buffered window as (head, len) for buffered() reporting.
++    pub fn buffered_window(&self) -> (i64, i64) {
++        let st = self.state.lock().unwrap();
++        (st.buffer_data_head, st.buffer.len() as i64)
++    }
++
++    /// Serve a readAt request for `pos`. May block waiting for data.
++    ///
++    /// AMediaDataSource readAt contract: return the number of bytes read, 0
++    /// if `size` was 0, or -1 to indicate end of stream. We never return a
++    /// short read for "no data yet"; we wait instead.
++    pub fn read_at(&self, dest: &mut [u8], pos: i64) -> (isize, Option<Dispatch>) {
++        if dest.is_empty() {
++            return (0, None);
++        }
++        let mut st = self.state.lock().unwrap();
++        loop {
++            if st.cancelled {
++                return (-1, None);
++            }
++            if st.is_seeking {
++                // A byte-range refetch is being set up; wait for the first
++                // bytes from the new position (or cancellation).
++                st = self.cond.wait(st).unwrap();
++                continue;
++            }
++            let pos_offset = pos - st.buffer_data_head;
++            let available = st.buffer.len() as i64 - pos_offset;
++            if pos_offset < 0 {
++                // Reader moved backwards outside the buffered window.
++                st.buffer.clear();
++                st.buffer_data_head = pos.max(0);
++                st.has_active_request = true;
++                st.is_seeking = true;
++                return (0, Some(Dispatch::Seek(pos.max(0) as u64)));
++            }
++            if available > 0 {
++                let n = available.min(dest.len() as i64) as usize;
++                dest[..n].copy_from_slice(
++                    &st.buffer[pos_offset as usize..pos_offset as usize + n],
++                );
++                // Slide the window forward: drop consumed prefix bytes (keep
++                // a small back-buffer for the extractor's occasional small
++                // backwards peeks, e.g. box re-reads during init) so the 8MB
++                // window does not fill up and stall the download.
++                if pos_offset as usize > BACK_BUFFER {
++                    let drop = pos_offset as usize - BACK_BUFFER;
++                    st.buffer.drain(..drop);
++                    st.buffer_data_head += drop as i64;
++                }
++                let remaining =
++                    (st.buffer.len() as i64) - (pos + n as i64 - st.buffer_data_head);
++                let need_data = !st.is_eos &&
++                    !st.has_active_request &&
++                    remaining < LOW_WATER_MARK as i64;
++                if need_data {
++                    st.has_active_request = true;
++                }
++                let dispatch = if need_data {
++                    Some(Dispatch::NeedData)
++                } else {
++                    None
++                };
++                return (n as isize, dispatch);
++            }
++            if st.is_eos {
++                // True end of the resource.
++                return (-1, None);
++            }
++            if !st.has_active_request {
++                // No fetch in flight: restart the download at pos. (An active
++                // fetch streams forward from the current window end and will
++                // cover any later position, so we simply wait for it.)
++                debug!(
++                    "read_at: need refetch at {} (head {}, len {})",
++                    pos,
++                    st.buffer_data_head,
++                    st.buffer.len()
++                );
++                st.buffer.clear();
++                st.buffer_data_head = pos;
++                st.has_active_request = true;
++                st.is_seeking = true;
++                return (0, Some(Dispatch::Seek(pos as u64)));
++            }
++            // A fetch is in flight and will cover this position: wait.
++            st = self
++                .cond
++                .wait_timeout(st, Duration::from_secs(2))
++                .unwrap()
++                .0;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Arc;
++
++    fn buf_with(size: usize) -> SharedBuffer {
++        let b = SharedBuffer::new();
++        b.set_total_size(size as i64);
++        b
++    }
++
++    #[test]
++    fn sequential_read_and_slide() {
++        let b = buf_with(1_000_000_000);
++        let chunk = vec![7u8; 3 * 1024 * 1024]; // 3MB: above the low-water mark
++        assert!(b.push_data(&chunk));
++        let mut dest = vec![0u8; 100_000];
++        let (n, d) = b.read_at(&mut dest, 0);
++        assert_eq!((n, d), (100_000, None));
++        assert!(dest.iter().all(|&x| x == 7));
++        // Beyond the back-buffer: window slides so head advances.
++        let (n, d) = b.read_at(&mut dest, 100_000);
++        assert_eq!((n, d), (100_000, None));
++        let (head, len) = b.buffered_window();
++        assert!(head > 0, "window should slide forward, head={head}");
++        assert!(len <= 3 * 1024 * 1024);
++    }
++
++    #[test]
++    fn read_past_available_waits_then_unblocks_on_push() {
++        let b = Arc::new(buf_with(64 * 1024 * 1024));
++        let big = vec![5u8; DEFAULT_CACHE_SIZE];
++        assert!(b.push_data(&big));
++        // Drain in 1MB chunks (the slide frees capacity as we go) until the
++        // low-water mark marks a fetch in flight.
++        let mut pos = 0i64;
++        let mut chunk = vec![0u8; 1024 * 1024];
++        loop {
++            let (n, d) = b.read_at(&mut chunk, pos);
++            pos += n as i64;
++            if d == Some(Dispatch::NeedData) {
++                break;
++            }
++            assert!(n > 0, "must not hit EOS/seek during drain");
++        }
++        // Finish draining what remains.
++        let mut remaining_buf = vec![0u8; DEFAULT_CACHE_SIZE];
++        let (n, _) = b.read_at(&mut remaining_buf[..(DEFAULT_CACHE_SIZE - pos as usize)], pos);
++        assert!(n > 0);
++        let end_pos = pos + n as i64;
++        let b2 = b.clone();
++        let reader = std::thread::spawn(move || {
++            let mut small = vec![0u8; 1024];
++            // Buffer empty, fetch in flight, no EOS: must block, not seek.
++            b2.read_at(&mut small, end_pos).0
++        });
++        std::thread::sleep(Duration::from_millis(100));
++        assert!(
++            !reader.is_finished(),
++            "reader must block while a fetch is in flight"
++        );
++        assert!(b.push_data(&vec![6u8; 4096]));
++        let n = reader.join().unwrap();
++        assert_eq!(n, 1024);
++    }
++
++    #[test]
++    fn read_before_head_requests_seek() {
++        let b = buf_with(1_000_000);
++        assert!(b.push_data(&vec![3u8; 300_000]));
++        // Read at 200_000: pos_offset exceeds BACK_BUFFER, so the window
++        // slides and head advances to 200_000 - BACK_BUFFER.
++        let mut dest = vec![0u8; 100_000];
++        let (n, _) = b.read_at(&mut dest, 200_000);
++        assert_eq!(n, 100_000);
++        let (head, _) = b.buffered_window();
++        assert_eq!(head, 200_000 - BACK_BUFFER as i64);
++        // Position 0 is now before the window: a byte-range refetch is needed.
++        let mut small = vec![0u8; 4096];
++        let (_, d) = b.read_at(&mut small, 0);
++        assert_eq!(d, Some(Dispatch::Seek(0)));
++    }
++
++    #[test]
++    fn full_buffer_rejects_push_and_eos_ends_reads() {
++        let b = buf_with(64 * 1024 * 1024);
++        let big = vec![9u8; DEFAULT_CACHE_SIZE];
++        assert!(b.push_data(&big));
++        assert!(!b.push_data(&[1u8; 1]), "full buffer must reject");
++        b.end_of_stream();
++        let mut dest = vec![0u8; 1024];
++        // Drain everything, then EOS must yield -1.
++        let mut pos = 0i64;
++        loop {
++            let (n, _) = b.read_at(&mut dest, pos);
++            if n <= 0 {
++                assert_eq!(n, -1);
++                break;
++            }
++            pos += n as i64;
++            assert!(pos <= DEFAULT_CACHE_SIZE as i64 + 1024);
++        }
++    }
++
++    #[test]
++    fn cancel_unblocks_blocked_reader() {
++        let b = Arc::new(buf_with(64 * 1024 * 1024));
++        assert!(b.push_data(&vec![5u8; DEFAULT_CACHE_SIZE]));
++        // Drain past the low-water mark so a fetch is in flight.
++        let mut chunk = vec![0u8; 1024 * 1024];
++        let mut pos = 0i64;
++        loop {
++            let (n, d) = b.read_at(&mut chunk, pos);
++            pos += n as i64;
++            if d == Some(Dispatch::NeedData) {
++                break;
++            }
++            assert!(n > 0);
++        }
++        let b2 = b.clone();
++        let reader = std::thread::spawn(move || {
++            let mut dest = vec![0u8; 1024];
++            // Read past the buffered end with a fetch in flight: blocks.
++            b2.read_at(&mut dest, DEFAULT_CACHE_SIZE as i64).0
++        });
++        std::thread::sleep(Duration::from_millis(100));
++        assert!(!reader.is_finished(), "reader must be blocked on the fetch");
++        b.cancel();
++        let n = reader.join().unwrap();
++        assert_eq!(n, -1, "cancelled read must bail out with -1");
++    }
++
++    #[test]
++    fn low_water_marks_need_data_once() {
++        let b = buf_with(64 * 1024 * 1024);
++        // Fill the buffer completely.
++        let big = vec![5u8; DEFAULT_CACHE_SIZE];
++        assert!(b.push_data(&big)); // has_active_request stays false, buffer full
++        // Read down past the low-water mark: first such read must dispatch
++        // NeedData exactly once, subsequent reads must not repeat it while a
++        // request is already active.
++        let mut dest = vec![0u8; DEFAULT_CACHE_SIZE - LOW_WATER_MARK - 1024];
++        let (n, d) = b.read_at(&mut dest, 0);
++        assert_eq!(n as usize, dest.len());
++        assert_eq!(d, None, "still above low-water right after read");
++        let mut small = vec![0u8; 2048];
++        let pos = dest.len() as i64;
++        let (_, d1) = b.read_at(&mut small, pos);
++        assert_eq!(d1, Some(Dispatch::NeedData));
++        let (_, d2) = b.read_at(&mut small, pos + 2048);
++        assert_eq!(d2, None, "no duplicate NeedData while request active");
++    }
++}
+diff --git a/components/media/backends/android/hosttest/.gitignore b/components/media/backends/android/hosttest/.gitignore
+new file mode 100644
+index 0000000..ea8c4bf
+--- /dev/null
++++ b/components/media/backends/android/hosttest/.gitignore
+@@ -0,0 +1 @@
++/target
+diff --git a/components/media/backends/android/hosttest/Cargo.lock b/components/media/backends/android/hosttest/Cargo.lock
+new file mode 100644
+index 0000000..93424ad
+--- /dev/null
++++ b/components/media/backends/android/hosttest/Cargo.lock
+@@ -0,0 +1,23 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "log"
++version = "0.4.35"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
++
++[[package]]
++name = "mime"
++version = "0.3.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
++
++[[package]]
++name = "servo-media-android-hosttest"
++version = "0.0.0"
++dependencies = [
++ "log",
++ "mime",
++]
+diff --git a/components/media/backends/android/hosttest/Cargo.toml b/components/media/backends/android/hosttest/Cargo.toml
+new file mode 100644
+index 0000000..baa83e9
+--- /dev/null
++++ b/components/media/backends/android/hosttest/Cargo.toml
+@@ -0,0 +1,14 @@
++[package]
++name = "servo-media-android-hosttest"
++version = "0.0.0"
++edition = "2021"
++publish = false
++
++# Standalone workspace: this test crate is NOT part of the servo workspace.
++# It #[path]-includes the backend's pure-logic modules verbatim so host tests
++# exercise the exact code the Android build compiles.
++[workspace]
++
++[dependencies]
++log = "0.4"
++mime = "0.3"
+diff --git a/components/media/backends/android/hosttest/README.md b/components/media/backends/android/hosttest/README.md
+new file mode 100644
+index 0000000..fe267fe
+--- /dev/null
++++ b/components/media/backends/android/hosttest/README.md
+@@ -0,0 +1,24 @@
++# Host tests for the Android media backend
++
++The pure logic of the backend (buffering, MIME table, YUV packing) is
++host-testable. This harness compiles the exact shipped files on the host via
++#[path] includes and runs their unit tests. The NDK-dependent code
++(sys.rs/source.rs/player.rs) is compiled only for Android targets.
++
++## Invocation
++
++    cd components/media/backends/android/hosttest
++    cargo test
++
++Requires any stable Rust toolchain (verified with 1.99.1). No Servo checkout,
++no Android SDK/NDK needed. The own [workspace] in Cargo.toml keeps this out of
++the Servo workspace when the crate is vendored into it.
++
++## Results (2026-11-06)
++
++    test result: ok. 13 passed; 0 failed
++
++Covered: SharedBuffer windows/seeks (6), mime_table answers (3),
++yuv_pack packing incl. row/pixel strides (4). NOT covered (need device
++evidence): codec format negotiation, crop/rotation/color changes, odd
++dimensions, ImageReader-decoder compatibility, A/V sync, audio focus/routes.
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+new file mode 100644
+index 0000000..7ea79be
+--- /dev/null
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -0,0 +1,8 @@
++//! Host-test harness: includes the backend's pure modules by path so the
++//! tests compile and run the exact sources shipped in the Android build.
++#[path = "../../buffer.rs"]
++pub mod buffer;
++#[path = "../../mime_table.rs"]
++pub mod mime_table;
++#[path = "../../yuv_pack.rs"]
++pub mod yuv_pack;
+diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
+new file mode 100644
+index 0000000..8d33fc9
+--- /dev/null
++++ b/components/media/backends/android/lib.rs
+@@ -0,0 +1,26 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Experimental Android media backend for Servo, implemented directly on the
++//! NDK media APIs (AMediaExtractor + AMediaCodec into an AImageReader surface
++//! + AAudio), fed by Servo's own progressive media fetch through an
++//! AMediaDataSource.
++//!
++//! This backend is compiled for Android builds but only selected at runtime
++//! when the `media_android_backend_enabled` pref is true; otherwise the dummy
++//! backend is used, exactly as before. Milestone-1 scope is progressive
++//! <video>/<audio> playback; MSE/EME/WebRTC/MediaStreams remain stubbed, and
++//! Android audio focus / route changes are not handled yet.
++
++// Pure logic, host-testable: hosttest/ #[path]-includes these exact files and
++// runs their unit tests on the host.
++mod buffer;
++mod mime_table;
++mod yuv_pack;
++
++#[cfg(target_os = "android")]
++mod android_impl;
++
++#[cfg(target_os = "android")]
++pub use android_impl::AndroidBackend;
+diff --git a/components/media/backends/android/mime_table.rs b/components/media/backends/android/mime_table.rs
+new file mode 100644
+index 0000000..bfeb44f
+--- /dev/null
++++ b/components/media/backends/android/mime_table.rs
+@@ -0,0 +1,99 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Conservative canPlayType table (pure logic, host-testable).
++//!
++//! This backend never answers "probably": without querying the actual
++//! device's MediaCodecList we cannot claim a specific codec decodes on this
++//! device, so known container + known codec family tops out at Maybe, and
++//! anything unrecognized is No.
++
++/// Support estimate for a MIME type string. Mirrors
++/// servo_media::SupportsMediaType minus `Probably`, which this backend never
++/// returns (see module docs).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Support {
++    Maybe,
++    No,
++}
++
++const KNOWN_CONTAINERS: [&str; 10] = [
++    "video/mp4",
++    "application/mp4",
++    "audio/mp4",
++    "audio/x-m4a",
++    "audio/mpeg",
++    "audio/aac",
++    "video/webm",
++    "audio/webm",
++    "video/3gpp",
++    "audio/3gpp",
++];
++
++const KNOWN_CODECS: [&str; 13] = [
++    "avc1", "avc3", "hvc1", "hev1", "vp8", "vp08", "vp9", "vp09", "av01", "mp4a", "opus",
++    "vorbis", "mp3",
++];
++
++pub fn can_play_type(media_type: &str) -> Support {
++    let Ok(mime) = media_type.parse::<mime::Mime>() else {
++        return Support::No;
++    };
++    let mime_type = mime.type_().as_str().to_owned() + "/" + mime.subtype().as_str();
++    if !KNOWN_CONTAINERS.contains(&mime_type.as_str()) {
++        return Support::No;
++    }
++    match mime.get_param("codecs") {
++        None => Support::Maybe,
++        Some(codecs) => {
++            // The mime crate keeps surrounding quotes on quoted-string
++            // parameter values; strip them per codec token.
++            let all_known = codecs
++                .as_str()
++                .split(',')
++                .map(|c| c.trim().trim_matches('"'))
++                .all(|c| KNOWN_CODECS.iter().any(|k| c.starts_with(k)));
++            if all_known {
++                Support::Maybe
++            } else {
++                Support::No
++            }
++        },
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn common_types_are_maybe() {
++        assert_eq!(can_play_type("video/mp4"), Support::Maybe);
++        assert_eq!(can_play_type("audio/mpeg"), Support::Maybe);
++        assert_eq!(
++            can_play_type("video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\""),
++            Support::Maybe
++        );
++        assert_eq!(can_play_type("video/webm; codecs=\"vp9, opus\""), Support::Maybe);
++        assert_eq!(can_play_type("audio/mp4; codecs=\"mp4a.40.5\""), Support::Maybe);
++    }
++
++    #[test]
++    fn unknown_container_or_codec_is_no() {
++        assert_eq!(can_play_type("video/ogg"), Support::No);
++        assert_eq!(can_play_type("application/x-mpegURL"), Support::No);
++        assert_eq!(can_play_type("video/mp4; codecs=\"ac-3\""), Support::No);
++        assert_eq!(can_play_type("not a mime"), Support::No);
++        assert_eq!(can_play_type(""), Support::No);
++    }
++
++    #[test]
++    fn mixed_codec_list_is_no() {
++        // One unknown codec in the list must not get a free pass.
++        assert_eq!(
++            can_play_type("video/mp4; codecs=\"avc1.42E01E, ac-3\""),
++            Support::No
++        );
++    }
++}
 diff --git a/components/media/backends/android/yuv_pack.rs b/components/media/backends/android/yuv_pack.rs
 new file mode 100644
 index 0000000..6dba694
