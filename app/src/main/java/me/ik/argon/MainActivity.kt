@@ -106,8 +106,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
     companion object {
         private const val ENGINE_UA =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Mobile Safari/537.36"
-        private val ENGINE_ARGS: String =
-            org.json.JSONArray().apply { put("--user-agent"); put(ENGINE_UA) }.toString()
     }
     private var searchEngine by mutableStateOf(SearchEngine.GOOGLE)
     private var omniboxFocused by mutableStateOf(false)
@@ -128,6 +126,15 @@ class MainActivity : ComponentActivity(), Servo.Client {
         history = HistoryStore(this)
         bookmarks = BookmarkStore(this)
         val startPageUrl = StartPage.write(this, bookmarks.entries, searchEngine)
+        // Experiment: user stylesheet declaring script-fallback family names
+        // from the device's own font files (bounded size; no default-family
+        // replacement). Null when no usable fonts found.
+        val fontCssPath = FontCss.write(this)
+        val engineArgs =
+            org.json.JSONArray().apply {
+                put("--user-agent"); put(ENGINE_UA)
+                if (fontCssPath != null) { put("--user-stylesheet"); put(fontCssPath) }
+            }.toString()
         enableEdgeToEdge()
 
         val intentUrl = if (intent?.action == Intent.ACTION_VIEW) intent.data?.toString() else null
@@ -141,7 +148,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         // UA: Chrome's reduced mobile string (frozen Android 10 / K
                         // model + major version), so sites serve their standard
                         // mobile experience. Verified website-visible in tests.
-                        args = ENGINE_ARGS,
+                        args = engineArgs,
                         initialUrl = intentUrl ?: startPageUrl,
                         logStr = null,
                         client = this@MainActivity,

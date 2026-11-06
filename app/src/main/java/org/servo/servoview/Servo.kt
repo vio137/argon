@@ -422,7 +422,7 @@ internal constructor(
             if (paintingActive.get()) {
                 val t0 = System.nanoTime()
                 jni.doFrame()
-                me.ik.argon.PerfStats.recordFrame(frameTs, System.nanoTime() - t0)
+                me.ik.argon.PerfStats.recordFrame(frameTs, t0, System.nanoTime() - t0)
             }
         }
     }

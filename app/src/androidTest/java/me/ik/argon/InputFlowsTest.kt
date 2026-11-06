@@ -364,6 +364,12 @@ class InputFlowsTest {
             for (i in 1..10) {
                 device.swipe(cx, (h * 0.80).toInt(), cx, (h * 0.20).toInt(), 6)
                 Thread.sleep(450)
+                if (i == 5) {
+                    // Native (UiAutomator) capture MID-scroll: compare against the
+                    // same-moment video frame to attribute the streaking artifact
+                    // (renderer vs recording codec).
+                    evidence("08-scroll-mid-native")
+                }
             }
             for (i in 1..10) {
                 device.swipe(cx, (h * 0.20).toInt(), cx, (h * 0.80).toInt(), 6)
@@ -421,6 +427,43 @@ class InputFlowsTest {
             Log.i(TAG, "UA_TEST=PASS")
         } finally {
             evidence("09-ua-end")
+        }
+    }
+
+    @Test
+    fun t8_fontCssFallbackExperiment() {
+        try {
+            // Lines: (1) Bengali default family - tests whether platform
+            // missing-glyph fallback consults the user-CSS @font-face named
+            // exactly like the fallback family. (2) Bengali with explicit
+            // ArgonTestBengali - positive control for @font-face + data: URL
+            // mechanics. (3) Devanagari default. (4) Japanese default -
+            // expected tofu (CJK font exceeds the CSS size cap; documents limit).
+            val rawHtml =
+                "<!DOCTYPE html><meta name=\"viewport\" content=\"width=device-width\">" +
+                    "<body style=\"margin:0;background:#fff;padding:28px\">" +
+                    "<div style=\"font-size:44px;color:#111;margin:22px 0\">L1 বাংলা আমার ভাষা</div>" +
+                    "<div style=\"font-size:44px;color:#111;margin:22px 0;font-family:ArgonTestBengali\">L2 বাংলা আমার ভাষা</div>" +
+                    "<div style=\"font-size:44px;color:#111;margin:22px 0\">L3 देवनागरी हिन्दी भाषा</div>" +
+                    "<div style=\"font-size:44px;color:#111;margin:22px 0\">L4 日本語のテキスト</div>"
+            val enc =
+                java.net.URLEncoder.encode(rawHtml, "UTF-8")
+                    .replace("+", "%20")
+                    .replace("%7E", "~")
+            val om = ensureBrowser()
+            om.click()
+            assertTrue("keyboard appears", waitIme(true, 8_000, "fontcss-omnibox-tap"))
+            om.setText("data:text/html,$enc")
+            Thread.sleep(500)
+            device.pressEnter()
+            Thread.sleep(5_000)
+            waitForLoadComplete("fontcss-page")
+            Thread.sleep(2_500)
+            evidence("10-fontcss-page")
+            Log.i(TAG, "FONTCSS_PAGE_SHOWN - verdict from native screenshot 10-fontcss-page + video")
+            Log.i(TAG, "FONTCSS_TEST=PASS")
+        } finally {
+            evidence("10-fontcss-end")
         }
     }
 }
