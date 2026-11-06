@@ -108,10 +108,24 @@ class MainActivity : ComponentActivity(), Servo.Client {
         private const val ENGINE_UA =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Mobile Safari/537.36"
 
-        /** Build-time pref arm (two-APK A/B). Empty in control builds; the
-         * precache variant sets listOf("--pref", "gfx_precache_shaders=true").
-         * Never populated from intents or other runtime input. */
-        private val ENGINE_PREFS: List<String> = emptyList()
+        /** Engine prefs shipped in the default build. Never populated from
+         * intents or other runtime input.
+         *
+         * GC responsiveness (added 1.0.14, UNVERIFIED on Argon - labeled in the
+         * release notes): the engine defaults js_mem_gc_incremental_enabled and
+         * js_mem_gc_per_zone_enabled to false, so SpiderMonkey GC runs are
+         * non-incremental stop-the-world pauses, which show up as scroll/page
+         * jank on JS-heavy sites. Incremental + per-zone GC is the long-standing
+         * Firefox configuration and slices GC work into ~10ms pieces. This is a
+         * mechanism-based choice, not a measurement: revert to emptyList() if
+         * device runs show regressions. layout_threads stays at the engine
+         * default here; threaded bench variants remain explicit opt-in builds. */
+        private val ENGINE_PREFS: List<String> =
+            listOf(
+                "--pref", "js_mem_gc_incremental_enabled=true",
+                "--pref", "js_mem_gc_incremental_slice_ms=10",
+                "--pref", "js_mem_gc_per_zone_enabled=true",
+            )
 
         private fun org.json.JSONArray.putAll(items: List<String>) {
             for (item in items) put(item)
