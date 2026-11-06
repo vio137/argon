@@ -195,6 +195,9 @@ class InputFlowsTest {
                     .replace("+", "%20")
                     .replace("%7E", "~")
             val dataUrl = "data:text/html,$enc"
+            // Evidence for the glyph-fallback investigation: which faces exist.
+            val fontInventory = device.executeShellCommand("ls /system/fonts")
+            Log.i(TAG, "FONT_INVENTORY: $fontInventory")
             val om = ensureBrowser()
             om.click()
             assertTrue("keyboard appears for omnibox", waitIme(true, 8_000, "omnibox-tap-2"))
