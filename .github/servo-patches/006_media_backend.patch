@@ -3329,7 +3329,7 @@ new file mode 100644
 index 0000000..2f0e6b1
 --- /dev/null
 +++ b/components/media/backends/android/build.rs
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,12 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
