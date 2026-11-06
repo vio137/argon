@@ -25,6 +25,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.mutableStateOf
 import org.json.JSONObject
 import org.servo.servoview.ServoHolder
 
@@ -42,6 +43,19 @@ data class ReaderArticle(
  */
 object ReaderMode {
     @Volatile private var cachedSource: String? = null
+
+    /** False once the engine proves to lack the evaluateScript symbol (older .so);
+     * the menu row is disabled instead of failing on every tap. */
+    val bridgeAvailable = mutableStateOf(true)
+
+    /** Result text is rendered as inert Compose Text (never HTML); these caps only
+     * bound memory/render cost for pathological pages. */
+    private const val MAX_TEXT_CHARS = 200_000
+    private const val MAX_PARAGRAPHS = 400
+    private const val MAX_JSON_CHARS = 600_000
+
+    /** Sentinel: result arrived after the user navigated away; discard quietly. */
+    internal const val STALE = "stale"
 
     private fun source(context: Context): String =
         cachedSource
@@ -71,17 +85,33 @@ object ReaderMode {
             }
 
     fun evaluate(context: Context, onResult: (ReaderArticle?, String?) -> Unit) {
+        if (!bridgeAvailable.value) {
+            onResult(null, "Reader view isn't available in this build.")
+            return
+        }
         val servo = ServoHolder.servo
         if (servo == null) {
             onResult(null, "Engine is not ready yet.")
             return
         }
+        // Bind the request to the page it was issued on; a result that arrives
+        // after navigation is stale and must not replace the new page's UI.
+        val urlAtRequest = ServoHolder.lastUrl
         servo.evaluateScript(source(context)) { json, error ->
-            if (error != null) {
-                onResult(null, "Couldn't read this page ($error).")
+            if (ServoHolder.lastUrl != urlAtRequest) {
+                onResult(null, STALE)
                 return@evaluateScript
             }
-            if (json == null) {
+            if (error != null) {
+                if (error == "bridge_missing") {
+                    bridgeAvailable.value = false
+                    onResult(null, "Reader view isn't available in this build.")
+                } else {
+                    onResult(null, "Couldn't read this page ($error).")
+                }
+                return@evaluateScript
+            }
+            if (json == null || json.length > MAX_JSON_CHARS) {
                 onResult(null, "Couldn't read this page.")
                 return@evaluateScript
             }
@@ -98,11 +128,16 @@ object ReaderMode {
                     )
                     return@evaluateScript
                 }
+                val rawText = obj.optString("text")
+                val cappedText =
+                    if (rawText.length > MAX_TEXT_CHARS) rawText.substring(0, MAX_TEXT_CHARS)
+                    else rawText
                 val paragraphs =
-                    obj.optString("text")
+                    cappedText
                         .split('\n')
                         .map { it.trim() }
                         .filter { it.isNotEmpty() }
+                        .take(MAX_PARAGRAPHS)
                 if (paragraphs.size < 2) {
                     onResult(null, "This page doesn't look like an article.")
                     return@evaluateScript

@@ -279,6 +279,7 @@ fun MenuSheet(
     canGoForward: Boolean,
     currentHost: String,
     onDismiss: () -> Unit,
+    readerEnabled: Boolean,
     onForward: () -> Unit,
     onReader: () -> Unit,
     onAddToStart: () -> Unit,
@@ -308,7 +309,7 @@ fun MenuSheet(
                 }
             }
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
-            SheetRow(R.drawable.ic_reader, "Reader view", true, onReader)
+            SheetRow(R.drawable.ic_reader, "Reader view", readerEnabled, onReader)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)

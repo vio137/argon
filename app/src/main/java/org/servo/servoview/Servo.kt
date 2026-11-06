@@ -380,7 +380,13 @@ internal constructor(
                 .onFailure {
                     pendingJsCallbacks.remove(id)
                     Log.e("ArgonJs", "evaluateScript engine error: $it")
-                    scope.launch { onResult(null, "engine error: ${it.message}") }
+                    // A 19-export engine .so (pre-bridge) throws UnsatisfiedLinkError;
+                    // surface it distinctly so callers can disable the feature instead
+                    // of crashing or retrying.
+                    val message =
+                        if (it is UnsatisfiedLinkError) "bridge_missing"
+                        else "engine error: ${it.message}"
+                    scope.launch { onResult(null, message) }
                 }
         }
     }

@@ -48,6 +48,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,6 +79,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.preference.PreferenceManager
 import me.ik.argon.R
 import org.servo.servoview.Servo
@@ -103,6 +106,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var readerLoading by mutableStateOf(false)
     private var readerArticle by mutableStateOf<ReaderArticle?>(null)
     private var readerError by mutableStateOf<String?>(null)
+    private var readerRequestGen = 0
     private var showAbout by mutableStateOf(false)
     private var adblock by mutableStateOf(true)
     private var experimental by mutableStateOf(false)
@@ -267,9 +271,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         Screen.Settings -> SettingsPage()
                         Screen.Browser -> {}
                     }
+                    val readerScope = rememberCoroutineScope()
                     if (showMenu) {
                         MenuSheet(
                             canGoForward = navigator.canGoForward,
+                            readerEnabled = ReaderMode.bridgeAvailable.value,
                             currentHost = hostOf(displayableUrl(currentUrl)),
                             onDismiss = { showMenu = false },
                             onForward = {
@@ -279,12 +285,22 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onReader = {
                                 showMenu = false
                                 readerLoading = true
+                                val gen = ++readerRequestGen
                                 ReaderMode.evaluate(this@MainActivity) { article, error ->
+                                    if (gen != readerRequestGen) return@evaluate
                                     readerLoading = false
-                                    if (article != null) {
-                                        readerArticle = article
-                                    } else {
-                                        readerError = error ?: "Couldn't extract the article."
+                                    when {
+                                        article != null -> readerArticle = article
+                                        error == ReaderMode.STALE -> Unit // navigated away; discard
+                                        else -> readerError = error ?: "Couldn't extract the article."
+                                    }
+                                }
+                                readerScope.launch {
+                                    delay(12_000)
+                                    if (gen == readerRequestGen && readerLoading) {
+                                        readerRequestGen++
+                                        readerLoading = false
+                                        readerError = "Reader view timed out on this page."
                                     }
                                 }
                             },
@@ -311,11 +327,18 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         AboutDialog(onDismiss = { showAbout = false })
                     }
                     if (readerLoading) {
-                        Box(
-                            Modifier.fillMaxSize().background(ArgonColors.Surface.copy(alpha = 0.55f)),
-                            contentAlignment = Alignment.Center,
+                        // Non-blocking pill: no touch interception, page stays usable
+                        // while extraction runs; results from a navigated-away page
+                        // are discarded by the request's URL binding.
+                        Row(
+                            Modifier.align(Alignment.TopCenter)
+                                .statusBarsPadding()
+                                .padding(top = 8.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(ArgonColors.SurfaceHigh)
+                                .padding(horizontal = 14.dp, vertical = 8.dp),
                         ) {
-                            Text("Preparing reader view...", color = ArgonColors.Text, fontSize = 15.sp)
+                            Text("Preparing reader view...", color = ArgonColors.Text, fontSize = 14.sp)
                         }
                     }
                     readerArticle?.let { article ->
