@@ -1,0 +1,161 @@
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index 012a04b..8f53a79 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -374,6 +374,10 @@ pub struct Preferences {
+     /// The exact behavior is given by
+     /// <https://docs.rs/hyper-util/latest/hyper_util/client/proxy/matcher/struct.Builder.html#method.no>
+     pub network_http_no_proxy: String,
++    /// When true, every HTTP(S) and WebSocket connection must go through the configured
++    /// proxy. If no usable proxy is configured the request fails instead of connecting
++    /// directly (used by Argon waX to fail closed).
++    pub network_require_proxy: bool,
+     /// The weight of the http memory cache
+     /// Notice that this is not equal to the number of different urls in the cache.
+     pub network_http_cache_size: u64,
+@@ -596,6 +600,7 @@ impl Preferences {
+             network_http_proxy_uri: String::new(),
+             network_https_proxy_uri: String::new(),
+             network_http_no_proxy: String::new(),
++            network_require_proxy: false,
+             network_http_cache_size: 5000,
+             network_local_directory_listing_enabled: true,
+             network_use_webpki_roots: false,
+diff --git a/components/net/Cargo.toml b/components/net/Cargo.toml
+index 9acc21e..c3fdd30 100644
+--- a/components/net/Cargo.toml
++++ b/components/net/Cargo.toml
+@@ -83,7 +83,7 @@ sea-query-rusqlite = { workspace = true }
+ smallvec = { workspace = true }
+ tempfile = { workspace = true }
+ time = { workspace = true }
+-tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
++tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+ tokio-rustls = { workspace = true }
+ tokio-stream = { workspace = true }
+ tokio-util = { workspace = true, features = ["codec", "io"] }
+diff --git a/components/net/connector.rs b/components/net/connector.rs
+index b1bf343..50779af 100644
+--- a/components/net/connector.rs
++++ b/components/net/connector.rs
+@@ -647,6 +647,11 @@ impl Service<Destination> for ProxyConnector {
+                 .map_err(|error| ConnectionError::ProxyError(BoxError::from(error)));
+                 Box::pin(final_tunnel)
+             },
++            None if servo_config::pref!(network_require_proxy) => {
++                Box::pin(std::future::ready(Err(ConnectionError::ProxyError(
++                    BoxError::from("direct connections are disabled (network_require_proxy)"),
++                ))))
++            },
+             None => Box::pin(
+                 self.client
+                     .call(req)
+diff --git a/components/net/websocket_loader.rs b/components/net/websocket_loader.rs
+index 8e6b344..8688b4a 100644
+--- a/components/net/websocket_loader.rs
++++ b/components/net/websocket_loader.rs
+@@ -299,6 +299,90 @@ async fn run_ws_loop(
+     }
+ }
+ 
++/// Open the TCP stream for a WebSocket. With no proxy configured this is a
++/// plain direct connection. With `network_https_proxy_uri` (or, if empty,
++/// `network_http_proxy_uri`) set, an HTTP CONNECT tunnel to the proxy is used
++/// and any failure is an error: there is no direct fallback.
++async fn connect_ws_stream(host: &str, port: u16) -> std::io::Result<TcpStream> {
++    let https_proxy = servo_config::pref!(network_https_proxy_uri);
++    let proxy = if https_proxy.is_empty() {
++        servo_config::pref!(network_http_proxy_uri)
++    } else {
++        https_proxy
++    };
++    let require_proxy = servo_config::pref!(network_require_proxy);
++    if proxy.is_empty() {
++        if require_proxy {
++            return Err(std::io::Error::other("proxy required but not configured"));
++        }
++        return TcpStream::connect((host, port)).await;
++    }
++    let invalid = |m: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
++    let proxy_url = url::Url::parse(&proxy).map_err(|_| invalid("invalid proxy uri"))?;
++    let proxy_host = proxy_url.host_str().ok_or_else(|| invalid("proxy has no host"))?;
++    let proxy_port = proxy_url
++        .port_or_known_default()
++        .ok_or_else(|| invalid("proxy has no port"))?;
++    // Refuse anything that could inject extra header lines or a second request.
++    let bad = |v: &str| v.bytes().any(|b| b <= 0x20 || b == 0x7f);
++    if bad(host) || bad(proxy_url.username()) || bad(proxy_url.password().unwrap_or("")) {
++        return Err(invalid("control character or space in host or proxy credentials"));
++    }
++    tokio::time::timeout(
++        std::time::Duration::from_secs(20),
++        connect_via_proxy(host, port, proxy_host, proxy_port, &proxy_url),
++    )
++    .await
++    .map_err(|_| std::io::Error::other("proxy CONNECT timed out"))?
++}
++
++async fn connect_via_proxy(
++    host: &str,
++    port: u16,
++    proxy_host: &str,
++    proxy_port: u16,
++    proxy_url: &url::Url,
++) -> std::io::Result<TcpStream> {
++    use base64::Engine as _;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    let mut stream = TcpStream::connect((proxy_host, proxy_port)).await?;
++
++    let authority = if host.starts_with('[') || !host.contains(':') {
++        format!("{host}:{port}")
++    } else {
++        format!("[{host}]:{port}")
++    };
++    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
++    if !proxy_url.username().is_empty() {
++        let credentials = format!(
++            "{}:{}",
++            proxy_url.username(),
++            proxy_url.password().unwrap_or("")
++        );
++        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
++        request.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
++    }
++    request.push_str("\r\n");
++    stream.write_all(request.as_bytes()).await?;
++
++    // Read the response head byte by byte so no tunnelled data is consumed.
++    let mut head = Vec::with_capacity(256);
++    let mut byte = [0u8; 1];
++    while !head.ends_with(b"\r\n\r\n") {
++        if head.len() >= 8192 || stream.read(&mut byte).await? == 0 {
++            return Err(std::io::Error::other("proxy CONNECT response invalid"));
++        }
++        head.push(byte[0]);
++    }
++    // Status line must be exactly "HTTP/1.x 200" followed by a space or CRLF.
++    let ok = (head.starts_with(b"HTTP/1.1 200") || head.starts_with(b"HTTP/1.0 200")) &&
++        matches!(head.get(12), Some(b' ') | Some(b'\r'));
++    if !ok {
++        return Err(std::io::Error::other("proxy refused CONNECT"));
++    }
++    Ok(stream)
++}
++
+ /// Initiate a new async WS connection. Returns an error if the connection fails
+ /// for any reason, or if the response isn't valid. Otherwise, the endless WS
+ /// listening loop will be started.
+@@ -329,8 +413,11 @@ pub(crate) async fn start_websocket(
+         .port_or_known_default()
+         .ok_or_else(|| Error::Url(UrlError::UnableToConnect("Unknown port".into())))?;
+ 
+-    let try_socket = TcpStream::connect((&*domain.to_string(), port)).await;
+-    let socket = try_socket.map_err(Error::Io)?;
++    // When a proxy pref is set (e.g. by Argon waX) WebSockets must use it and
++    // must never fall back to a direct connection.
++    let socket = connect_ws_stream(&domain.to_string(), port)
++        .await
++        .map_err(Error::Io)?;
+     let connector = TlsConnector::from(Arc::new(tls_config));
+ 
+     // TODO(pylbrecht): move request conversion to a separate function
