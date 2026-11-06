@@ -354,16 +354,15 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 if (focusState.isFocused && !omniboxFocused) {
                                     omniboxFocused = true
                                     urlState.edit {
-                                        if (currentUrl.isNotEmpty()) {
-                                            replace(0, length, currentUrl)
+                                        val shown = displayableUrl(currentUrl)
+                                        if (shown.isNotEmpty()) {
+                                            replace(0, length, shown)
+                                            selectAll()
                                         }
-                                        selectAll()
                                     }
                                 } else if (!focusState.isFocused && omniboxFocused) {
                                     omniboxFocused = false
-                                    if (currentUrl.isNotEmpty()) {
-                                        urlState.edit { replace(0, length, hostOf(currentUrl)) }
-                                    }
+                                    urlState.edit { replace(0, length, hostOf(displayableUrl(currentUrl))) }
                                 }
                             },
                     )
@@ -474,7 +473,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     override fun onUrlChanged(url: String) {
         currentUrl = url
         if (!omniboxFocused) {
-            urlState.edit { replace(0, length, hostOf(url)) }
+            urlState.edit { replace(0, length, hostOf(displayableUrl(url))) }
         }
     }
 }
