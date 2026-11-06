@@ -176,7 +176,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 put("--user-agent"); put(ENGINE_UA)
                 putAll(ENGINE_PREFS)
             }.toString()
-        android.util.Log.i("ArgonNav", "ENGINE_ARGS_EFFECTIVE $engineArgs")
+        // Redact credentials before logging: engine args may carry URIs
+        // (e.g. proxy prefs) with embedded user:pass - never log secrets.
+        android.util.Log.i("ArgonNav", "ENGINE_ARGS_EFFECTIVE ${redactUriCredentials(engineArgs)}")
         enableEdgeToEdge()
 
         // High refresh rate (1.0.14): request the panel's peak-refresh mode
@@ -637,3 +639,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         super.onDestroy()
     }
 }
+
+/** Replaces the userinfo part of any URI in the string with "***". */
+internal fun redactUriCredentials(s: String): String =
+    s.replace(Regex("""([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s"\]]+@"""), "$1***@")
