@@ -1,0 +1,31 @@
+name: android-release-lint
+
+# Runs the release lint gate that is skipped locally on the 2GB build box
+# (lintVitalAnalyzeRelease stalls there). This is the release-blocking
+# equivalent; local lint skip is only a build-box workaround, findings here
+# must be reviewed before any release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Release lint
+        run: ./gradlew :app:lintVitalRelease --console=plain
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: app/build/reports/
+          if-no-files-found: ignore
