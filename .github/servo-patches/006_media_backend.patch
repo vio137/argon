@@ -3324,3 +3324,21 @@ index bb4fb92..d5bc347 100644
      not(target_env = "ohos"),
      not(all(feature = "media-gstreamer", not(target_os = "android")))
  ))]
+diff --git a/components/media/backends/android/build.rs b/components/media/backends/android/build.rs
+new file mode 100644
+index 0000000..2f0e6b1
+--- /dev/null
++++ b/components/media/backends/android/build.rs
+@@ -0,0 +1,10 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// The Android media backend calls NDK audio/media entry points directly.
++// Without these link directives the final libservoshell.so has undefined
++// AAudio/AMedia symbols and no NEEDED entries for their libraries; with
++// BIND_NOW the dynamic loader then fails to load the engine at app launch.
++fn main() {
++    println!("cargo:rustc-link-lib=aaudio");
++    println!("cargo:rustc-link-lib=mediandk");
++}
