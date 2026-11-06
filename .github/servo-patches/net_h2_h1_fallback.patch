@@ -26,7 +26,7 @@
      );
      let is_secure_scheme = url.is_secure_scheme();
 +    let retry_method = method.clone();
-+    let retry_encoded_url = encoded_url.clone();
++    let retry_encoded_url = utf8_percent_encode(url.as_str(), FRAGMENT).to_string();
 +    let retry_headers = headers.clone();
 +    let h2_reset_flag = StdArc::new(Mutex::new(false));
 +    let h2_reset_flag_clone = StdArc::clone(&h2_reset_flag);
