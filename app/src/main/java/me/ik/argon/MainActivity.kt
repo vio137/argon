@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
@@ -167,6 +168,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         navigator = navigator,
                         modifier =
                             Modifier.fillMaxSize()
+                                // Keep page content below the phone status bar:
+                                // the system bar stays visible and readable and
+                                // web content never draws under it.
+                                .statusBarsPadding()
                                 // Reserve the bottom chrome zone so page content
                                 // never renders under the floating bar.
                                 .padding(bottom = 76.dp)
