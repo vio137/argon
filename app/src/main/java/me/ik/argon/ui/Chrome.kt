@@ -55,10 +55,14 @@ import me.ik.argon.ArgonColors
 import me.ik.argon.R
 
 /**
- * Argon command bar - rebuilt chrome (milestone 1).
- * One floating pill: back (contextual), omnibox, trailing action slot.
- * Focus expands the field and crossfades the trailing slot to an accent Go
- * button; loading state is drawn as a travelling accent arc on the border.
+ * Argon command bar - chrome v2.
+ * One unified capsule: navigation, omnibox and actions live inside a single
+ * continuous element (no detached buttons), with the loading state drawn as a
+ * thin accent track along the capsule's bottom edge. Idle: back (contextual),
+ * security/search glyph, address, stop-or-reload, menu. Focused: the field
+ * takes the space, clear appears, and the trailing slot crossfades to an
+ * accent Go button. Touch targets stay >=44dp; every action keeps its
+ * content-description for tests and accessibility.
  */
 @Composable
 fun ArgonCommandBar(
@@ -77,46 +81,42 @@ fun ArgonCommandBar(
     loadingArc: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // The capsule: elevation + hairline, accent border while editing.
+    val borderAlpha by animateFloatAsState(if (focused) 0.55f else 0f, label = "focusBorder")
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
         modifier =
             modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
                 .imePadding()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .height(56.dp)
+                .shadow(14.dp, RoundedCornerShape(28.dp), ambientColor = Color.Black, spotColor = Color.Black)
+                .clip(RoundedCornerShape(28.dp))
+                .background(ArgonColors.SurfaceHigh)
+                .border(
+                    1.dp,
+                    if (borderAlpha > 0.01f) ArgonColors.Accent.copy(alpha = borderAlpha)
+                    else ArgonColors.Hairline,
+                    RoundedCornerShape(28.dp),
+                ),
     ) {
-        AnimatedVisibility(
-            visible = canGoBack && !focused,
-            enter = slideInHorizontally(spring()) { -it } + fadeIn(),
-            exit = slideOutHorizontally(spring()) { -it } + fadeOut(),
-        ) {
-            ChromeIconButton(onClick = onBack, description = "Back", enabled = true) {
-                ChromeGlyph(R.drawable.ic_arrow_back, "Back", ArgonColors.Text)
-            }
-        }
-
-        // The pill itself: elevation + hairline, accent border when focused.
-        val borderAlpha by animateFloatAsState(if (focused) 0.55f else 0f, label = "focusBorder")
-        Box(
-            modifier =
-                Modifier.weight(1f)
-                    .height(54.dp)
-                    .shadow(14.dp, RoundedCornerShape(27.dp), ambientColor = Color.Black, spotColor = Color.Black)
-                    .clip(RoundedCornerShape(27.dp))
-                    .background(ArgonColors.SurfaceHigh)
-                    .border(
-                        1.dp,
-                        if (borderAlpha > 0.01f) ArgonColors.Accent.copy(alpha = borderAlpha)
-                        else ArgonColors.Hairline,
-                        RoundedCornerShape(27.dp),
-                    ),
-        ) {
+        Box(Modifier.weight(1f).fillMaxSize()) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                modifier = Modifier.fillMaxSize().padding(start = 6.dp, end = 4.dp),
             ) {
+                // Contextual back, inside the capsule.
+                AnimatedVisibility(
+                    visible = canGoBack && !focused,
+                    enter = slideInHorizontally(spring()) { -it } + fadeIn(),
+                    exit = slideOutHorizontally(spring()) { -it } + fadeOut(),
+                ) {
+                    ChromeIconButton(onClick = onBack, description = "Back", enabled = true) {
+                        ChromeGlyph(R.drawable.ic_arrow_back, "Back", ArgonColors.Text)
+                    }
+                }
                 ChromeGlyph(
                     if (secure) R.drawable.ic_lock else R.drawable.ic_search,
                     null,
@@ -167,43 +167,45 @@ fun ArgonCommandBar(
                         ChromeGlyph(R.drawable.ic_close, "Clear", ArgonColors.Text3)
                     }
                 }
+
+                // Trailing slot, inside the capsule: Go (editing) vs
+                // stop/reload + menu (idle).
+                AnimatedContent(
+                    targetState = focused,
+                    transitionSpec = {
+                        (slideInHorizontally(spring()) { it / 2 } + fadeIn()) togetherWith
+                            (slideOutHorizontally(spring()) { it / 2 } + fadeOut())
+                    },
+                    label = "trailingSlot",
+                ) { isFocused ->
+                    if (isFocused) {
+                        ChromeIconButton(onClick = onSubmit, description = "Go", enabled = true, filled = true) {
+                            ChromeGlyph(R.drawable.ic_arrow_forward, "Go", Color(0xFF0B0B10))
+                        }
+                    } else {
+                        Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
+                            ChromeIconButton(onClick = onStopOrReload, description = if (isLoading) "Stop" else "Reload", enabled = true) {
+                                ChromeGlyph(
+                                    if (isLoading) R.drawable.ic_close else R.drawable.ic_refresh,
+                                    if (isLoading) "Stop" else "Reload",
+                                    ArgonColors.Text,
+                                )
+                            }
+                            ChromeIconButton(onClick = onMenu, description = "Menu", enabled = true) {
+                                ChromeGlyph(R.drawable.ic_menu, "Menu", ArgonColors.Text)
+                            }
+                        }
+                    }
+                }
             }
+            // Loading: thin accent track along the capsule's bottom edge.
             androidx.compose.animation.AnimatedVisibility(
                 visible = isLoading,
                 enter = fadeIn(),
                 exit = fadeOut(),
+                modifier = Modifier.align(Alignment.BottomCenter),
             ) {
                 loadingArc()
-            }
-        }
-
-        // Trailing slot: Go (focused) vs stop/reload + menu (idle).
-        AnimatedContent(
-            targetState = focused,
-            transitionSpec = {
-                (slideInHorizontally(spring()) { it / 2 } + fadeIn()) togetherWith
-                    (slideOutHorizontally(spring()) { it / 2 } + fadeOut())
-            },
-            label = "trailingSlot",
-        ) { isFocused ->
-            if (isFocused) {
-                // Accent-filled Go button - the one action that matters while typing.
-                ChromeIconButton(onClick = onSubmit, description = "Go", enabled = true, filled = true) {
-                    ChromeGlyph(R.drawable.ic_arrow_forward, "Go", Color(0xFF0B0B10))
-                }
-            } else {
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    ChromeIconButton(onClick = onStopOrReload, description = if (isLoading) "Stop" else "Reload", enabled = true) {
-                        ChromeGlyph(
-                            if (isLoading) R.drawable.ic_close else R.drawable.ic_refresh,
-                            if (isLoading) "Stop" else "Reload",
-                            ArgonColors.Text,
-                        )
-                    }
-                    ChromeIconButton(onClick = onMenu, description = "Menu", enabled = true) {
-                        ChromeGlyph(R.drawable.ic_menu, "Menu", ArgonColors.Text)
-                    }
-                }
             }
         }
     }

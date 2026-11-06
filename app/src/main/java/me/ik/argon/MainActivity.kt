@@ -474,6 +474,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     @Composable
     private fun LoadingArc() {
+        // Bottom-edge loading track: a short accent segment travelling the
+        // capsule's width (rendered inside the bar's bottom-aligned slot).
         val transition = rememberInfiniteTransition(label = "loadArc")
         val progress by
             transition.animateFloat(
@@ -482,29 +484,17 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 animationSpec = infiniteRepeatable(tween(1200, easing = LinearEasing)),
                 label = "arcProgress",
             )
-        Canvas(Modifier.fillMaxSize()) {
-            val strokeWidth = 2.dp.toPx()
-            val inset = strokeWidth
-            val rect = Rect(Offset(inset, inset), Size(size.width - inset * 2, size.height - inset * 2))
-            val perimeter = 2 * (rect.width + rect.height)
-            val path =
-                Path().apply {
-                    addRoundRect(
-                        androidx.compose.ui.geometry.RoundRect(rect, androidx.compose.ui.geometry.CornerRadius(rect.height / 2))
-                    )
-                }
-            val measure = PathMeasure(path.asAndroidPath(), false)
-            val length = measure.length
-            val arcLen = length * 0.12f
-            val start = progress * length
-            val segment = Path()
-            measure.getSegment(start, start + arcLen, segment.asAndroidPath(), true)
-            if (start + arcLen > length) {
-                val wrapped = Path()
-                measure.getSegment(0f, start + arcLen - length, wrapped.asAndroidPath(), true)
-                drawPath(wrapped, ArgonColors.Accent, style = Stroke(width = strokeWidth, cap = StrokeCap.Round))
-            }
-            drawPath(segment, ArgonColors.Accent, style = Stroke(width = strokeWidth, cap = StrokeCap.Round))
+        Canvas(Modifier.fillMaxWidth().height(2.5.dp)) {
+            val w = size.width
+            val segLen = w * 0.28f
+            val travel = w + segLen
+            val x = progress * travel - segLen
+            drawRoundRect(
+                color = ArgonColors.Accent,
+                topLeft = Offset(x, 0f),
+                size = Size(segLen, size.height),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(size.height / 2, size.height / 2),
+            )
         }
     }
 
