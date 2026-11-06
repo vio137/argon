@@ -107,6 +107,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var readerRequestGen = 0
     private var showAbout by mutableStateOf(false)
     private var adblock by mutableStateOf(true)
+    private var showOnboarding by mutableStateOf(false)
     private var experimental by mutableStateOf(false)
 
     companion object {
@@ -155,6 +156,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         MediaFocus.start(this)
         prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         adblock = prefs.getBoolean("adblock", true)
+        showOnboarding = !prefs.getBoolean("onboarded", false)
         experimental = prefs.getBoolean("experimental", false)
         searchEngine = SearchEngine.fromPref(prefs.getString("engine", null))
         Blocklist.apply(this, adblock)
@@ -271,6 +273,26 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             )
                         Screen.Settings -> SettingsPage()
                         Screen.Browser -> {}
+                    }
+                    if (showOnboarding) {
+                        OnboardingScreen(
+                            adblock = adblock,
+                            searchEngine = searchEngine,
+                            onAdblockChange = {
+                                adblock = it
+                                prefs.edit().putBoolean("adblock", it).apply()
+                                Blocklist.apply(this@MainActivity, it)
+                            },
+                            onEngineChange = {
+                                searchEngine = it
+                                prefs.edit().putString("engine", it.name.lowercase()).apply()
+                                StartPage.write(this@MainActivity, bookmarks.entries, it)
+                            },
+                            onDone = {
+                                prefs.edit().putBoolean("onboarded", true).apply()
+                                showOnboarding = false
+                            },
+                        )
                     }
                     val readerScope = rememberCoroutineScope()
                     if (showMenu) {
