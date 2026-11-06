@@ -79,8 +79,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import androidx.preference.PreferenceManager
 import me.ik.argon.R
 import org.servo.servoview.Servo
@@ -286,21 +284,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 readerLoading = true
                                 val gen = ++readerRequestGen
-                                ReaderMode.evaluate(this@MainActivity) { article, error ->
+                                ReaderMode.evaluate(this@MainActivity, readerScope) { article, error ->
                                     if (gen != readerRequestGen) return@evaluate
                                     readerLoading = false
                                     when {
                                         article != null -> readerArticle = article
                                         error == ReaderMode.STALE -> Unit // navigated away; discard
                                         else -> readerError = error ?: "Couldn't extract the article."
-                                    }
-                                }
-                                readerScope.launch {
-                                    delay(12_000)
-                                    if (gen == readerRequestGen && readerLoading) {
-                                        readerRequestGen++
-                                        readerLoading = false
-                                        readerError = "Reader view timed out on this page."
                                     }
                                 }
                             },

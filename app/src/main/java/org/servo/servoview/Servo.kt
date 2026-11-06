@@ -372,7 +372,7 @@ internal constructor(
     /** Argon: evaluate an app-bundled script in the active page. The callback
      * runs on the activity scope with (json, error); exactly one is non-null.
      * Not exposed to web content - callers pass bundled source only. */
-    fun evaluateScript(script: String, onResult: (String?, String?) -> Unit) {
+    fun evaluateScript(script: String, onResult: (String?, String?) -> Unit): Int {
         val id = nextJsRequestId.incrementAndGet()
         pendingJsCallbacks[id] = onResult
         scope.launch(glDispatcher) {
@@ -389,11 +389,17 @@ internal constructor(
                     scope.launch { onResult(null, message) }
                 }
         }
+        return id
     }
 
     internal companion object {
         private val nextJsRequestId = AtomicInteger(0)
         internal val pendingJsCallbacks = ConcurrentHashMap<Int, (String?, String?) -> Unit>()
+
+        /** Advanced on every top-level load start (navigation AND reload), so an
+         * in-flight evaluateScript result can be bound to the exact document it
+         * was issued on; URL equality alone misses reload and away-and-back. */
+        internal val navigationGeneration = AtomicInteger(0)
     }
 
     fun addPlatformWindow(
@@ -605,6 +611,7 @@ internal constructor(
 
         override fun onLoadStarted() {
             Log.i("ArgonNav", "loadStarted")
+            Servo.navigationGeneration.incrementAndGet()
             scope.launch { client.onLoadStarted() }
         }
 

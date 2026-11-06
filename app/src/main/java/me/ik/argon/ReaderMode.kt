@@ -26,7 +26,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.mutableStateOf
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.json.JSONObject
+import org.servo.servoview.Servo
 import org.servo.servoview.ServoHolder
 
 data class ReaderArticle(
@@ -53,6 +57,7 @@ object ReaderMode {
     private const val MAX_TEXT_CHARS = 200_000
     private const val MAX_PARAGRAPHS = 400
     private const val MAX_JSON_CHARS = 600_000
+    private const val TIMEOUT_MS = 12_000L
 
     /** Sentinel: result arrived after the user navigated away; discard quietly. */
     internal const val STALE = "stale"
@@ -84,7 +89,7 @@ object ReaderMode {
                 wrapped
             }
 
-    fun evaluate(context: Context, onResult: (ReaderArticle?, String?) -> Unit) {
+    fun evaluate(context: Context, scope: CoroutineScope, onResult: (ReaderArticle?, String?) -> Unit) {
         if (!bridgeAvailable.value) {
             onResult(null, "Reader view isn't available in this build.")
             return
@@ -94,14 +99,16 @@ object ReaderMode {
             onResult(null, "Engine is not ready yet.")
             return
         }
-        // Bind the request to the page it was issued on; a result that arrives
-        // after navigation is stale and must not replace the new page's UI.
-        val urlAtRequest = ServoHolder.lastUrl
-        servo.evaluateScript(source(context)) { json, error ->
-            if (ServoHolder.lastUrl != urlAtRequest) {
-                onResult(null, STALE)
-                return@evaluateScript
-            }
+        // Bind the request to the exact document it was issued on: the
+        // generation advances on every top-level load start, covering reload
+        // and away-and-back, which URL equality would miss.
+        val generationAtRequest = Servo.navigationGeneration.get()
+        val requestId =
+            servo.evaluateScript(source(context)) { json, error ->
+                if (Servo.navigationGeneration.get() != generationAtRequest) {
+                    onResult(null, STALE)
+                    return@evaluateScript
+                }
             if (error != null) {
                 if (error == "bridge_missing") {
                     bridgeAvailable.value = false
@@ -152,6 +159,19 @@ object ReaderMode {
                 )
             } catch (e: Exception) {
                 onResult(null, "Couldn't parse the article.")
+            }
+        }
+        // A never-returning evaluation must not leak its registry entry or fire
+        // later into disposed UI: on timeout, drop the pending callback (a late
+        // engine result then finds no entry and is discarded) and report once.
+        scope.launch {
+            delay(TIMEOUT_MS)
+            if (Servo.pendingJsCallbacks.remove(requestId) != null) {
+                if (Servo.navigationGeneration.get() == generationAtRequest) {
+                    onResult(null, "Reader view timed out on this page.")
+                } else {
+                    onResult(null, STALE)
+                }
             }
         }
     }
