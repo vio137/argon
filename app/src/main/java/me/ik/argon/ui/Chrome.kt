@@ -180,7 +180,7 @@ fun ArgonCommandBar(
                 ) { isFocused ->
                     if (isFocused) {
                         ChromeIconButton(onClick = onSubmit, description = "Go", enabled = true, filled = true) {
-                            ChromeGlyph(R.drawable.ic_arrow_forward, "Go", Color(0xFF0B0B10))
+                            ChromeGlyph(R.drawable.ic_arrow_forward, "Go", ArgonColors.OnAccent)
                         }
                     } else {
                         Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
