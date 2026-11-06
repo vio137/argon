@@ -425,9 +425,14 @@ internal constructor(
     }
 
     fun touchMove(x: Float, y: Float, pointerId: Int) {
+        me.ik.argon.PerfStats.recordInputPosted()
         pendingMoves[pointerId] = MoveEvent(x, y, pointerId, System.nanoTime())
         scope.launch(glDispatcher) {
-            val move = pendingMoves.remove(pointerId) ?: return@launch // superseded
+            val move = pendingMoves.remove(pointerId)
+            if (move == null) {
+                me.ik.argon.PerfStats.recordInputSuperseded()
+                return@launch // superseded by a newer move
+            }
             me.ik.argon.PerfStats.recordInput(move.postNs)
             runCatching { jni.touchMove(move.x, move.y, move.pointerId) }
         }

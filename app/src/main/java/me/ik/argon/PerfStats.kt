@@ -45,6 +45,23 @@ object PerfStats {
         lastExecStart = execStartNs
     }
 
+    @Volatile private var inputPosted = 0
+    @Volatile private var inputSuperseded = 0
+
+    /** Every touchMove posted from the UI thread. */
+    @Synchronized
+    fun recordInputPosted() {
+        inputPosted++
+    }
+
+    /** A queued move task that found a newer pending move and exited without
+     * delivering: coalescing win, but retained in the count so a low measured
+     * lag can never hide input starvation. */
+    @Synchronized
+    fun recordInputSuperseded() {
+        inputSuperseded++
+    }
+
     /** Records one touch-move task that REACHED the GL thread: posted at
      * postNs on the UI thread, starting execution now. */
     @Synchronized
@@ -59,6 +76,8 @@ object PerfStats {
     fun reset() {
         count = 0
         inputCount = 0
+        inputPosted = 0
+        inputSuperseded = 0
         lastFrameTs = 0L
         lastExecStart = 0L
     }
@@ -97,7 +116,8 @@ object PerfStats {
                 "execgap_ms[p50=%.2f p90=%.2f p99=%.2f max=%.2f over20ms=%.1f%% over34ms=%.1f%%] " +
                 "queue_ms[p50=%.2f p90=%.2f p99=%.2f max=%.2f] " +
                 "work_ms[p50=%.2f p90=%.2f p99=%.2f max=%.2f] " +
-                "inputlag_ms[n=%d p50=%.2f p90=%.2f p99=%.2f max=%.2f]",
+                "inputlag_ms[n=%d p50=%.2f p90=%.2f p99=%.2f max=%.2f] " +
+                "input_coverage[posted=%d delivered=%d superseded=%d]",
             n,
             pct(iv, n, 0.50), pct(iv, n, 0.99),
             pct(eg, n, 0.50), pct(eg, n, 0.90), pct(eg, n, 0.99), eg[n - 1] / 1_000_000.0,
@@ -108,6 +128,7 @@ object PerfStats {
             inputCount,
             pct(il, ni, 0.50), pct(il, ni, 0.90), pct(il, ni, 0.99),
             if (ni > 0) il[ni - 1] / 1_000_000.0 else 0.0,
+            inputPosted, ni, inputSuperseded,
         )
     }
 }
