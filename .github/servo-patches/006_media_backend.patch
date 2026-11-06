@@ -575,7 +575,7 @@ index 0000000..7ea79be
 +pub mod yuv_pack;
 diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
 new file mode 100644
-index 0000000..aa38df8
+index 0000000..c5c173c
 --- /dev/null
 +++ b/components/media/backends/android/lib.rs
 @@ -0,0 +1,250 @@
@@ -602,11 +602,11 @@ index 0000000..aa38df8
 +
 +#[cfg(target_os = "android")]
 +mod android_impl {
-+    #[path = "player.rs"]
++    #[path = "../player.rs"]
 +    mod player;
-+    #[path = "source.rs"]
++    #[path = "../source.rs"]
 +    mod source;
-+    #[path = "sys.rs"]
++    #[path = "../sys.rs"]
 +    mod sys;
 +
 +    use std::any::Any;
