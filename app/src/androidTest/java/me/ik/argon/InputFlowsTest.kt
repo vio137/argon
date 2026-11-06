@@ -187,6 +187,7 @@ class InputFlowsTest {
                     "<body style=\"margin:0;background:#fff\">" +
                     "<input id=\"t\" style=\"position:fixed;top:40%;left:10%;width:80%;height:70px;font-size:36px\" placeholder=\"tap-and-type\">" +
                     "<div id=\"out\" style=\"position:fixed;top:60%;left:10%;font-size:42px;color:#087f23\"></div>" +
+                    "<div id=\"fonts\" style=\"position:fixed;top:6%;left:10%;font-size:40px;color:#111\">বাংলা আমার<br>देवनागरी हिन्दी<br>中文日本語한국어</div>" +
                     "<script>var t=document.getElementById('t');" +
                     "t.addEventListener('input',function(){document.getElementById('out').textContent='GOT:'+t.value});</script>"
             val enc =
