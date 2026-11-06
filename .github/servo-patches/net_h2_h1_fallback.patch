@@ -1,0 +1,120 @@
+--- a/components/net/http_loader.rs	2026-11-06 16:59:48.380524565 +0530
++++ b/components/net/http_loader.rs	2026-11-06 17:04:17.279293220 +0530
+@@ -127,6 +127,8 @@
+     pub cors_cache: RwLock<CorsCache>,
+     pub history_states: RwLock<FxHashMap<HistoryStateId, Vec<u8>>>,
+     pub client: ServoClient,
++    /// Argon: HTTP/1.1-only client for retrying h2-reset requests.
++    pub client_http1: ServoClient,
+     pub override_manager: CertificateErrorOverrideManager,
+     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+ }
+@@ -556,6 +558,11 @@
+         .is_some_and(|body| body.source_is_null());
+     let headers = &mut fetch_params.request.headers;
+ 
++    // Argon: bodiless idempotent requests are safe to replay over HTTP/1.1 if
++    // the server resets the HTTP/2 stream (upstream servo#39785).
++    let allow_h1_retry =
++        body_sender.is_none() && (*method == Method::GET || *method == Method::HEAD);
++
+     #[cfg(feature = "devtools")]
+     let devtools_bytes = StdArc::new(Mutex::new(vec![]));
+ 
+@@ -667,6 +674,11 @@
+         headers.clone(),
+     );
+     let is_secure_scheme = url.is_secure_scheme();
++    let retry_method = method.clone();
++    let retry_encoded_url = encoded_url.clone();
++    let retry_headers = headers.clone();
++    let h2_reset_flag = StdArc::new(Mutex::new(false));
++    let h2_reset_flag_clone = StdArc::clone(&h2_reset_flag);
+ 
+     // Generally, we use a persistent connection, so we will also set other PerformanceResourceTiming
+     //   attributes to this as well (domain_lookup_start, domain_lookup_end, connect_start, connect_end,
+@@ -730,21 +742,76 @@
+         })
+         .map_err(move |error| {
+             warn!("network error: {error:?}");
++            if allow_h1_retry && is_h2_protocol_reset(&error) {
++                *h2_reset_flag_clone.lock() = true;
++            }
+             NetworkError::from_hyper_error(
+                 &error,
+                 override_manager.remove_certificate_failing_verification(host.as_str()),
+             )
+         });
+ 
+-    #[cfg(feature = "tracing")]
+-    {
+-        client_future.instrument(trace_span!("HyperRequest")).await
+-    }
++    let primary_result = {
++        #[cfg(feature = "tracing")]
++        {
++            client_future.instrument(trace_span!("HyperRequest")).await
++        }
+ 
+-    #[cfg(not(feature = "tracing"))]
+-    {
+-        client_future.await
+-    }
++        #[cfg(not(feature = "tracing"))]
++        {
++            client_future.await
++        }
++    };
++
++    // Argon: if the server reset the HTTP/2 stream with PROTOCOL_ERROR
++    // (upstream servo#39785, observed against Google front ends), retry once
++    // over HTTP/1.1. Restricted to bodiless GET/HEAD, which are safe to
++    // replay; every other request keeps the original error.
++    if *h2_reset_flag.lock() {
++        warn!(
++            "HTTP/2 PROTOCOL_ERROR reset; retrying {retry_method} once over HTTP/1.1: {retry_encoded_url}"
++        );
++        let retry_request = HyperRequest::builder()
++            .method(retry_method)
++            .uri(retry_encoded_url)
++            .body(
++                http_body_util::Empty::new()
++                    .map_err(|_| unreachable!())
++                    .boxed(),
++            );
++        let mut retry_request = match retry_request {
++            Ok(request) => request,
++            Err(error) => return Err(NetworkError::HttpError(error.to_string())),
++        };
++        *retry_request.headers_mut() = retry_headers;
++        return context
++            .state
++            .client_http1
++            .request(retry_request)
++            .await
++            .map(|res| {
++                (
++                    Decoder::detect(res.map(|r| r.boxed()), is_secure_scheme),
++                    None,
++                )
++            })
++            .map_err(|error| {
++                warn!("network error (HTTP/1.1 retry): {error:?}");
++                NetworkError::from_hyper_error(&error, None)
++            });
++    }
++
++    primary_result
++}
++
++/// Argon: detect the HTTP/2 PROTOCOL_ERROR stream reset that some front ends
++/// (Google properties, upstream servo#39785) return to hyper's h2 client.
++/// Matches the Debug representation to avoid a direct h2 dependency: a false
++/// positive costs one redundant HTTP/1.1 retry of a safe (bodiless GET/HEAD)
++/// request; a false negative preserves the status quo.
++fn is_h2_protocol_reset(error: &hyper_util::client::legacy::Error) -> bool {
++    let debug = format!("{error:?}");
++    debug.contains("Http2") && debug.contains("Reset") && debug.contains("PROTOCOL_ERROR")
+ }
+ 
+ /// Setup the callback mechanism to forward chunks from the request received to the `chunk_requester`.

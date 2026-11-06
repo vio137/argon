@@ -1,0 +1,36 @@
+--- a/components/net/resource_thread.rs	2026-11-06 17:02:03.617904800 +0530
++++ b/components/net/resource_thread.rs	2026-11-06 17:04:17.279293220 +0530
+@@ -50,7 +50,8 @@
+ 
+ use crate::async_runtime::{init_async_runtime, spawn_task};
+ use crate::connector::{
+-    CACertificates, CertificateErrorOverrideManager, create_http_client, create_tls_config,
++    CACertificates, CertificateErrorOverrideManager, create_http1_client, create_http_client,
++    create_tls_config,
+ };
+ use crate::cookie::ServoCookie;
+ use crate::cookie_storage::CookieStorage;
+@@ -226,6 +227,11 @@
+             ignore_certificate_errors,
+             override_manager.clone(),
+         )),
++        client_http1: create_http1_client(create_tls_config(
++            ca_certificates.clone(),
++            ignore_certificate_errors,
++            override_manager.clone(),
++        )),
+         override_manager,
+         embedder_proxy: embedder_proxy.clone(),
+     };
+@@ -239,6 +245,11 @@
+         history_states: RwLock::new(FxHashMap::default()),
+         http_cache: HttpCache::new(HttpCacheAssignment::Private),
+         client: create_http_client(create_tls_config(
++            ca_certificates.clone(),
++            ignore_certificate_errors,
++            override_manager.clone(),
++        )),
++        client_http1: create_http1_client(create_tls_config(
+             ca_certificates,
+             ignore_certificate_errors,
+             override_manager.clone(),

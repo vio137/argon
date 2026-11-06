@@ -1,0 +1,41 @@
+--- a/components/net/connector.rs	2026-11-06 16:59:48.172522439 +0530
++++ b/components/net/connector.rs	2026-11-06 17:04:17.279293220 +0530
+@@ -658,13 +658,19 @@
+ 
+ pub type ServoClient = Client<InstrumentedConnector<ProxyConnector>, BoxedBody>;
+ 
+-pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
+-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
++fn create_client(tls_config: TlsConfig, http2: bool) -> ServoClient {
++    let builder = hyper_rustls::HttpsConnectorBuilder::new()
+         .with_tls_config(tls_config)
+         .https_or_http()
+-        .enable_http1()
+-        .enable_http2()
+-        .wrap_connector(ProxyConnector::new());
++        .enable_http1();
++    // Argon: selectable HTTP/2 so that bodiless idempotent requests whose h2
++    // stream is reset by the server (upstream servo#39785) can be retried over
++    // HTTP/1.1 with a dedicated client.
++    let connector = if http2 {
++        builder.enable_http2().wrap_connector(ProxyConnector::new())
++    } else {
++        builder.wrap_connector(ProxyConnector::new())
++    };
+ 
+     Client::builder(TokioExecutor {})
+         .http1_title_case_headers(true)
+@@ -679,3 +685,13 @@
+         .pool_max_idle_per_host(6)
+         .build(InstrumentedConnector::from(connector))
+ }
++
++/// The default client, with HTTP/2 enabled.
++pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
++    create_client(tls_config, true)
++}
++
++/// An HTTP/1.1-only client used to retry requests reset at the HTTP/2 layer.
++pub fn create_http1_client(tls_config: TlsConfig) -> ServoClient {
++    create_client(tls_config, false)
++}
