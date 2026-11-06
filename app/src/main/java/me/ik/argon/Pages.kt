@@ -1,5 +1,6 @@
 package me.ik.argon
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,6 +37,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -91,8 +93,13 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                     items(history.entries, key = { it.url + it.time }) { entry ->
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.fillMaxWidth().clickable { onOpen(entry.url) }.padding(horizontal = 20.dp, vertical = 12.dp),
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .clickable { onOpen(entry.url) }
+                                    .padding(horizontal = 20.dp, vertical = 10.dp),
                         ) {
+                            HostGlyph(hostOf(entry.url))
+                            Spacer(Modifier.width(14.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(entry.title, color = ArgonColors.Text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
@@ -270,6 +277,7 @@ private fun SettingClick(title: String, subtitle: String?, danger: Boolean = fal
 @OptIn(ExperimentalMaterial3Api::class)
 fun MenuSheet(
     canGoForward: Boolean,
+    currentHost: String,
     onDismiss: () -> Unit,
     onForward: () -> Unit,
     onAddToStart: () -> Unit,
@@ -279,12 +287,45 @@ fun MenuSheet(
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = ArgonColors.Surface) {
         Column(Modifier.padding(bottom = 40.dp)) {
+            // Context header: what page these actions apply to.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+            ) {
+                HostGlyph(currentHost)
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        currentHost.ifEmpty { "Argon" },
+                        color = ArgonColors.Text,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text("Page actions", color = ArgonColors.Text3, fontSize = 13.sp)
+                }
+            }
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
             SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
         }
+    }
+}
+
+@Composable
+private fun HostGlyph(host: String) {
+    val letter = host.firstOrNull()?.uppercaseChar()?.toString() ?: "•"
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.size(38.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(ArgonColors.AccentSoft),
+    ) {
+        Text(letter, color = ArgonColors.Accent, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -296,9 +337,17 @@ private fun SheetRow(icon: Int, label: String, enabled: Boolean, onClick: () -> 
             Modifier.fillMaxWidth()
                 .alpha(if (enabled) 1f else 0.38f)
                 .clickable(enabled = enabled, onClick = onClick)
-                .padding(horizontal = 24.dp, vertical = 14.dp),
+                .padding(horizontal = 24.dp, vertical = 12.dp),
     ) {
-        Icon(painterResource(icon), contentDescription = null, tint = ArgonColors.Text, modifier = Modifier.size(22.dp))
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.size(38.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(ArgonColors.SurfaceHigh),
+        ) {
+            Icon(painterResource(icon), contentDescription = null, tint = ArgonColors.Text, modifier = Modifier.size(20.dp))
+        }
         Spacer(Modifier.width(16.dp))
         Text(label, color = ArgonColors.Text, fontSize = 17.sp)
     }

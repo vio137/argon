@@ -220,6 +220,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     if (showMenu) {
                         MenuSheet(
                             canGoForward = navigator.canGoForward,
+                            currentHost = hostOf(displayableUrl(currentUrl)),
                             onDismiss = { showMenu = false },
                             onForward = {
                                 showMenu = false
