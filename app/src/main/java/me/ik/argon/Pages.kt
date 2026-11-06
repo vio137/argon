@@ -39,10 +39,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -62,7 +60,7 @@ private fun PageTopBar(
         IconButton(onClick = onBack) {
             Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "Back", tint = ArgonColors.Text)
         }
-        Text(title, color = ArgonColors.Text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+        Text(title, color = ArgonColors.Text, style = ArgonType.Title)
         Spacer(Modifier.weight(1f))
         actions?.invoke()
     }
@@ -86,7 +84,7 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
             )
             if (history.entries.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Pages you visit will appear here.", color = ArgonColors.Text3, fontSize = 15.sp)
+                    Text("Pages you visit will appear here.", color = ArgonColors.Text3, style = ArgonType.BodySmall)
                 }
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
@@ -101,11 +99,11 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                             HostGlyph(hostOf(entry.url))
                             Spacer(Modifier.width(14.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(entry.title, color = ArgonColors.Text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
                                     "${hostOf(entry.url)} · ${timeFormat.format(Date(entry.time))}",
                                     color = ArgonColors.Text3,
-                                    fontSize = 13.sp,
+                                    style = ArgonType.Caption,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
@@ -206,7 +204,7 @@ fun SettingsScreen(
                 Text(
                     "Argon 1.0 · Servo engine b6c9df7 · Block list StevenBlack/hosts (Nov 2026)",
                     color = ArgonColors.Text3,
-                    fontSize = 13.sp,
+                    style = ArgonType.Caption,
                 )
             }
         }
@@ -233,7 +231,7 @@ fun SettingsScreen(
                                 onClick = null,
                                 colors = RadioButtonDefaults.colors(selectedColor = ArgonColors.Accent),
                             )
-                            Text(engine.label, color = ArgonColors.Text, fontSize = 17.sp)
+                            Text(engine.label, color = ArgonColors.Text, style = ArgonType.Body)
                         }
                     }
                 }
@@ -268,8 +266,8 @@ private fun SettingSwitch(title: String, subtitle: String, checked: Boolean, onC
         modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
     ) {
         Column(Modifier.weight(1f).padding(end = 16.dp)) {
-            Text(title, color = ArgonColors.Text, fontSize = 17.sp)
-            Text(subtitle, color = ArgonColors.Text3, fontSize = 13.sp)
+            Text(title, color = ArgonColors.Text, style = ArgonType.Body)
+            Text(subtitle, color = ArgonColors.Text3, style = ArgonType.Caption)
         }
         Switch(
             checked = checked,
@@ -293,9 +291,9 @@ private fun SettingClick(title: String, subtitle: String?, danger: Boolean = fal
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp),
     ) {
         Column {
-            Text(title, color = if (danger) ArgonColors.Danger else ArgonColors.Text, fontSize = 17.sp)
+            Text(title, color = if (danger) ArgonColors.Danger else ArgonColors.Text, style = ArgonType.Body)
             if (subtitle != null) {
-                Text(subtitle, color = ArgonColors.Text3, fontSize = 13.sp)
+                Text(subtitle, color = ArgonColors.Text3, style = ArgonType.Caption)
             }
         }
     }
@@ -330,12 +328,11 @@ fun MenuSheet(
                     Text(
                         currentHost.ifEmpty { "Argon" },
                         color = ArgonColors.Text,
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.SemiBold,
+                        style = ArgonType.Heading,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text("Page actions", color = ArgonColors.Text3, fontSize = 13.sp)
+                    Text("Page actions", color = ArgonColors.Text3, style = ArgonType.Caption)
                 }
             }
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
@@ -360,7 +357,7 @@ private fun HostGlyph(host: String) {
                 .clip(RoundedCornerShape(12.dp))
                 .background(ArgonColors.AccentSoft),
     ) {
-        Text(letter, color = ArgonColors.Accent, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Text(letter, color = ArgonColors.Accent, style = ArgonType.Heading)
     }
 }
 
@@ -384,7 +381,7 @@ private fun SheetRow(icon: Int, label: String, enabled: Boolean, onClick: () -> 
             Icon(painterResource(icon), contentDescription = null, tint = ArgonColors.Text, modifier = Modifier.size(20.dp))
         }
         Spacer(Modifier.width(16.dp))
-        Text(label, color = ArgonColors.Text, fontSize = 17.sp)
+        Text(label, color = ArgonColors.Text, style = ArgonType.Body)
     }
 }
 
@@ -395,12 +392,12 @@ fun AboutDialog(onDismiss: () -> Unit) {
         title = { Text("Argon") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Version 1.0 · package me.ik.argon", fontSize = 15.sp)
-                Text("Web engine: Servo nightly 2026-11-05 (servo/servo@b6c9df76), MPL-2.0 · servo.org", fontSize = 15.sp)
-                Text("Ad and tracker list: StevenBlack/hosts, MIT license", fontSize = 15.sp)
-                Text("Reader view: Mozilla Readability 0.6.0, Apache-2.0", fontSize = 15.sp)
-                Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", fontSize = 15.sp)
-                Text("Argon is an independent shell and is not affiliated with the Servo project.", fontSize = 13.sp, color = ArgonColors.Text2)
+                Text("Version 1.0 · package me.ik.argon", style = ArgonType.BodySmall)
+                Text("Web engine: Servo nightly 2026-11-05 (servo/servo@b6c9df76), MPL-2.0 · servo.org", style = ArgonType.BodySmall)
+                Text("Ad and tracker list: StevenBlack/hosts, MIT license", style = ArgonType.BodySmall)
+                Text("Reader view: Mozilla Readability 0.6.0, Apache-2.0", style = ArgonType.BodySmall)
+                Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", style = ArgonType.BodySmall)
+                Text("Argon is an independent shell and is not affiliated with the Servo project.", style = ArgonType.Caption, color = ArgonColors.Text2)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
