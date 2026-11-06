@@ -7,6 +7,7 @@ package org.servo.servoview
 
 import android.util.Log
 import android.content.Context
+import android.os.Build
 import android.util.Size
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -28,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -102,6 +104,7 @@ fun Servo(
     LaunchedEffect(experimentalModeEnabled) { servo.setExperimentalMode(experimentalModeEnabled) }
 
     val resources = LocalResources.current
+    val appContext = LocalContext.current
     val focusRequester = remember { FocusRequester() }
     AndroidExternalSurface(
         modifier =
@@ -174,6 +177,17 @@ fun Servo(
     ) {
         onSurface { surface, width, height ->
             val size = Size(width, height)
+
+            // High refresh rate (1.0.14): let this surface run at the panel's
+            // peak rate while content is active. COMPATIBILITY_DEFAULT lets
+            // the system drop the rate for static content, so idle power is
+            // preserved. Actual rendered fps still depends on page work per
+            // frame; this only removes the 60 Hz cap. No game classification,
+            // no thermal/battery bypass.
+            if (Build.VERSION.SDK_INT >= 30) {
+                val maxHz = appContext.display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 60f
+                runCatching { surface.setFrameRate(maxHz, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT) }
+            }
 
             if (servo.paintingPaused) {
                 servo.paintingPaused = false

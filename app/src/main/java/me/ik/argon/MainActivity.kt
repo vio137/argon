@@ -173,6 +173,25 @@ class MainActivity : ComponentActivity(), Servo.Client {
         android.util.Log.i("ArgonNav", "ENGINE_ARGS_EFFECTIVE $engineArgs")
         enableEdgeToEdge()
 
+        // High refresh rate (1.0.14): request the panel's peak-refresh mode
+        // at the current resolution so scrolling/animation can run at
+        // 90/120Hz+ where supported. The mode switches back when Argon is not
+        // in front. Logged for device verification (DISPLAY_MODE).
+        runCatching {
+            @Suppress("DEPRECATION") val d = windowManager.defaultDisplay
+            @Suppress("DEPRECATION") val cur = d.mode
+            @Suppress("DEPRECATION") val best =
+                d.supportedModes
+                    .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                    .maxByOrNull { it.refreshRate }
+            if (best != null && best.modeId != cur.modeId) {
+                val lp = window.attributes
+                lp.preferredDisplayModeId = best.modeId
+                window.attributes = lp
+            }
+            android.util.Log.i("ArgonNav", "DISPLAY_MODE peak=${best?.refreshRate} was=${cur.refreshRate}")
+        }
+
         val intentUrl = if (intent?.action == Intent.ACTION_VIEW) intent.data?.toString() else null
 
         setContent {
