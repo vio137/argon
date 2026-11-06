@@ -2965,16 +2965,17 @@ index 5492a0e..216f8a7 100644
  
  [dev-dependencies]
 diff --git a/components/servo/servo.rs b/components/servo/servo.rs
-index bb4fb92..aea8c08 100644
+index bb4fb92..d5bc347 100644
 --- a/components/servo/servo.rs
 +++ b/components/servo/servo.rs
-@@ -167,7 +167,20 @@ mod media_platform {
+@@ -167,7 +167,21 @@ mod media_platform {
      }
  }
  
 +#[cfg(all(target_os = "android", not(target_env = "ohos")))]
 +mod media_platform {
 +    use super::ServoMedia;
++    use servo_config::pref;
 +    pub fn init() {
 +        if pref!(media_android_backend_enabled) {
 +            ServoMedia::init::<servo_media_android::AndroidBackend>();
