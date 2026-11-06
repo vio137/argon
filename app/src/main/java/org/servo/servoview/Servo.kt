@@ -417,12 +417,21 @@ internal constructor(
         scope.launch(glDispatcher) { jni.setExperimentalMode(enable) }
     }
 
+    // Latest-vsync-wins coalescing: every vsync posts a task, but a queued
+    // task whose frame was superseded exits immediately. This bounds the GL
+    // queue to one pending frame and always renders the newest vsync -
+    // run#13 measured a 1.5-4.6s queue backlog without it.
+    private val pendingFrameTs = java.util.concurrent.atomic.AtomicLong(-1L)
+
     fun onDoFrame(frameTs: Long = 0L) {
+        pendingFrameTs.set(frameTs)
         scope.launch(glDispatcher) {
+            val ts = pendingFrameTs.getAndSet(-1L)
+            if (ts == -1L) return@launch // superseded; a newer task renders it
             if (paintingActive.get()) {
                 val t0 = System.nanoTime()
                 jni.doFrame()
-                me.ik.argon.PerfStats.recordFrame(frameTs, t0, System.nanoTime() - t0)
+                me.ik.argon.PerfStats.recordFrame(ts, t0, System.nanoTime() - t0)
             }
         }
     }

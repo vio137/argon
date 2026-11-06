@@ -138,14 +138,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
         // Experiment: user stylesheet declaring script-fallback family names
         // from the device's own font files (bounded size; no default-family
         // replacement). Null when no usable fonts found.
-        val fontCssPath = FontCss.write(this)
         // Engine args are FIXED at build time: MainActivity is exported
         // (launcher/VIEW), so any intent-extra arg hook would let other apps
         // inject engine flags. Pref A/B uses separate build variants instead.
         val engineArgs =
             org.json.JSONArray().apply {
                 put("--user-agent"); put(ENGINE_UA)
-                if (fontCssPath != null) { put("--user-stylesheet"); put(fontCssPath) }
                 putAll(ENGINE_PREFS)
             }.toString()
         android.util.Log.i("ArgonNav", "ENGINE_ARGS_EFFECTIVE $engineArgs")
