@@ -1,0 +1,323 @@
+package me.ik.argon
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private val timeFormat = SimpleDateFormat("MMM d, h:mm a", Locale.getDefault())
+
+@Composable
+private fun PageTopBar(
+    title: String,
+    onBack: () -> Unit,
+    actions: (@Composable () -> Unit)? = null,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 4.dp, vertical = 8.dp),
+    ) {
+        IconButton(onClick = onBack) {
+            Icon(painterResource(R.drawable.ic_arrow_back), contentDescription = "Back", tint = ArgonColors.Text)
+        }
+        Text(title, color = ArgonColors.Text, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.weight(1f))
+        actions?.invoke()
+    }
+}
+
+@Composable
+fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> Unit) {
+    var confirmClear by remember { mutableStateOf(false) }
+    Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
+        Column(Modifier.fillMaxSize()) {
+            PageTopBar(
+                "History",
+                onBack,
+                actions = {
+                    if (history.entries.isNotEmpty()) {
+                        IconButton(onClick = { confirmClear = true }) {
+                            Icon(painterResource(R.drawable.ic_delete), contentDescription = "Clear history", tint = ArgonColors.Text2)
+                        }
+                    }
+                },
+            )
+            if (history.entries.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Pages you visit will appear here.", color = ArgonColors.Text3, fontSize = 15.sp)
+                }
+            } else {
+                LazyColumn(Modifier.fillMaxSize()) {
+                    items(history.entries, key = { it.url + it.time }) { entry ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().clickable { onOpen(entry.url) }.padding(horizontal = 20.dp, vertical = 12.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(entry.title, color = ArgonColors.Text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    "${hostOf(entry.url)} · ${timeFormat.format(Date(entry.time))}",
+                                    color = ArgonColors.Text3,
+                                    fontSize = 13.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            IconButton(onClick = { history.remove(entry) }) {
+                                Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear history?") },
+            text = { Text("This deletes every entry in your browsing history.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        history.clear()
+                        confirmClear = false
+                    }
+                ) {
+                    Text("Clear", color = ArgonColors.Danger)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+fun SettingsScreen(
+    adblock: Boolean,
+    onAdblock: (Boolean) -> Unit,
+    searchEngine: SearchEngine,
+    onSearchEngine: (SearchEngine) -> Unit,
+    experimental: Boolean,
+    onExperimental: (Boolean) -> Unit,
+    onClearHistory: () -> Unit,
+    onBack: () -> Unit,
+) {
+    var engineDialog by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf(false) }
+    Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
+        Column(Modifier.fillMaxSize()) {
+            PageTopBar("Settings", onBack)
+            Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+                SettingSwitch(
+                    title = "Ad blocking",
+                    subtitle = "${String.format("%,d", Blocklist.DOMAIN_COUNT)} ad and tracker domains blocked at the engine level",
+                    checked = adblock,
+                    onCheckedChange = onAdblock,
+                )
+                SettingClick(
+                    title = "Search engine",
+                    subtitle = searchEngine.label,
+                    onClick = { engineDialog = true },
+                )
+                SettingSwitch(
+                    title = "Experimental web features",
+                    subtitle = "In-development Servo capabilities",
+                    checked = experimental,
+                    onCheckedChange = onExperimental,
+                )
+                SettingClick(title = "Clear history", subtitle = null, danger = true, onClick = { confirmClear = true })
+                Spacer(Modifier.height(32.dp))
+                Text(
+                    "Argon 1.0 · Servo engine b6c9df7 · Block list StevenBlack/hosts (Nov 2026)",
+                    color = ArgonColors.Text3,
+                    fontSize = 13.sp,
+                )
+            }
+        }
+    }
+    if (engineDialog) {
+        AlertDialog(
+            onDismissRequest = { engineDialog = false },
+            title = { Text("Search engine") },
+            text = {
+                Column {
+                    SearchEngine.entries.forEach { engine ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .clickable {
+                                        onSearchEngine(engine)
+                                        engineDialog = false
+                                    }
+                                    .padding(vertical = 4.dp),
+                        ) {
+                            RadioButton(
+                                selected = engine == searchEngine,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(selectedColor = ArgonColors.Accent),
+                            )
+                            Text(engine.label, color = ArgonColors.Text, fontSize = 17.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { engineDialog = false }) { Text("Cancel") } },
+        )
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear history?") },
+            text = { Text("This deletes every entry in your browsing history.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onClearHistory()
+                        confirmClear = false
+                    }
+                ) {
+                    Text("Clear", color = ArgonColors.Danger)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun SettingSwitch(title: String, subtitle: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+    ) {
+        Column(Modifier.weight(1f).padding(end = 16.dp)) {
+            Text(title, color = ArgonColors.Text, fontSize = 17.sp)
+            Text(subtitle, color = ArgonColors.Text3, fontSize = 13.sp)
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors =
+                SwitchDefaults.colors(
+                    checkedTrackColor = ArgonColors.Accent,
+                    checkedThumbColor = ArgonColors.Bg,
+                    uncheckedTrackColor = ArgonColors.SurfaceHigh,
+                    uncheckedThumbColor = ArgonColors.Text2,
+                    uncheckedBorderColor = ArgonColors.SurfaceHigh,
+                ),
+        )
+    }
+}
+
+@Composable
+private fun SettingClick(title: String, subtitle: String?, danger: Boolean = false, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp),
+    ) {
+        Column {
+            Text(title, color = if (danger) ArgonColors.Danger else ArgonColors.Text, fontSize = 17.sp)
+            if (subtitle != null) {
+                Text(subtitle, color = ArgonColors.Text3, fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+fun MenuSheet(
+    canGoForward: Boolean,
+    onDismiss: () -> Unit,
+    onForward: () -> Unit,
+    onAddToStart: () -> Unit,
+    onHistory: () -> Unit,
+    onSettings: () -> Unit,
+    onAbout: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = ArgonColors.Surface) {
+        Column(Modifier.padding(bottom = 40.dp)) {
+            SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
+            SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
+            SheetRow(R.drawable.ic_history, "History", true, onHistory)
+            SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
+            SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
+        }
+    }
+}
+
+@Composable
+private fun SheetRow(icon: Int, label: String, enabled: Boolean, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier =
+            Modifier.fillMaxWidth()
+                .alpha(if (enabled) 1f else 0.38f)
+                .clickable(enabled = enabled, onClick = onClick)
+                .padding(horizontal = 24.dp, vertical = 14.dp),
+    ) {
+        Icon(painterResource(icon), contentDescription = null, tint = ArgonColors.Text, modifier = Modifier.size(22.dp))
+        Spacer(Modifier.width(16.dp))
+        Text(label, color = ArgonColors.Text, fontSize = 17.sp)
+    }
+}
+
+@Composable
+fun AboutDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Argon") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Version 1.0 · package me.ik.argon", fontSize = 15.sp)
+                Text("Web engine: Servo nightly 2026-11-05 (servo/servo@b6c9df76), MPL-2.0 · servo.org", fontSize = 15.sp)
+                Text("Ad and tracker list: StevenBlack/hosts, MIT license", fontSize = 15.sp)
+                Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", fontSize = 15.sp)
+                Text("Argon is an independent shell and is not affiliated with the Servo project.", fontSize = 13.sp, color = ArgonColors.Text2)
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
+}

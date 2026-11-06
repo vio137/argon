@@ -1,0 +1,480 @@
+package me.ik.argon
+
+import android.content.Intent
+import android.content.SharedPreferences
+import android.graphics.PathMeasure
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.foundation.text.input.selectAll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import android.util.Log
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asAndroidPath
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.preference.PreferenceManager
+import me.ik.argon.R
+import org.servo.servoview.Servo
+import org.servo.servoview.ServoNavigator
+import org.servo.servoview.ServoHolder
+
+enum class Screen {
+    Browser,
+    History,
+    Settings,
+}
+
+class MainActivity : ComponentActivity(), Servo.Client {
+
+    private val urlState = TextFieldState()
+    private val servoFocusRequester = FocusRequester()
+    private var isLoading by mutableStateOf(false)
+    private var currentUrl by mutableStateOf("")
+    private var currentTitle by mutableStateOf("")
+    private var alertMessage by mutableStateOf<String?>(null)
+    private var screen by mutableStateOf(Screen.Browser)
+    private var showMenu by mutableStateOf(false)
+    private var showAbout by mutableStateOf(false)
+    private var adblock by mutableStateOf(true)
+    private var experimental by mutableStateOf(false)
+    private var searchEngine by mutableStateOf(SearchEngine.GOOGLE)
+    private var omniboxFocused by mutableStateOf(false)
+    private var restartDialog by mutableStateOf(false)
+
+    private lateinit var prefs: SharedPreferences
+    private lateinit var history: HistoryStore
+    private lateinit var bookmarks: BookmarkStore
+    private val navigator get() = ServoHolder.navigator
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+        adblock = prefs.getBoolean("adblock", true)
+        experimental = prefs.getBoolean("experimental", false)
+        searchEngine = SearchEngine.fromPref(prefs.getString("engine", null))
+        Blocklist.apply(this, adblock)
+        history = HistoryStore(this)
+        bookmarks = BookmarkStore(this)
+        val startPageUrl = StartPage.write(this, bookmarks.entries, searchEngine)
+        enableEdgeToEdge()
+
+        val intentUrl = if (intent?.action == Intent.ACTION_VIEW) intent.data?.toString() else null
+
+        setContent {
+            ArgonTheme {
+                Box(Modifier.fillMaxSize().background(ArgonColors.Bg)) {
+                    Servo(
+                        experimentalModeEnabled = experimental,
+                        args = null,
+                        initialUrl = intentUrl ?: startPageUrl,
+                        logStr = null,
+                        client = this@MainActivity,
+                        navigator = navigator,
+                        modifier =
+                            Modifier.fillMaxSize()
+                                // Reserve the bottom chrome zone so page content
+                                // never renders under the floating bar.
+                                .padding(bottom = 76.dp)
+                                .imePadding()
+                                .focusRequester(servoFocusRequester),
+                    )
+                    LaunchedEffect(Unit) { servoFocusRequester.requestFocus() }
+                    BrowserChrome(Modifier.align(Alignment.BottomCenter))
+                    when (screen) {
+                        Screen.History ->
+                            HistoryPage(
+                                history = history,
+                                onOpen = {
+                                    navigate(it)
+                                    screen = Screen.Browser
+                                },
+                                onBack = { screen = Screen.Browser },
+                            )
+                        Screen.Settings -> SettingsPage()
+                        Screen.Browser -> {}
+                    }
+                    if (showMenu) {
+                        MenuSheet(
+                            canGoForward = navigator.canGoForward,
+                            onDismiss = { showMenu = false },
+                            onForward = {
+                                showMenu = false
+                                navigator.forward()
+                            },
+                            onAddToStart = {
+                                showMenu = false
+                                bookmarks.add(currentTitle, currentUrl)
+                                StartPage.write(this@MainActivity, bookmarks.entries, searchEngine)
+                            },
+                            onHistory = {
+                                showMenu = false
+                                screen = Screen.History
+                            },
+                            onSettings = {
+                                showMenu = false
+                                screen = Screen.Settings
+                            },
+                            onAbout = {
+                                showMenu = false
+                                showAbout = true
+                            },
+                        )
+                    }
+                    if (showAbout) {
+                        AboutDialog(onDismiss = { showAbout = false })
+                    }
+                    if (restartDialog) {
+                        AlertDialog(
+                            onDismissRequest = { restartDialog = false },
+                            title = { Text("Restart to apply") },
+                            text = { Text("Argon restarts to switch the block list at the engine level.") },
+                            confirmButton = {
+                                TextButton(
+                                    onClick = {
+                                        restartDialog = false
+                                        restartApp()
+                                    }
+                                ) {
+                                    Text("Restart")
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { restartDialog = false }) { Text("Later") }
+                            },
+                        )
+                    }
+                    alertMessage?.let { message ->
+                        AlertDialog(
+                            onDismissRequest = { alertMessage = null },
+                            confirmButton = {
+                                TextButton(onClick = { alertMessage = null }) { Text("OK") }
+                            },
+                            text = { Text(message) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == Intent.ACTION_VIEW) {
+            intent.data?.toString()?.let { navigate(it) }
+        }
+    }
+
+    private fun navigate(target: String) {
+        val dest = locationFor(target, searchEngine)
+        Log.i("ArgonNav", "submit target='$target' dest='$dest'")
+        navigator.navigate(dest)
+    }
+
+    private fun submitOmnibox() {
+        val input = urlState.text.toString()
+        if (input.isNotBlank()) {
+            navigate(input)
+            servoFocusRequester.requestFocus()
+        }
+    }
+
+    private fun restartApp() {
+        val launch =
+            packageManager.getLaunchIntentForPackage(packageName)!!
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        startActivity(launch)
+        Runtime.getRuntime().exit(0)
+    }
+
+    @Composable
+    private fun BrowserChrome(modifier: Modifier) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            modifier =
+                modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .imePadding()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+        ) {
+            if (!omniboxFocused) {
+                IconButton(onClick = { navigator.back() }, enabled = navigator.canGoBack) {
+                    Icon(
+                        painterResource(R.drawable.ic_arrow_back),
+                        contentDescription = "Back",
+                        tint = if (navigator.canGoBack) ArgonColors.Text else ArgonColors.Text3,
+                    )
+                }
+            }
+            OmniboxPill(Modifier.weight(1f))
+            if (omniboxFocused) {
+                IconButton(onClick = { submitOmnibox() }) {
+                    Icon(
+                        painterResource(R.drawable.ic_arrow_forward),
+                        contentDescription = "Go",
+                        tint = ArgonColors.Accent,
+                    )
+                }
+            } else {
+                IconButton(onClick = { if (isLoading) navigator.stop() else navigator.reload() }) {
+                    Icon(
+                        painterResource(if (isLoading) R.drawable.ic_close else R.drawable.ic_refresh),
+                        contentDescription = if (isLoading) "Stop" else "Reload",
+                        tint = ArgonColors.Text,
+                    )
+                }
+                IconButton(onClick = { showMenu = true }) {
+                    Icon(
+                        painterResource(R.drawable.ic_menu),
+                        contentDescription = "Menu",
+                        tint = ArgonColors.Text,
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun OmniboxPill(modifier: Modifier) {
+        val focusManager = LocalFocusManager.current
+        val shape = RoundedCornerShape(26.dp)
+        Box(modifier = modifier.height(52.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier =
+                    Modifier.fillMaxSize()
+                        .clip(shape)
+                        .background(ArgonColors.Surface)
+                        .padding(horizontal = 16.dp),
+            ) {
+                Icon(
+                    painterResource(
+                        if (currentUrl.startsWith("https://")) R.drawable.ic_lock
+                        else R.drawable.ic_search
+                    ),
+                    contentDescription = null,
+                    tint = ArgonColors.Text3,
+                    modifier = Modifier.size(18.dp),
+                )
+                Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                    if (urlState.text.isEmpty()) {
+                        Text("Search or enter address", color = ArgonColors.Text3, fontSize = 17.sp)
+                    }
+                    BasicTextField(
+                        state = urlState,
+                        lineLimits = TextFieldLineLimits.SingleLine,
+                        textStyle =
+                            TextStyle(
+                                color = ArgonColors.Text,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Normal,
+                            ),
+                        keyboardOptions =
+                            KeyboardOptions(
+                                keyboardType = KeyboardType.Uri,
+                                imeAction = ImeAction.Go,
+                            ),
+                        onKeyboardAction = { submitOmnibox() },
+                        modifier =
+                            Modifier.fillMaxWidth().onPreviewKeyEvent { event ->
+                                if (event.type == KeyEventType.KeyDown &&
+                                    (event.key == Key.Enter || event.key == Key.NumPadEnter)
+                                ) {
+                                    submitOmnibox()
+                                    true
+                                } else {
+                                    false
+                                }
+                            }.onFocusChanged { focusState ->
+                                if (focusState.isFocused && !omniboxFocused) {
+                                    omniboxFocused = true
+                                    urlState.edit {
+                                        if (currentUrl.isNotEmpty()) {
+                                            replace(0, length, currentUrl)
+                                        }
+                                        selectAll()
+                                    }
+                                } else if (!focusState.isFocused && omniboxFocused) {
+                                    omniboxFocused = false
+                                    if (currentUrl.isNotEmpty()) {
+                                        urlState.edit { replace(0, length, hostOf(currentUrl)) }
+                                    }
+                                }
+                            },
+                    )
+                }
+                if (urlState.text.isNotEmpty() && omniboxFocused) {
+                    Icon(
+                        painterResource(R.drawable.ic_close),
+                        contentDescription = "Clear",
+                        tint = ArgonColors.Text3,
+                        modifier =
+                            Modifier.size(18.dp).clickable { urlState.edit { replace(0, length, "") } },
+                    )
+                }
+            }
+            AnimatedVisibility(
+                visible = isLoading,
+                enter = fadeIn(),
+                exit = fadeOut(),
+            ) {
+                LoadingArc()
+            }
+        }
+    }
+
+    @Composable
+    private fun LoadingArc() {
+        val transition = rememberInfiniteTransition(label = "loadArc")
+        val progress by
+            transition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(tween(1200, easing = LinearEasing)),
+                label = "arcProgress",
+            )
+        Canvas(Modifier.fillMaxSize()) {
+            val strokeWidth = 2.dp.toPx()
+            val inset = strokeWidth
+            val rect = Rect(Offset(inset, inset), Size(size.width - inset * 2, size.height - inset * 2))
+            val perimeter = 2 * (rect.width + rect.height)
+            val path =
+                Path().apply {
+                    addRoundRect(
+                        androidx.compose.ui.geometry.RoundRect(rect, androidx.compose.ui.geometry.CornerRadius(rect.height / 2))
+                    )
+                }
+            val measure = PathMeasure(path.asAndroidPath(), false)
+            val length = measure.length
+            val arcLen = length * 0.12f
+            val start = progress * length
+            val segment = Path()
+            measure.getSegment(start, start + arcLen, segment.asAndroidPath(), true)
+            if (start + arcLen > length) {
+                val wrapped = Path()
+                measure.getSegment(0f, start + arcLen - length, wrapped.asAndroidPath(), true)
+                drawPath(wrapped, ArgonColors.Accent, style = Stroke(width = strokeWidth, cap = StrokeCap.Round))
+            }
+            drawPath(segment, ArgonColors.Accent, style = Stroke(width = strokeWidth, cap = StrokeCap.Round))
+        }
+    }
+
+    @Composable
+    private fun SettingsPage() {
+        SettingsScreen(
+            adblock = adblock,
+            onAdblock = {
+                adblock = it
+                prefs.edit().putBoolean("adblock", it).apply()
+                Blocklist.apply(this@MainActivity, it)
+                restartDialog = true
+            },
+            searchEngine = searchEngine,
+            onSearchEngine = {
+                searchEngine = it
+                prefs.edit().putString("engine", it.name.lowercase()).apply()
+                StartPage.write(this@MainActivity, bookmarks.entries, it)
+            },
+            experimental = experimental,
+            onExperimental = {
+                experimental = it
+                prefs.edit().putBoolean("experimental", it).apply()
+            },
+            onClearHistory = { history.clear() },
+            onBack = { screen = Screen.Browser },
+        )
+        BackHandler { screen = Screen.Browser }
+    }
+
+    // Servo.Client
+    override fun onAlert(message: String) {
+        alertMessage = message
+    }
+
+    override fun onLoadStarted() {
+        isLoading = true
+    }
+
+    override fun onLoadEnded() {
+        if (currentUrl.isNotEmpty() && !currentUrl.startsWith("file://")) {
+            history.add(currentUrl, currentTitle)
+        }
+        isLoading = false
+    }
+
+    override fun onTitleChanged(title: String) {
+        currentTitle = title
+    }
+
+    override fun onUrlChanged(url: String) {
+        currentUrl = url
+        if (!omniboxFocused) {
+            urlState.edit { replace(0, length, hostOf(url)) }
+        }
+    }
+}
