@@ -37,7 +37,13 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8: keep-rules in proguard-rules.pro cover every JNI entry
+            // point (org.servo.servoview, MediaFocus) and the serialization
+            // models. Any new external/JNI class needs a rule before this
+            // ships; verified by the androidTest matrix, not by compiling.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 }
