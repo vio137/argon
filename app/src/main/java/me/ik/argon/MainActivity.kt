@@ -130,11 +130,21 @@ class MainActivity : ComponentActivity(), Servo.Client {
         // from the device's own font files (bounded size; no default-family
         // replacement). Null when no usable fonts found.
         val fontCssPath = FontCss.write(this)
+        // Test-harness isolation hook: the instrumentation runner can force-stop
+        // and relaunch with --es argon_engine_args_append '["--pref","key=value"]'
+        // to A/B engine prefs in fresh processes of the SAME build: the extra is
+        // APPENDED to the defaults, so arms differ only by the pref under test.
         val engineArgs =
             org.json.JSONArray().apply {
                 put("--user-agent"); put(ENGINE_UA)
                 if (fontCssPath != null) { put("--user-stylesheet"); put(fontCssPath) }
+                val append = intent?.getStringExtra("argon_engine_args_append")
+                if (append != null) {
+                    val extra = org.json.JSONArray(append)
+                    for (i in 0 until extra.length()) put(extra.getString(i))
+                }
             }.toString()
+        android.util.Log.i("ArgonNav", "ENGINE_ARGS_EFFECTIVE $engineArgs")
         enableEdgeToEdge()
 
         val intentUrl = if (intent?.action == Intent.ACTION_VIEW) intent.data?.toString() else null
