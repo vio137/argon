@@ -20,9 +20,13 @@ android {
 
     buildFeatures { compose = true }
 
-    // lintVitalAnalyzeRelease stalls for 10+ minutes on the 2GB build box and
-    // is not a release gate for us; skip it.
-    lint { checkReleaseBuilds = false }
+    // lintVital* stalls 10+ min on the 2GB local build box; skip it there via
+    // -Pargon.skipLintVital=true (kept in ~/.gradle/gradle.properties, uncommitted).
+    // CI (android-release-lint workflow) always runs the gate.
+    lint {
+        checkReleaseBuilds =
+            !providers.gradleProperty("argon.skipLintVital").map { it.toBoolean() }.getOrElse(false)
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
