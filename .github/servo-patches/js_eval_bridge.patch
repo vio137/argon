@@ -1,0 +1,89 @@
+diff --git a/ports/servoshell/egl/android/mod.rs b/ports/servoshell/egl/android/mod.rs
+index dab1f04..1155c41 100644
+--- a/ports/servoshell/egl/android/mod.rs
++++ b/ports/servoshell/egl/android/mod.rs
+@@ -38,6 +38,9 @@ thread_local! {
+ 
+ static CALLBACK_OBJECT: OnceLock<Global<JObject<'static>>> = OnceLock::new();
+ 
++/// Argon: JavaVM for delivering evaluateScript results from the servo thread.
++static JS_EVAL_JVM: OnceLock<JavaVM> = OnceLock::new();
++
+ fn callback_ref() -> &'static JObject<'static> {
+     CALLBACK_OBJECT.get().expect("Servo init failed").as_ref()
+ }
+@@ -161,6 +164,7 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
+             .expect("CALLBACK_OBJECT was already initialized.");
+ 
+         let jvm = env.get_java_vm()?;
++        let _ = JS_EVAL_JVM.set(jvm.clone());
+         let event_loop_waker = Box::new(WakeupCallback::new(jvm.clone()));
+ 
+         let host = Rc::new(HostCallbacks::new(jvm));
+@@ -330,6 +334,66 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_stop<'local>(
+     .resolve::<ThrowRuntimeExAndDefault>()
+ }
+ 
++/// Argon: evaluate an app-bundled JavaScript string in the active webview's
++/// page context and deliver the result to Callbacks.onJsResult. The result
++/// (JSON) or error never leaves the app; this is not exposed to web content.
++#[unsafe(no_mangle)]
++pub extern "C" fn Java_org_servo_servoview_JNIServo_evaluateScript<'local>(
++    mut env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    request_id: jint,
++    script: JString<'local>,
++) {
++    env.with_env(|env| -> jni::errors::Result<_> {
++        let script = JString::cast_local(env, script)?.try_to_string(env)?;
++        call(env, move |s| {
++            let Some(webview) = s.active_or_newest_webview() else {
++                notify_js_result(request_id, None, Some("no active webview".to_owned()));
++                return;
++            };
++            webview.evaluate_javascript(script, move |result| {
++                let (json, error) = match result {
++                    Ok(value) => (serde_json::to_string(&value).ok(), None),
++                    Err(err) => (None, Some(format!("{err:?}"))),
++                };
++                notify_js_result(request_id, json, error);
++            });
++        });
++        Ok(())
++    })
++    .resolve::<ThrowRuntimeExAndDefault>()
++}
++
++fn notify_js_result(request_id: jint, json: Option<String>, error: Option<String>) {
++    let Some(jvm) = JS_EVAL_JVM.get() else {
++        error!("evaluateScript result dropped: JVM unavailable");
++        return;
++    };
++    let _ = jvm.attach_current_thread(|env| -> Result<(), Error> {
++        let json_arg = match &json {
++            Some(s) => match new_string_as_jvalue(env, s) {
++                Ok(v) => v,
++                Err(_) => return Ok(()),
++            },
++            None => JValueOwned::Object(JObject::null()),
++        };
++        let err_arg = match &error {
++            Some(s) => match new_string_as_jvalue(env, s) {
++                Ok(v) => v,
++                Err(_) => return Ok(()),
++            },
++            None => JValueOwned::Object(JObject::null()),
++        };
++        env.call_method(
++            callback_ref(),
++            jni_str!("onJsResult"),
++            jni_sig!("(ILjava/lang/String;Ljava/lang/String;)V"),
++            &[JValue::Int(request_id), (&json_arg).into(), (&err_arg).into()],
++        )?;
++        Ok(())
++    });
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn Java_org_servo_servoview_JNIServo_goBack<'local>(
+     mut env: EnvUnowned<'local>,
