@@ -466,4 +466,71 @@ class InputFlowsTest {
             evidence("10-fontcss-end")
         }
     }
+
+        private fun navigateViaOmnibox(url: String) {
+            val om = findOmnibox()
+            om.click()
+            Thread.sleep(400)
+            om.setText(url)
+            val go = device.findObject(By.desc("Go"))
+            assertNotNull("Go button present", go)
+            go.click()
+        }
+
+    @Test
+    fun t9_siteLoadingAndViewport() {
+        try {
+            ensureBrowser()
+
+            // (a) Viewport sanity: data: page reports CSS-pixel viewport size
+            // and devicePixelRatio through the title bridge and paints it.
+            val probe =
+                "data:text/html,<!DOCTYPE html><meta name=viewport content='width=device-width,initial-scale=1'>" +
+                    "<body style='margin:0;background:%23fff;color:%23000'>" +
+                    "<div id=v style='font-size:70px;padding:40px'>measuring</div>" +
+                    "<script>var s=window.innerWidth+'x'+window.innerHeight+' dpr='+window.devicePixelRatio;" +
+                    "document.title='VW:'+s;document.getElementById('v').textContent=s;</script>"
+            navigateViaOmnibox(probe)
+            Thread.sleep(3_000)
+            evidence("t9a-viewport-probe")
+            val title = me.ik.argon.MainActivity.lastTitleForTest
+            Log.i(TAG, "VIEWPORT_TITLE='$title'")
+            val m = Regex("VW:(\\d+)x(\\d+) dpr=([\\d.]+)").find(title)
+            assertNotNull("viewport probe reported CSS size via title (got '$title')", m)
+            val cssW = m!!.groupValues[1].toInt()
+            val dpr = m.groupValues[3].toFloat()
+            Log.i(TAG, "VIEWPORT_CSS_WIDTH=$cssW DPR=$dpr")
+            assertTrue("CSS viewport width is a sane phone width (got ${'$'}cssW)", cssW in 300..620)
+            assertTrue("devicePixelRatio in phone range (got $dpr)", dpr in 1.5f..4.5f)
+
+            // (b) YouTube: reproduce the user-reported SendRequest failure and
+            // capture the engine's INNER error line (net::http_loader) plus a
+            // screenshot. On the unpatched engine this yields the root-cause
+            // evidence; on a fixed engine the page must load.
+            navigateViaOmnibox("https://m.youtube.com")
+            val committed =
+                device.wait(
+                    Until.findObject(By.clazz("android.widget.EditText").textContains("youtube")),
+                    45_000,
+                )
+            assertTrue("navigation to youtube committed", committed != null)
+            Thread.sleep(12_000)
+            val netlog = device.executeShellCommand("logcat -d -s net::http_loader ArgonNav")
+            Log.i(TAG, "T9_NETLOG_BEGIN")
+            netlog.lines().takeLast(60).forEach { Log.i(TAG, "T9_NETLOG $it") }
+            Log.i(TAG, "T9_NETLOG_END")
+            val sendRequest = netlog.contains("SendRequest")
+            val h2Reset = netlog.contains("Http2") && netlog.contains("PROTOCOL_ERROR")
+            Log.i(TAG, "YOUTUBE_SENDREQUEST=$sendRequest H2_RESET=$h2Reset")
+            evidence("t9b-youtube")
+
+            // (c) Real responsive site: width and rendering capture.
+            navigateViaOmnibox("https://en.m.wikipedia.org/wiki/Bengali_language")
+            Thread.sleep(10_000)
+            evidence("t9c-wikipedia-responsive")
+            Log.i(TAG, "SITE_LOADING_TEST=DONE")
+        } finally {
+            evidence("t9-end")
+        }
+    }
 }

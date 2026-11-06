@@ -116,6 +116,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
         private fun org.json.JSONArray.putAll(items: List<String>) {
             for (item in items) put(item)
         }
+
+        /** Latest page title, exposed for instrumentation assertions. */
+        @Volatile
+        var lastTitleForTest: String = ""
+            private set
     }
     private var searchEngine by mutableStateOf(SearchEngine.GOOGLE)
     private var omniboxFocused by mutableStateOf(false)
@@ -540,6 +545,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     override fun onTitleChanged(title: String) {
         currentTitle = title
+        lastTitleForTest = title
     }
 
     override fun onUrlChanged(url: String) {
