@@ -404,7 +404,7 @@ internal constructor(
     // and exit when superseded. Down/up/cancel flush pending moves first, so
     // ordering against gesture state transitions is preserved (pinch keeps each
     // pointer's latest position).
-    private class MoveEvent(val x: Float, val y: Float, val pointerId: Int)
+    private class MoveEvent(val x: Float, val y: Float, val pointerId: Int, val postNs: Long)
     private val pendingMoves = java.util.concurrent.ConcurrentHashMap<Int, MoveEvent>()
 
     private fun flushPendingMoves() {
@@ -412,6 +412,7 @@ internal constructor(
         val snapshot = pendingMoves.values.toList()
         pendingMoves.clear()
         for (move in snapshot) {
+            me.ik.argon.PerfStats.recordInput(move.postNs)
             runCatching { jni.touchMove(move.x, move.y, move.pointerId) }
         }
     }
@@ -424,9 +425,10 @@ internal constructor(
     }
 
     fun touchMove(x: Float, y: Float, pointerId: Int) {
-        pendingMoves[pointerId] = MoveEvent(x, y, pointerId)
+        pendingMoves[pointerId] = MoveEvent(x, y, pointerId, System.nanoTime())
         scope.launch(glDispatcher) {
             val move = pendingMoves.remove(pointerId) ?: return@launch // superseded
+            me.ik.argon.PerfStats.recordInput(move.postNs)
             runCatching { jni.touchMove(move.x, move.y, move.pointerId) }
         }
     }

@@ -147,10 +147,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
         // Engine args are FIXED at build time: MainActivity is exported
         // (launcher/VIEW), so any intent-extra arg hook would let other apps
         // inject engine flags. Pref A/B uses separate build variants instead.
-        // Adaptive layout parallelism: the engine default is a hardcoded 3
-        // layout threads; budget by actual cores (leave one for the rest of
-        // the system, cap to avoid diminishing returns and small-core churn).
-        val layoutThreads = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(3, 8)
+        // Conservative layout parallelism: engine default is a hardcoded 3.
+        // Use half the cores (floor at the engine default), capped low -
+        // compositor, script and GL threads also need big cores, and on
+        // heterogeneous SoCs wide layout pools contend with them. Unverified
+        // tuning: A/B against the engine default before claiming improvement.
+        val layoutThreads = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(3, 6)
         android.util.Log.i("ArgonNav", "LAYOUT_THREADS=$layoutThreads cores=${Runtime.getRuntime().availableProcessors()}")
         val engineArgs =
             org.json.JSONArray().apply {
