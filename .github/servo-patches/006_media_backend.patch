@@ -305,10 +305,10 @@ index 0000000..ed1f9fe
 +}
 diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
 new file mode 100644
-index 0000000..4e0bb60
+index 0000000..063609f
 --- /dev/null
 +++ b/components/media/backends/android/android_impl/player.rs
-@@ -0,0 +1,1409 @@
+@@ -0,0 +1,1415 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -1137,9 +1137,15 @@ index 0000000..4e0bb60
 +    /// currently wants audio focus (read by the app-side MediaFocus bridge).
 +    fn focus_tick(&mut self) {
 +        let st = self.shared.get();
++        // Video-only pipelines never wait on audio focus.
++        let effective = if self.audio.is_some() {
++            focus::focus()
++        } else {
++            focus::FOCUS_GRANTED
++        };
 +        match self
 +            .focus
-+            .step(st.paused, focus::focus(), focus::noisy_epoch())
++            .step(st.paused, effective, focus::noisy_epoch())
 +        {
 +            FocusAction::Pause => {
 +                self.clock.pause();
@@ -2544,10 +2550,10 @@ index 0000000..b5b8231
 +}
 diff --git a/components/media/backends/android/focus.rs b/components/media/backends/android/focus.rs
 new file mode 100644
-index 0000000..037ec08
+index 0000000..763dac4
 --- /dev/null
 +++ b/components/media/backends/android/focus.rs
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,269 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -2563,6 +2569,9 @@ index 0000000..037ec08
 +//! The app side learns whether it should hold focus by reading
 +//! `active_audio_players()`: the number of players that currently want to
 +//! make sound (not paused by the page, not muted, not permanently displaced).
++//! A player counts (and so triggers the app's focus request) before it has
++//! made any sound: output is gated on the grant, not on playback having
++//! started, so no audio can leak ahead of focus.
 +
 +use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 +
@@ -2570,16 +2579,20 @@ index 0000000..037ec08
 +pub const FOCUS_LOST_TRANSIENT: u8 = 1;
 +pub const FOCUS_LOST: u8 = 2;
 +pub const FOCUS_DUCK: u8 = 3;
++/// No focus decision yet: the app side has not requested or granted focus.
++/// Audio output is held until a real grant arrives; a denied request never
++/// becomes a grant by itself.
++pub const FOCUS_UNKNOWN: u8 = 4;
 +
 +/// Output gain while another app asked us to duck.
 +pub const DUCK_GAIN: f32 = 0.2;
 +
-+static FOCUS: AtomicU8 = AtomicU8::new(FOCUS_GRANTED);
++static FOCUS: AtomicU8 = AtomicU8::new(FOCUS_UNKNOWN);
 +static NOISY_EPOCH: AtomicU32 = AtomicU32::new(0);
 +static ACTIVE_AUDIO: AtomicUsize = AtomicUsize::new(0);
 +
 +pub fn set_focus(state: u8) {
-+    FOCUS.store(state.min(FOCUS_DUCK), Ordering::SeqCst);
++    FOCUS.store(state.min(FOCUS_UNKNOWN), Ordering::SeqCst);
 +}
 +
 +pub fn focus() -> u8 {
@@ -2666,6 +2679,10 @@ index 0000000..037ec08
 +            return if was_held { Action::None } else { Action::Pause };
 +        }
 +        match (focus, self.hold) {
++            (FOCUS_UNKNOWN, Hold::None) => {
++                self.hold = Hold::Transient;
++                Action::Pause
++            },
 +            (FOCUS_LOST_TRANSIENT, Hold::None) => {
 +                self.hold = Hold::Transient;
 +                Action::Pause
@@ -2722,6 +2739,15 @@ index 0000000..037ec08
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++
++    #[test]
++    fn audio_is_held_until_a_real_grant_arrives() {
++        let mut t = FocusTracker::new(0);
++        assert_eq!(t.step(false, FOCUS_UNKNOWN, 0), Action::Pause);
++        assert_eq!(t.step(false, FOCUS_UNKNOWN, 0), Action::None);
++        assert!(t.wants_focus(false, false, true));
++        assert_eq!(t.step(false, FOCUS_GRANTED, 0), Action::Resume);
++    }
 +
 +    #[test]
 +    fn transient_loss_pauses_then_auto_resumes() {
