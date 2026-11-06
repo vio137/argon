@@ -23,7 +23,7 @@ jobs:
     env:
       JAVA_HOME: /usr/lib/jvm/temurin-21-jdk-amd64
       ANDROID_SDK_ROOT: /opt/argon-android-sdk
-      NDK_VERSION: 28.2.13676358
+      NDK_VERSION: 29.0.14206865  # pin requires NDK r29 (book is stale)
     steps:
       - name: Checkout argon (for the patch)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 (pinned SHA)
