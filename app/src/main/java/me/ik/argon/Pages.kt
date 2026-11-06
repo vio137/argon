@@ -147,6 +147,10 @@ fun SettingsScreen(
     onSearchEngine: (SearchEngine) -> Unit,
     experimental: Boolean,
     onExperimental: (Boolean) -> Unit,
+    httpsOnly: Boolean,
+    onHttpsOnly: (Boolean) -> Unit,
+    clearOnExit: Boolean,
+    onClearOnExit: (Boolean) -> Unit,
     onClearHistory: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -166,6 +170,18 @@ fun SettingsScreen(
                     title = "Search engine",
                     subtitle = searchEngine.label,
                     onClick = { engineDialog = true },
+                )
+                SettingSwitch(
+                    title = "HTTPS-only",
+                    subtitle = "Upgrades addresses you type or open to https://. Resources a page loads itself are not affected",
+                    checked = httpsOnly,
+                    onCheckedChange = onHttpsOnly,
+                )
+                SettingSwitch(
+                    title = "Clear history on exit",
+                    subtitle = "Clears Argon's history list when the app is closed. Engine cookies and cache are not cleared",
+                    checked = clearOnExit,
+                    onCheckedChange = onClearOnExit,
                 )
                 SettingSwitch(
                     title = "Experimental web features",
@@ -286,6 +302,7 @@ fun MenuSheet(
     onHistory: () -> Unit,
     onSettings: () -> Unit,
     onAbout: () -> Unit,
+    onExit: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = ArgonColors.Surface) {
         Column(Modifier.padding(bottom = 40.dp)) {
@@ -314,6 +331,7 @@ fun MenuSheet(
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
             SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
+            SheetRow(R.drawable.ic_exit, "Quit Argon", true, onExit)
         }
     }
 }

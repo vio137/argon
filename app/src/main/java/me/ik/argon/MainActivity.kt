@@ -108,6 +108,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var showAbout by mutableStateOf(false)
     private var adblock by mutableStateOf(true)
     private var showOnboarding by mutableStateOf(false)
+    private var httpsOnly by mutableStateOf(false)
+    private var clearOnExit by mutableStateOf(false)
     private var experimental by mutableStateOf(false)
 
     companion object {
@@ -157,6 +159,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
         prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         adblock = prefs.getBoolean("adblock", true)
         showOnboarding = !prefs.getBoolean("onboarded", false)
+        httpsOnly = prefs.getBoolean("https_only", false)
+        clearOnExit = prefs.getBoolean("clear_on_exit", false)
         experimental = prefs.getBoolean("experimental", false)
         searchEngine = SearchEngine.fromPref(prefs.getString("engine", null))
         Blocklist.apply(this, adblock)
@@ -336,6 +340,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 showAbout = true
                             },
+                            onExit = {
+                                showMenu = false
+                                finishAndRemoveTask()
+                            },
                         )
                     }
                     if (showAbout) {
@@ -411,7 +419,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     }
 
     private fun navigate(target: String) {
-        val dest = locationFor(target, searchEngine)
+        val dest = locationFor(target, searchEngine, httpsOnly)
         Log.i("ArgonNav", "submit target='$target' dest='$dest'")
         navigator.navigate(dest)
     }
@@ -622,6 +630,16 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 experimental = it
                 prefs.edit().putBoolean("experimental", it).apply()
             },
+            httpsOnly = httpsOnly,
+            onHttpsOnly = {
+                httpsOnly = it
+                prefs.edit().putBoolean("https_only", it).apply()
+            },
+            clearOnExit = clearOnExit,
+            onClearOnExit = {
+                clearOnExit = it
+                prefs.edit().putBoolean("clear_on_exit", it).apply()
+            },
             onClearHistory = { history.clear() },
             onBack = { screen = Screen.Browser },
         )
@@ -658,6 +676,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     override fun onDestroy() {
         MediaFocus.stop()
+        // Scope is exactly the app's own history list; engine cookies/cache
+        // are not covered (labeled as such in Settings).
+        if (clearOnExit && ::history.isInitialized) history.clear()
         super.onDestroy()
     }
 }

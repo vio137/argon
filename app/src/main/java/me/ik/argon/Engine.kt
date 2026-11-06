@@ -14,8 +14,11 @@ enum class SearchEngine(val label: String, val template: String, val searchUrlPr
     }
 }
 
-fun locationFor(input: String, engine: SearchEngine): String {
-    val trimmed = input.trim()
+fun locationFor(input: String, engine: SearchEngine, httpsOnly: Boolean = false): String {
+    val raw = input.trim()
+    val trimmed =
+        if (httpsOnly && raw.matches(Regex("^(?i)http://.+"))) "https://" + raw.substring(7)
+        else raw
     val looksLikeUrl =
         trimmed.matches(Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://.*")) ||
             (!trimmed.contains(' ') && trimmed.contains('.') && trimmed.length > 3)
