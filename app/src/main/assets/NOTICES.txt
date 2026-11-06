@@ -5,9 +5,13 @@ Argon Browser 1.0 - Third-Party Notices
    (org/servo/servoview/JNIServo.kt, org/servo/servoview/Servo.kt)
    - Source: servo/servo@b6c9df76bf2d79d479e4b0162f7ecb383d32d2fd (nightly 2026-11-05)
    - License: Mozilla Public License 2.0 (https://mozilla.org/MPL/2.0/)
-   - These covered files are redistributed UNMODIFIED. Corresponding source:
+   - Corresponding source:
      https://github.com/servo/servo/tree/b6c9df76bf2d79d479e4b0162f7ecb383d32d2fd
      (engine: ports/servoshell, components/; glue: support/android/apk/servoview)
+   - Argon MODIFIES this engine and glue: Indic font fallback, HTTP/2 retry
+     hardening, and an evaluateScript JNI bridge. The patches (MPL-2.0) are
+     published at https://github.com/vio137/argon/tree/main/.github/servo-patches
+     and the modified glue ships in this repository under app/src/main/java/org/servo/servoview/.
    - Servo's own third-party Rust dependencies retain their licenses; see the
      servo/servo repository at the commit above for the full inventory.
    - Argon is an independent shell and is not affiliated with the Servo project.
@@ -16,7 +20,11 @@ Argon Browser 1.0 - Third-Party Notices
    - Source: https://github.com/StevenBlack/hosts (Nov 1, 2026 snapshot)
    - License: MIT
 
-3. unslop (interface design method)
+3. Mozilla Readability (assets/readability.js, reader view)
+   - Source: https://github.com/mozilla/readability, release 0.6.0
+   - License: Apache License 2.0
+
+4. unslop (interface design method)
    - Author: Damir Sokolovsky (@heydamir) - https://github.com/heydamir/unslop
    - License: CC BY 4.0
 

@@ -44,7 +44,9 @@ import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.PlatformTextInputModifierNode
 import androidx.compose.ui.platform.establishTextInputSession
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -367,6 +369,27 @@ internal constructor(
         ServoHolder.lastUrl?.let { url -> scope.launch { client.onUrlChanged(url) } }
     }
 
+    /** Argon: evaluate an app-bundled script in the active page. The callback
+     * runs on the activity scope with (json, error); exactly one is non-null.
+     * Not exposed to web content - callers pass bundled source only. */
+    fun evaluateScript(script: String, onResult: (String?, String?) -> Unit) {
+        val id = nextJsRequestId.incrementAndGet()
+        pendingJsCallbacks[id] = onResult
+        scope.launch(glDispatcher) {
+            runCatching { jni.evaluateScript(id, script) }
+                .onFailure {
+                    pendingJsCallbacks.remove(id)
+                    Log.e("ArgonJs", "evaluateScript engine error: $it")
+                    scope.launch { onResult(null, "engine error: ${it.message}") }
+                }
+        }
+    }
+
+    internal companion object {
+        private val nextJsRequestId = AtomicInteger(0)
+        internal val pendingJsCallbacks = ConcurrentHashMap<Int, (String?, String?) -> Unit>()
+    }
+
     fun addPlatformWindow(
         size: Size,
         density: Float,
@@ -592,6 +615,11 @@ internal constructor(
             Log.i("ArgonNav", "urlChanged $url")
             ServoHolder.lastUrl = url
             scope.launch { client.onUrlChanged(url) }
+        }
+
+        override fun onJsResult(requestId: Int, json: String?, error: String?) {
+            val callback = Servo.pendingJsCallbacks.remove(requestId) ?: return
+            scope.launch { callback(json, error) }
         }
 
         override fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean) {

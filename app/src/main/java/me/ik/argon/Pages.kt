@@ -280,6 +280,7 @@ fun MenuSheet(
     currentHost: String,
     onDismiss: () -> Unit,
     onForward: () -> Unit,
+    onReader: () -> Unit,
     onAddToStart: () -> Unit,
     onHistory: () -> Unit,
     onSettings: () -> Unit,
@@ -307,6 +308,7 @@ fun MenuSheet(
                 }
             }
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
+            SheetRow(R.drawable.ic_reader, "Reader view", true, onReader)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
@@ -363,6 +365,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 Text("Version 1.0 · package me.ik.argon", fontSize = 15.sp)
                 Text("Web engine: Servo nightly 2026-11-05 (servo/servo@b6c9df76), MPL-2.0 · servo.org", fontSize = 15.sp)
                 Text("Ad and tracker list: StevenBlack/hosts, MIT license", fontSize = 15.sp)
+                Text("Reader view: Mozilla Readability 0.6.0, Apache-2.0", fontSize = 15.sp)
                 Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", fontSize = 15.sp)
                 Text("Argon is an independent shell and is not affiliated with the Servo project.", fontSize = 13.sp, color = ArgonColors.Text2)
             }

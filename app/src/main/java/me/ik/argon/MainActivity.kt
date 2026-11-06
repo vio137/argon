@@ -100,6 +100,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var alertMessage by mutableStateOf<String?>(null)
     private var screen by mutableStateOf(Screen.Browser)
     private var showMenu by mutableStateOf(false)
+    private var readerLoading by mutableStateOf(false)
+    private var readerArticle by mutableStateOf<ReaderArticle?>(null)
+    private var readerError by mutableStateOf<String?>(null)
     private var showAbout by mutableStateOf(false)
     private var adblock by mutableStateOf(true)
     private var experimental by mutableStateOf(false)
@@ -273,6 +276,18 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 navigator.forward()
                             },
+                            onReader = {
+                                showMenu = false
+                                readerLoading = true
+                                ReaderMode.evaluate(this@MainActivity) { article, error ->
+                                    readerLoading = false
+                                    if (article != null) {
+                                        readerArticle = article
+                                    } else {
+                                        readerError = error ?: "Couldn't extract the article."
+                                    }
+                                }
+                            },
                             onAddToStart = {
                                 showMenu = false
                                 bookmarks.add(currentTitle, currentUrl)
@@ -294,6 +309,27 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     }
                     if (showAbout) {
                         AboutDialog(onDismiss = { showAbout = false })
+                    }
+                    if (readerLoading) {
+                        Box(
+                            Modifier.fillMaxSize().background(ArgonColors.Surface.copy(alpha = 0.55f)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("Preparing reader view...", color = ArgonColors.Text, fontSize = 15.sp)
+                        }
+                    }
+                    readerArticle?.let { article ->
+                        ReaderOverlay(article = article, onClose = { readerArticle = null })
+                    }
+                    readerError?.let { message ->
+                        AlertDialog(
+                            onDismissRequest = { readerError = null },
+                            confirmButton = {
+                                TextButton(onClick = { readerError = null }) { Text("OK") }
+                            },
+                            title = { Text("Reader view") },
+                            text = { Text(message) },
+                        )
                     }
                     if (restartDialog) {
                         AlertDialog(

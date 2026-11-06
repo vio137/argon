@@ -63,6 +63,9 @@ internal class JNIServo {
 
     external fun setExperimentalMode(enable: Boolean)
 
+    /** Argon: evaluate an app-bundled script; result arrives via Callbacks.onJsResult. */
+    external fun evaluateScript(requestId: Int, script: String)
+
     external fun doFrame()
 
     interface Callbacks {
@@ -83,5 +86,8 @@ internal class JNIServo {
         fun onImeShow()
 
         fun onImeHide()
+
+        /** Argon: result of evaluateScript; exactly one of json/error is non-null. */
+        fun onJsResult(requestId: Int, json: String?, error: String?)
     }
 }
