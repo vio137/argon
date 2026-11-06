@@ -34,13 +34,13 @@ index 012a04b..b3a7236 100644
              network_connection_timeout: 15,
 diff --git a/components/media/backends/android/Cargo.toml b/components/media/backends/android/Cargo.toml
 new file mode 100644
-index 0000000..406401d
+index 0000000..44b9984
 --- /dev/null
 +++ b/components/media/backends/android/Cargo.toml
 @@ -0,0 +1,34 @@
-+/* This Source Code Form is subject to the terms of the Mozilla Public
-+ * License, v. 2.0. If a copy of the MPL was not distributed with this
-+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 +
 +[package]
 +name = "servo-media-android"
@@ -529,6 +529,36 @@ index 0000000..baa83e9
 +[dependencies]
 +log = "0.4"
 +mime = "0.3"
+diff --git a/components/media/backends/android/hosttest/README.md b/components/media/backends/android/hosttest/README.md
+new file mode 100644
+index 0000000..fe267fe
+--- /dev/null
++++ b/components/media/backends/android/hosttest/README.md
+@@ -0,0 +1,24 @@
++# Host tests for the Android media backend
++
++The pure logic of the backend (buffering, MIME table, YUV packing) is
++host-testable. This harness compiles the exact shipped files on the host via
++#[path] includes and runs their unit tests. The NDK-dependent code
++(sys.rs/source.rs/player.rs) is compiled only for Android targets.
++
++## Invocation
++
++    cd components/media/backends/android/hosttest
++    cargo test
++
++Requires any stable Rust toolchain (verified with 1.99.1). No Servo checkout,
++no Android SDK/NDK needed. The own [workspace] in Cargo.toml keeps this out of
++the Servo workspace when the crate is vendored into it.
++
++## Results (2026-11-06)
++
++    test result: ok. 13 passed; 0 failed
++
++Covered: SharedBuffer windows/seeks (6), mime_table answers (3),
++yuv_pack packing incl. row/pixel strides (4). NOT covered (need device
++evidence): codec format negotiation, crop/rotation/color changes, odd
++dimensions, ImageReader-decoder compatibility, A/V sync, audio focus/routes.
 diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
 new file mode 100644
 index 0000000..7ea79be
