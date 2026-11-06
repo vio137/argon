@@ -305,10 +305,10 @@ index 0000000..ed1f9fe
 +}
 diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
 new file mode 100644
-index 0000000..063609f
+index 0000000..3c2c65f
 --- /dev/null
 +++ b/components/media/backends/android/android_impl/player.rs
-@@ -0,0 +1,1415 @@
+@@ -0,0 +1,1425 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -1125,6 +1125,16 @@ index 0000000..063609f
 +
 +            if self.last_position_event.elapsed() >= POSITION_EVENT_INTERVAL {
 +                self.last_position_event = Instant::now();
++                if !self.aaudio.is_null() {
++                    // Runtime evidence for the media diagnostic: presented PCM
++                    // from the NDK, our own clock, and the focus state.
++                    debug!(
++                        "audio evidence: frames_written={} clock_us={} focus={}",
++                        unsafe { sys::AAudioStream_getFramesWritten(self.aaudio) },
++                        self.clock.now_us(),
++                        focus::focus(),
++                    );
++                }
 +                send_event(
 +                    &self.sender,
 +                    PlayerEvent::PositionChanged(self.clock.now_us() as f64 / 1e6),
@@ -1868,10 +1878,10 @@ index 0000000..76f9701
 +}
 diff --git a/components/media/backends/android/android_impl/sys.rs b/components/media/backends/android/android_impl/sys.rs
 new file mode 100644
-index 0000000..e7a3f78
+index 0000000..eb2ba01
 --- /dev/null
 +++ b/components/media/backends/android/android_impl/sys.rs
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,280 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -2071,6 +2081,7 @@ index 0000000..e7a3f78
 +    pub fn AAudio_createStreamBuilder(
 +        builder: *mut *mut AAudioStreamBuilder,
 +    ) -> aaudio_result_t;
++    pub fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
 +    pub fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> aaudio_result_t;
 +    pub fn AAudioStreamBuilder_setDirection(builder: *mut AAudioStreamBuilder, direction: i32);
 +    pub fn AAudioStreamBuilder_setSampleRate(builder: *mut AAudioStreamBuilder, sample_rate: i32);

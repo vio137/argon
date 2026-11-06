@@ -117,18 +117,25 @@ class MediaDiagTest {
 
         private fun currentTime(d: JSONObject) = d.optDouble("currentTime", -1.0)
 
-        /** Samples a grid over the screen centre (the video area): returns a
-         *  simple pixel hash and average luminance, or null on failure. */
-        private fun sampleVideoRegion(): Pair<String, Int>? {
+        /** Samples a grid inside the video element's own content rect (from
+         *  __diag rect * dpr, inset 8px), never touching chrome or page pixels. */
+        private fun sampleVideoRect(d: JSONObject): Pair<String, Int>? {
+            val rect = d.optJSONObject("rect") ?: return null
+            val dpr = rect.optDouble("dpr", 1.0)
             val shot: Bitmap = InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
                 ?: return null
             try {
-                val cols = 24
-                val rows = 14
-                val x0 = shot.width / 4
-                val y0 = shot.height / 3
-                val w = shot.width / 2
-                val h = shot.height / 3
+                val inset = 8
+                val x0 = (rect.optDouble("x") * dpr).toInt() + inset
+                val y0 = (rect.optDouble("y") * dpr).toInt() + inset
+                val w = (rect.optDouble("w") * dpr).toInt() - 2 * inset
+                val h = (rect.optDouble("h") * dpr).toInt() - 2 * inset
+                if (w < 16 || h < 16 || x0 < 0 || y0 < 0 || x0 + w > shot.width || y0 + h > shot.height) {
+                    Log.w(TAG, "video rect off-screen: x=$x0 y=$y0 w=$w h=$h shot=${'$'}{shot.width}x${'$'}{shot.height}")
+                    return null
+                }
+                val cols = 16
+                val rows = 12
                 var hash = 1469598103934665603L
                 var lum = 0L
                 var n = 0
@@ -210,28 +217,36 @@ class MediaDiagTest {
     }
 
     /**
-     * Real decoded-video proof: two native screenshots 1.2s apart during
-     * playback must differ in the video region. A dummy backend can advance
-     * currentTime and fire events; it cannot change rendered pixels.
+     * Real decoded-video proof on a deterministic fixture (diag.mp4 = 1s full-
+     * frame solid colours + 440 Hz tone): two screenshots cropped to the exact
+     * video content rect (from __diag, excluding all chrome and page pixels)
+     * must differ, and presentation counters must advance. Negative control:
+     * the same crop while paused must NOT change.
      */
     @Test
     fun t05_renderedFramesChange() {
         openUrl(PAGE)
         pollDiag(30_000) { it.optInt("readyState", 0) >= 1 }
         play()
-        pollDiag(20_000) { currentTime(it) > 1.0 }
-        val a = sampleVideoRegion()
+        val playing = pollDiag(20_000) { currentTime(it) > 1.0 }
+        assertNotNull("playback running for frame evidence", playing)
+        Log.i(TAG, "counters: total=${playing!!.optInt("totalFrames")} dropped=${playing.optInt("droppedFrames")} rect=${playing.optJSONObject("rect")}")
+        val a = sampleVideoRect(playing)
         Thread.sleep(1_200)
-        val b = sampleVideoRegion()
+        val d2 = diag()!!
+        val b = sampleVideoRect(d2)
         assertNotNull("screenshot A", a)
         assertNotNull("screenshot B", b)
-        val (hashA, avgA) = a!!
-        val (hashB, avgB) = b!!
-        Log.i(TAG, "frames: hashA=$hashA avgA=$avgA hashB=$hashB avgB=$avgB")
-        assertTrue(
-            "rendered video pixels change over 1.2s (hashA=$hashA hashB=$hashB)",
-            hashA != hashB,
-        )
+        Log.i(TAG, "frames: hashA=${a!!.first} avgA=${a.second} hashB=${b!!.first} avgB=${b.second} total2=${d2.optInt("totalFrames")}")
+        assertTrue("rendered video pixels change over 1.2s", a.first != b.first)
+        // Negative control: paused, same crop must be static.
+        evalJs("(function(){document.getElementById('v').pause();return 'paused';})()")
+        Thread.sleep(600)
+        val p1 = sampleVideoRect(diag()!!)
+        Thread.sleep(1_200)
+        val p2 = sampleVideoRect(diag()!!)
+        Log.i(TAG, "negative control: pausedA=${p1?.first} pausedB=${p2?.first}")
+        assertTrue("paused video pixels do NOT change", p1 != null && p2 != null && p1.first == p2.first)
     }
 
     @Test
