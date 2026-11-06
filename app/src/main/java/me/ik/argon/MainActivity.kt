@@ -7,6 +7,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
@@ -100,16 +101,53 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var currentTitle by mutableStateOf("")
     private var alertMessage by mutableStateOf<String?>(null)
     private var screen by mutableStateOf(Screen.Browser)
+    private var domLoading by mutableStateOf(false)
     private var showMenu by mutableStateOf(false)
     private var readerLoading by mutableStateOf(false)
     private var readerArticle by mutableStateOf<ReaderArticle?>(null)
     private var readerError by mutableStateOf<String?>(null)
     private var readerRequestGen = 0
     private var showAbout by mutableStateOf(false)
+    private var domText by mutableStateOf<String?>(null)
     private var adblock by mutableStateOf(true)
     private var showOnboarding by mutableStateOf(false)
     private var httpsOnly by mutableStateOf(false)
     private var clearOnExit by mutableStateOf(false)
+
+    private val exportBookmarksLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/html")) { uri ->
+            if (uri != null) {
+                val n =
+                    runCatching {
+                            contentResolver.openOutputStream(uri)?.use { out ->
+                                out.write(BookmarksIO.export(bookmarks.entries).toByteArray(Charsets.UTF_8))
+                            } ?: error("no stream")
+                            bookmarks.entries.size
+                        }
+                        .getOrElse { -1 }
+                alertMessage = if (n >= 0) "Exported $n bookmarks." else "Bookmark export failed."
+            }
+        }
+
+    private val importBookmarksLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                val result =
+                    runCatching {
+                            val html =
+                                contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                                    ?: error("no stream")
+                            val parsed = BookmarksIO.import(html)
+                            val before = bookmarks.entries.size
+                            parsed.forEach { bookmarks.add(it.title, it.url) }
+                            bookmarks.entries.size - before
+                        }
+                        .getOrElse { -1 }
+                alertMessage =
+                    if (result >= 0) "Imported $result new bookmarks."
+                    else "Bookmark import failed - not a recognized bookmarks file."
+            }
+        }
     private var experimental by mutableStateOf(false)
 
     companion object {
@@ -340,6 +378,17 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 showAbout = true
                             },
+                            onViewDom = {
+                                showMenu = false
+                                domLoading = true
+                                val gen = ++readerRequestGen
+                                ViewDom.fetch(readerScope) { dom, error ->
+                                    if (gen != readerRequestGen) return@fetch
+                                    domLoading = false
+                                    if (dom != null) domText = dom
+                                    else if (error != ReaderMode.STALE) readerError = error
+                                }
+                            },
                             onExit = {
                                 showMenu = false
                                 finishAndRemoveTask()
@@ -348,6 +397,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     }
                     if (showAbout) {
                         AboutDialog(onDismiss = { showAbout = false })
+                    }
+                    val dom = domText
+                    if (dom != null) {
+                        DomPage(dom = dom, onBack = { domText = null })
+                        BackHandler { domText = null }
                     }
                     if (readerLoading) {
                         // Non-blocking pill: no touch interception, page stays usable
@@ -640,6 +694,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 clearOnExit = it
                 prefs.edit().putBoolean("clear_on_exit", it).apply()
             },
+            onExportBookmarks = { exportBookmarksLauncher.launch("argon-bookmarks.html") },
+            onImportBookmarks = { importBookmarksLauncher.launch(arrayOf("text/html", "text/*", "application/octet-stream")) },
             onClearHistory = { history.clear() },
             onBack = { screen = Screen.Browser },
         )

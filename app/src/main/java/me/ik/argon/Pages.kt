@@ -151,6 +151,8 @@ fun SettingsScreen(
     onHttpsOnly: (Boolean) -> Unit,
     clearOnExit: Boolean,
     onClearOnExit: (Boolean) -> Unit,
+    onExportBookmarks: () -> Unit,
+    onImportBookmarks: () -> Unit,
     onClearHistory: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -188,6 +190,16 @@ fun SettingsScreen(
                     subtitle = "In-development Servo capabilities",
                     checked = experimental,
                     onCheckedChange = onExperimental,
+                )
+                SettingClick(
+                    title = "Export bookmarks",
+                    subtitle = "Save as browser-compatible HTML",
+                    onClick = onExportBookmarks,
+                )
+                SettingClick(
+                    title = "Import bookmarks",
+                    subtitle = "From a Chrome, Firefox, Edge or Safari HTML file; existing entries are kept",
+                    onClick = onImportBookmarks,
                 )
                 SettingClick(title = "Clear history", subtitle = null, danger = true, onClick = { confirmClear = true })
                 Spacer(Modifier.height(32.dp))
@@ -302,6 +314,7 @@ fun MenuSheet(
     onHistory: () -> Unit,
     onSettings: () -> Unit,
     onAbout: () -> Unit,
+    onViewDom: () -> Unit,
     onExit: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = ArgonColors.Surface) {
@@ -327,6 +340,7 @@ fun MenuSheet(
             }
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
             SheetRow(R.drawable.ic_reader, "Reader view", readerEnabled, onReader)
+            SheetRow(R.drawable.ic_reader, "View DOM (current page)", readerEnabled, onViewDom)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
