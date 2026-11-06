@@ -1,0 +1,97 @@
+name: Build patched Servo engine (Android, font fallback)
+
+# Manual build of the Servo engine with the font_list patch applied.
+# Produces an UNSIGNED servoshell library for internal testing only.
+# No secrets, no signing material, no third-party actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      servo_ref:
+        description: 'Servo commit (short or full SHA) to build'
+        required: true
+        default: 'b6c9df76'
+
+concurrency:
+  group: servo-font-patch
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      JAVA_HOME: /usr/lib/jvm/temurin-21-jdk-amd64
+      ANDROID_SDK_ROOT: /opt/argon-android-sdk
+      NDK_VERSION: 28.2.13676358
+    steps:
+      - name: Checkout argon (for the patch)
+        uses: actions/checkout@v4
+
+      - name: Resolve full servo commit SHA
+        id: sha
+        run: |
+          FULL=$(curl -fsSL "https://api.github.com/repos/servo/servo/commits/${{ inputs.servo_ref }}" | python3 -c "import sys,json; print(json.load(sys.stdin)['sha'])")
+          echo "Resolved ${{ inputs.servo_ref }} -> $FULL"
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
+
+      - name: Reclaim disk space (own reviewed steps only)
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" /usr/local/lib/android /usr/local/share/powershell \
+            /usr/share/swift /opt/az /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          sudo rm -rf /var/lib/docker || true
+          sudo rm -f /swapfile || true
+          df -h /
+
+      - name: Install Android cmdline-tools and SDK packages
+        run: |
+          set -ex
+          sudo mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip" \
+            || curl -fsSL -o /tmp/cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          sudo unzip -q /tmp/cmdline-tools.zip -d /tmp/ct
+          sudo mv /tmp/ct/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | sudo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          sudo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION"
+          sudo chmod -R a+rx "$ANDROID_SDK_ROOT"
+          df -h /
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch servo at the pin and apply the font patch
+        run: |
+          set -ex
+          mkdir servo && cd servo
+          git init -q
+          git fetch -q --depth 1 https://github.com/servo/servo.git "${{ steps.sha.outputs.full }}"
+          git checkout -q FETCH_HEAD
+          git apply "$GITHUB_WORKSPACE/.github/servo-font-patch/font_list.patch"
+          git diff --stat
+          df -h /
+
+      - name: Build servoshell for Android (release)
+        run: |
+          set -ex
+          cd servo
+          export PATH="$HOME/.cargo/bin:$PATH"
+          ./mach build --android --release
+          df -h /
+          find target -name '*.so' -path '*android*' | head -20
+
+      - name: Upload patched engine library (unsigned, internal only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: servoshell-fontpatch-${{ steps.sha.outputs.full }}
+          path: |
+            servo/target/aarch64-linux-android/release/*.so
+            servo/target/aarch64-linux-android/release/**/*.so
+          if-no-files-found: error
+          retention-days: 30

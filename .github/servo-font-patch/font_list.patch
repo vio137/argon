@@ -1,0 +1,72 @@
+--- a/components/fonts/platform/freetype/android/font_list.rs	2026-11-06 14:51:59.487780117 +0530
++++ b/components/fonts/platform/freetype/android/font_list.rs	2026-11-06 16:51:09.872069853 +0530
+@@ -236,6 +236,40 @@
+         self.families
+             .iter()
+             .find(|family| family.name.eq_ignore_ascii_case(name))
++            .or_else(|| {
++                self.families
++                    .iter()
++                    .find(|family| Self::normalized_eq(&family.name, name))
++            })
++    }
++
++    // Compare family names ignoring case, spaces and punctuation, so that
++    // "Noto Sans Bengali" matches the synthetic "NotoSansBengali".
++    fn normalized_eq(a: &str, b: &str) -> bool {
++        a.chars()
++            .filter(|c| c.is_ascii_alphanumeric())
++            .map(|c| c.to_ascii_lowercase())
++            .eq(b
++                .chars()
++                .filter(|c| c.is_ascii_alphanumeric())
++                .map(|c| c.to_ascii_lowercase()))
++    }
++
++    // Derive a family name from a postScriptName such as
++    // "NotoSansBengali-Regular" -> "NotoSansBengali".
++    fn family_name_from_postscript_name(ps_name: String) -> Option<String> {
++        let name = ps_name.trim();
++        if name.is_empty() {
++            return None;
++        }
++        // Strip a trailing style suffix ("-Regular", "-UI-Bold", ...).
++        let base = name.rsplit_once('-').map(|(base, _)| base).unwrap_or(name);
++        let base = base.trim();
++        if base.is_empty() {
++            None
++        } else {
++            Some(base.to_owned())
++        }
+     }
+ 
+     fn find_alias(&self, name: &str) -> Option<&FontAlias> {
+@@ -268,7 +302,27 @@
+         let name = if let Some(name) = Self::find_attrib("name", attrs) {
+             name
+         } else {
+-            return;
++            // Android API 28+ places script-specific fonts (Bengali, Devanagari,
++            // CJK, ...) in unnamed, language-tagged <family> entries whose only
++            // identifying attribute is postScriptName on the <font> child, e.g.
++            // <font postScriptName="NotoSansBengali-Regular" ...>. Register them
++            // under a synthetic family name derived from the postScriptName so
++            // that lookups ("Noto Sans Bengali" etc.) can resolve them.
++            let ps_name = familyset.iter().find_map(|node| {
++                if let Node::Element {
++                    name, attributes, ..
++                } = node
++                {
++                    if name.local_name == "font" {
++                        return Self::find_attrib("postScriptName", attributes);
++                    }
++                }
++                None
++            });
++            match ps_name.and_then(Self::family_name_from_postscript_name) {
++                Some(name) => name,
++                None => return,
++            }
+         };
+ 
+         let mut fonts = Vec::new();
