@@ -162,7 +162,36 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 .focusRequester(servoFocusRequester),
                     )
                     LaunchedEffect(Unit) { servoFocusRequester.requestFocus() }
-                    BrowserChrome(Modifier.align(Alignment.BottomCenter))
+                    me.ik.argon.ui.ArgonCommandBar(
+                        urlState = urlState,
+                        omniboxText = urlState.text.toString(),
+                        currentDisplayUrl = hostOf(displayableUrl(currentUrl)),
+                        canGoBack = navigator.canGoBack,
+                        isLoading = isLoading,
+                        focused = omniboxFocused,
+                        secure = currentUrl.startsWith("https://"),
+                        onFocusChange = { nowFocused ->
+                            if (nowFocused && !omniboxFocused) {
+                                omniboxFocused = true
+                                urlState.edit {
+                                    val shown = displayableUrl(currentUrl)
+                                    if (shown.isNotEmpty()) {
+                                        replace(0, length, shown)
+                                        selectAll()
+                                    }
+                                }
+                            } else if (!nowFocused && omniboxFocused) {
+                                omniboxFocused = false
+                                urlState.edit { replace(0, length, hostOf(displayableUrl(currentUrl))) }
+                            }
+                        },
+                        onSubmit = { submitOmnibox() },
+                        onBack = { navigator.back() },
+                        onStopOrReload = { if (isLoading) navigator.stop() else navigator.reload() },
+                        onMenu = { showMenu = true },
+                        loadingArc = { LoadingArc() },
+                        modifier = Modifier.align(Alignment.BottomCenter),
+                    )
                     when (screen) {
                         Screen.History ->
                             HistoryPage(
