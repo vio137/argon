@@ -119,6 +119,16 @@ site-loading and browsing performance before drawing conclusions.
   entirely engine-side) - so monotonic-id uniqueness plus complete close
   tombstoning closes the adoption liveness gap: an unknown, untombstoned id
   can only be a live view.
+- 040 (S2a, MSE stage 1): ports the servo-media-mse traits crate from
+  servo/media#458 into the vendored in-tree media workspace
+  (components/media/mse: MediaSource / SourceBuffer / SourceBufferList /
+  AppendMode / EosError / ReadyState traits, pure std), plus the two wiring
+  points: Player::connect_media_source (default Err(SetStreamFailed)) and
+  Backend::create_mse_source (default None). No backend implements MSE yet,
+  so behavior is unchanged by construction; the script-layer MSE pref stays
+  OFF until the Android backend implements the traits for real (S3). The
+  gstreamer reference implementation from media#458 is NOT ported (we do
+  not build gstreamer); it serves as the S3 reference only.
 - Dialog safety (upstream behavior, verified in components/servo/
   webview_delegate.rs at the pinned revision): only the informational Alert
   reaches the app via onAlert; Confirm and Prompt fall through to the
