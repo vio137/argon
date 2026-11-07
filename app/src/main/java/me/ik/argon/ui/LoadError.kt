@@ -44,7 +44,15 @@ fun LoadErrorCard(
                 "Secure connection failed" to
                     "The connection failed its security checks, so the page was not shown."
             "crash" -> "This page crashed" to "The page stopped while loading."
-            else -> "This page couldn't be loaded" to reason.ifBlank { "The connection failed." }
+            else ->
+                "This page couldn't be loaded" to
+                    when (reason) {
+                        "http_error" -> "The site returned an error instead of the page."
+                        "connection_failed" -> "The site could not be reached."
+                        "redirect" -> "The site kept redirecting, so loading stopped."
+                        "blocked" -> "The page was blocked by a security policy."
+                        else -> "The connection failed."
+                    }
         }
     Box(
         Modifier.fillMaxSize()

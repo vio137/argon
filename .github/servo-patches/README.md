@@ -72,3 +72,16 @@ site-loading and browsing performance before drawing conclusions.
   failures are a distinct kind with no bypass affordance.
 - App side: MainActivity LoadErrorCard overlay; events bound to
   currentUrl/lastRequestedUrl, dropped when stale.
+
+### 020 revision history
+- v1 (2ad46c0): initial signal; raw bounded reason string (RETRACTED:
+  String::truncate could split a UTF-8 boundary, and raw provider detail was
+  over-shared). Engine build run 42352632037 compile-checks v1 as an exact
+  snapshot; its artifact is not a candidate.
+- v2 (current): payload is a fixed ASCII category token (tls_validation,
+  crash, http_error, connection_failed, redirect, blocked, resource,
+  network) - Unicode-safe by construction, no provider detail. Staleness
+  gate moved to the authoritative layer: the constellation forwards only
+  when the failed pipeline is the webview's active top-level document or an
+  in-flight navigation target (pipeline identity, not URL equality).
+  App-side URL matching remains secondary defense.

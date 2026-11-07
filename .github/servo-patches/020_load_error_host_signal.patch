@@ -1,26 +1,36 @@
 diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
-index 7018074..4e60650 100644
+index 7018074..8eb56fb 100644
 --- a/components/constellation/constellation.rs
 +++ b/components/constellation/constellation.rs
-@@ -2048,6 +2048,26 @@ where
+@@ -2048,6 +2048,36 @@ where
                      pipeline.title = title;
                  }
              },
-+            ScriptToConstellationMessage::LoadError(pipeline_id, kind, reason) => {
-+                // Argon: forward only when the failed pipeline still belongs
-+                // to a live webview, attaching the pipeline's recorded URL
-+                // for host-side staleness binding. Never logged: the reason
-+                // may embed a private URL.
++            ScriptToConstellationMessage::LoadError(pipeline_id, kind, category) => {
++                // Argon: authoritative staleness gate on document/request
++                // identity, not URL equality. Forward only when the failed
++                // pipeline is the webview's current active top-level document
++                // or the target of an in-flight navigation request; stale,
++                // superseded, and iframe pipelines are dropped here. The
++                // category is a fixed ASCII token; the URL attached is the
++                // pipeline's recorded one, for secondary host-side matching.
 +                if let Some(pipeline) = self.pipelines.get(&pipeline_id) {
 +                    let webview_id = pipeline.webview_id;
-+                    if self.webviews.contains_key(&webview_id) {
++                    let is_current = self.webviews.get(&webview_id).is_some_and(|webview| {
++                        webview.active_top_level_pipeline_id == Some(pipeline_id) ||
++                            webview
++                                .pending_changes
++                                .iter()
++                                .any(|change| change.new_pipeline_id == pipeline_id)
++                    });
++                    if is_current {
 +                        self.constellation_to_embedder_proxy.send(
 +                            ConstellationToEmbedderMsg::LoadError(
 +                                webview_id,
 +                                pipeline_id,
 +                                pipeline.url.clone(),
 +                                kind,
-+                                reason,
++                                category,
 +                            ),
 +                        );
 +                    }
@@ -30,7 +40,7 @@ index 7018074..4e60650 100644
                  self.handle_iframe_size_msg(webview_id, iframe_sizes)
              },
 diff --git a/components/constellation/embedder.rs b/components/constellation/embedder.rs
-index af264da..d4654d1 100644
+index af264da..4d6cbbc 100644
 --- a/components/constellation/embedder.rs
 +++ b/components/constellation/embedder.rs
 @@ -4,7 +4,7 @@
@@ -42,14 +52,15 @@ index af264da..d4654d1 100644
  };
  use servo_base::generic_channel::GenericSender;
  use servo_base::id::{PipelineId, WebViewId};
-@@ -40,6 +40,11 @@ pub enum ConstellationToEmbedderMsg {
+@@ -40,6 +40,12 @@ pub enum ConstellationToEmbedderMsg {
      AllowNavigationRequest(WebViewId, PipelineId, ServoUrl),
      /// The history state has changed.
      HistoryChanged(WebViewId, Vec<ServoUrl>, usize),
-+    /// A top-level document load failed with a network-level error. Carries
-+    /// the pipeline's recorded URL so the embedder can bind the event to the
-+    /// currently displayed page and drop stale events. The reason string is
-+    /// engine-generated, bounded, and must never be logged.
++    /// A top-level document load failed with a network-level error. Sent
++    /// only when the failed pipeline is the webview's current top-level
++    /// document or pending navigation target. Carries the pipeline's
++    /// recorded URL for secondary host-side matching and a fixed ASCII
++    /// category token, never raw server/provider detail.
 +    LoadError(WebViewId, PipelineId, ServoUrl, LoadErrorKind, String),
      /// A pipeline exited, whether cleanly or because its content process died.
      PipelineExited(PipelineId),
@@ -67,39 +78,42 @@ index f983245..998a374 100644
                  Self::ReportMemory(..) => target!("ReportMemory"),
                  Self::FinishJavaScriptEvaluation(..) => target!("FinishJavaScriptEvaluation"),
 diff --git a/components/script/dom/servoparser/mod.rs b/components/script/dom/servoparser/mod.rs
-index 7648ad5..ddb89e7 100644
+index 7648ad5..44e2c5c 100644
 --- a/components/script/dom/servoparser/mod.rs
 +++ b/components/script/dom/servoparser/mod.rs
-@@ -1554,6 +1554,35 @@ impl ParserContext {
+@@ -1554,6 +1554,38 @@ impl ParserContext {
          // navigationParams's navigable, navigationParams's id, navigationParams's navigation timing type,
          // and navigationParams's user involvement.
          if let Some(error) = error {
 +            // Argon: surface top-level load failures to the host so it can
 +            // present its own error UI. Sent only for top-level documents;
 +            // iframe failures and cancelled loads never produce this signal
-+            // (LoadCancelled returned before this point). The reason is
-+            // bounded and must not be logged: it may embed a URL.
++            // (LoadCancelled returned before this point). The payload is a
++            // fixed ASCII category token, never raw server/provider detail:
++            // nothing private or unbounded leaves the engine.
 +            if window.is_top_level() {
 +                let kind = match &error {
 +                    NetworkError::SslValidation(..) => embedder_traits::LoadErrorKind::Tls,
 +                    NetworkError::Crash(..) => embedder_traits::LoadErrorKind::Crash,
 +                    _ => embedder_traits::LoadErrorKind::Network,
 +                };
-+                let mut bounded_reason = match &error {
-+                    NetworkError::SslValidation(reason, _) |
-+                    NetworkError::BlobURLStoreError(reason) |
-+                    NetworkError::WebsocketConnectionFailure(reason) |
-+                    NetworkError::HttpError(reason) |
-+                    NetworkError::ResourceLoadError(reason) |
-+                    NetworkError::MimeType(reason) => reason.clone(),
-+                    other => format!("{other:?}"),
++                let category = match &error {
++                    NetworkError::SslValidation(..) => "tls_validation",
++                    NetworkError::Crash(..) => "crash",
++                    NetworkError::HttpError(..) => "http_error",
++                    NetworkError::ConnectionFailure => "connection_failed",
++                    NetworkError::TooManyRedirects | NetworkError::RedirectError => "redirect",
++                    NetworkError::ContentSecurityPolicy |
++                    NetworkError::MixedContent |
++                    NetworkError::Nosniff => "blocked",
++                    NetworkError::ResourceLoadError(..) => "resource",
++                    _ => "network",
 +                };
-+                bounded_reason.truncate(160);
 +                window.send_to_constellation(
 +                    servo_constellation_traits::ScriptToConstellationMessage::LoadError(
 +                        window.pipeline_id(),
 +                        kind,
-+                        bounded_reason,
++                        category.to_owned(),
 +                    ),
 +                );
 +            }
@@ -125,7 +139,7 @@ index bb4fb92..e182a95 100644
                  let orphaned = self
                      .geolocation_watches
 diff --git a/components/servo/webview_delegate.rs b/components/servo/webview_delegate.rs
-index 36fdea4..ecbfb15 100644
+index 36fdea4..98a241a 100644
 --- a/components/servo/webview_delegate.rs
 +++ b/components/servo/webview_delegate.rs
 @@ -9,7 +9,8 @@ use embedder_traits::{
@@ -143,11 +157,11 @@ index 36fdea4..ecbfb15 100644
      /// status can accessed via [`WebView::load_status`].
      fn notify_load_status_changed(&self, _webview: WebView, _status: LoadStatus) {}
 +    /// A top-level document load failed with a network-level error and Servo
-+    /// rendered its inline error page. `url` is the failed pipeline's
-+    /// recorded URL, for binding this event to the currently displayed page.
-+    /// `reason` is engine-generated and bounded (160 chars); it may embed a
-+    /// URL and must not be logged publicly. [`LoadErrorKind::Tls`] failures
-+    /// must never surface retry/proceed-anyway affordances.
++    /// rendered its inline error page. Fired only for the webview's current
++    /// top-level document or pending navigation target. `url` is the failed
++    /// pipeline's recorded URL; `reason` is a fixed ASCII category token,
++    /// never raw server/provider detail. [`LoadErrorKind::Tls`] failures
++    /// must never surface proceed-anyway affordances.
 +    fn notify_load_error(
 +        &self,
 +        _webview: WebView,
@@ -160,7 +174,7 @@ index 36fdea4..ecbfb15 100644
      /// cursor can accessed via [`WebView::cursor`].
      fn notify_cursor_changed(&self, _webview: WebView, _cursor: Cursor) {}
 diff --git a/components/shared/constellation/from_script_message.rs b/components/shared/constellation/from_script_message.rs
-index f415ada..128f789 100644
+index f415ada..38aa45d 100644
 --- a/components/shared/constellation/from_script_message.rs
 +++ b/components/shared/constellation/from_script_message.rs
 @@ -13,7 +13,8 @@ use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
@@ -180,8 +194,8 @@ index f415ada..128f789 100644
 +    /// A top-level document load failed with a network-level error and an
 +    /// inline error page was rendered. Sent only for top-level documents;
 +    /// iframe and subresource failures never produce this message. The
-+    /// reason string is engine-generated and bounded by the sender (160
-+    /// chars); it may embed a URL and must never be logged.
++    /// string is a fixed ASCII category token chosen by the sender, never
++    /// raw server/provider detail.
 +    LoadError(PipelineId, LoadErrorKind, String),
      /// Notify the constellation that the size of some `<iframe>`s has changed.
      IFrameSizes(Vec<IFrameSizeMsg>),
@@ -211,7 +225,7 @@ index a842ae1..e57f498 100644
  /// when the [Notification API](<https://notifications.spec.whatwg.org/#notifications>) is called.
  #[derive(Clone, Debug, Deserialize, Serialize)]
 diff --git a/ports/servoshell/egl/android/mod.rs b/ports/servoshell/egl/android/mod.rs
-index dab1f04..2e369ab 100644
+index dab1f04..9631849 100644
 --- a/ports/servoshell/egl/android/mod.rs
 +++ b/ports/servoshell/egl/android/mod.rs
 @@ -25,7 +25,8 @@ use raw_window_handle::{
@@ -230,7 +244,7 @@ index dab1f04..2e369ab 100644
      fn on_panic(&self, _reason: String, _backtrace: Option<String>) {}
 +
 +    /// Argon: forward top-level load failures to the app. Only the kind is
-+    /// logged; url and reason may be private and are never logged.
++    /// logged; the url stays private and reason is a fixed category token.
 +    fn on_load_error(&self, url: String, kind: LoadErrorKind, reason: String) {
 +        debug!("on_load_error: {kind:?}");
 +        let kind_str = match kind {
@@ -288,7 +302,7 @@ index 4329cf0..afda40c 100644
          log::log!(level.into(), "{message}");
      }
 diff --git a/ports/servoshell/egl/host_trait.rs b/ports/servoshell/egl/host_trait.rs
-index 89bc803..31d99c7 100644
+index 89bc803..3171b2e 100644
 --- a/ports/servoshell/egl/host_trait.rs
 +++ b/ports/servoshell/egl/host_trait.rs
 @@ -2,7 +2,7 @@
@@ -305,7 +319,7 @@ index 89bc803..31d99c7 100644
      ///  - Throbber stops spinning.
      fn notify_load_status_changed(&self, load_status: LoadStatus);
 +    /// A top-level load failed; `url` is the failed pipeline's recorded URL
-+    /// and `reason` is bounded and engine-generated; neither may be logged.
++    /// and `reason` is a fixed ASCII category token.
 +    /// [`LoadErrorKind::Tls`] failures never offer bypass.
 +    fn on_load_error(&self, _url: String, _kind: LoadErrorKind, _reason: String) {}
      /// Page title has changed.
