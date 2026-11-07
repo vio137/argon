@@ -344,6 +344,10 @@ fun SettingsScreen(
     onHttpsOnly: (Boolean) -> Unit,
     clearOnExit: Boolean,
     onClearOnExit: (Boolean) -> Unit,
+    compactTabs: Boolean,
+    onCompactTabs: (Boolean) -> Unit,
+    closeButtonsBackgroundTabs: Boolean,
+    onCloseButtonsBackgroundTabs: (Boolean) -> Unit,
     onExportBookmarks: () -> Unit,
     onImportBookmarks: () -> Unit,
     onClearHistory: (Long?) -> Unit,
@@ -385,6 +389,19 @@ fun SettingsScreen(
                     subtitle = "In-development Servo capabilities",
                     checked = experimental,
                     onCheckedChange = onExperimental,
+                )
+                SettingsLabel("Tabs")
+                SettingSwitch(
+                    title = "Compact tabs",
+                    subtitle = "Smaller tab chips showing the site initial; close button only on the active tab",
+                    checked = compactTabs,
+                    onCheckedChange = onCompactTabs,
+                )
+                SettingSwitch(
+                    title = "Close button on background tabs",
+                    subtitle = "Shows the close control on every tab chip, not only the active one",
+                    checked = closeButtonsBackgroundTabs,
+                    onCheckedChange = onCloseButtonsBackgroundTabs,
                 )
                 SettingsLabel("Data")
                 SettingClick(

@@ -175,6 +175,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var lastShareAt: Long = 0L
     private var httpsOnly by mutableStateOf(false)
     private var clearOnExit by mutableStateOf(false)
+    private var compactTabs by mutableStateOf(false)
+    private var tabCloseButtons by mutableStateOf(true)
 
     private val exportBookmarksLauncher =
         registerForActivityResult(ActivityResultContracts.CreateDocument("text/html")) { uri ->
@@ -333,6 +335,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
         showOnboarding = !prefs.getBoolean("onboarded", false)
         httpsOnly = prefs.getBoolean("https_only", false)
         clearOnExit = prefs.getBoolean("clear_on_exit", false)
+        compactTabs = prefs.getBoolean("compact_tabs", false)
+        tabCloseButtons = prefs.getBoolean("tab_close_buttons", true)
         experimental = prefs.getBoolean("experimental", false)
         searchEngine = SearchEngine.fromPref(prefs.getString("engine", null))
         Blocklist.apply(this, adblock)
@@ -922,6 +926,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
             WaxEffect.CONNECT_EXISTING_SESSION -> {
                 val session = waxSession ?: return
                 waxConnection = WaxConnection.CONNECTING
+                val scope = uiScope ?: return
                 scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                     val profile = waxStore.load()
                     val code = if (profile != null) session.connect(profile) else -1
@@ -1001,6 +1006,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 onNew = { openNewTab(startPageUrl) },
                 onLongPress = { tabStripMenuId = it },
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),
+                compact = compactTabs,
+                showCloseOnBackground = tabCloseButtons,
             )
         }
     }
@@ -1098,6 +1105,16 @@ class MainActivity : ComponentActivity(), Servo.Client {
             onClearOnExit = {
                 clearOnExit = it
                 prefs.edit().putBoolean("clear_on_exit", it).apply()
+            },
+            compactTabs = compactTabs,
+            onCompactTabs = {
+                compactTabs = it
+                prefs.edit().putBoolean("compact_tabs", it).apply()
+            },
+            closeButtonsBackgroundTabs = tabCloseButtons,
+            onCloseButtonsBackgroundTabs = {
+                tabCloseButtons = it
+                prefs.edit().putBoolean("tab_close_buttons", it).apply()
             },
             onExportBookmarks = { exportBookmarksLauncher.launch("argon-bookmarks.html") },
             onImportBookmarks = { importBookmarksLauncher.launch(arrayOf("text/html", "text/*", "application/octet-stream")) },

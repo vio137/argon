@@ -42,6 +42,8 @@ fun ArgonTabStrip(
     onNew: () -> Unit,
     onLongPress: (String) -> Unit,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
+    showCloseOnBackground: Boolean = true,
 ) {
     Row(
         modifier = modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
@@ -59,6 +61,31 @@ fun ArgonTabStrip(
                         onLongClick = { onLongPress(id) },
                     ),
             ) {
+                if (compact) {
+                    // Compact density: fixed-size initial chip (site monogram
+                    // placeholder until a favicon pipeline lands); close only on
+                    // the active chip so background chips stay tap targets.
+                    Text(
+                        label.firstOrNull()?.uppercase() ?: "?",
+                        color = if (selected) ArgonColors.Text else ArgonColors.Text2,
+                        fontSize = 13.sp,
+                        modifier =
+                            Modifier.padding(
+                                start = 12.dp,
+                                top = 6.dp,
+                                bottom = 6.dp,
+                                end = if (selected) 2.dp else 12.dp,
+                            ),
+                    )
+                    if (selected) {
+                        Text(
+                            "\u00d7",
+                            color = ArgonColors.Text3,
+                            fontSize = 14.sp,
+                            modifier = Modifier.clickable { onClose(id) }.padding(horizontal = 8.dp),
+                        )
+                    }
+                } else {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.padding(start = 10.dp, top = 6.dp, bottom = 6.dp, end = 2.dp),
@@ -71,12 +98,15 @@ fun ArgonTabStrip(
                         fontSize = 12.sp,
                         modifier = Modifier.widthIn(max = 120.dp),
                     )
+                    if (selected || showCloseOnBackground) {
                     Text(
                         "\u00d7",
                         color = ArgonColors.Text3,
                         fontSize = 14.sp,
                         modifier = Modifier.clickable { onClose(id) }.padding(horizontal = 8.dp),
                     )
+                    }
+                }
                 }
             }
         }
