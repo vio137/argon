@@ -1,0 +1,43 @@
+commit 43856afd5b569958503b0dc941dd87123548867b
+Author: Instinct Agent <agent@instinct.com>
+Date:   Sat Nov 7 19:57:46 2026 +0530
+
+    058 media: flush AAudio queue on seek (drop stale pre-seek audio)
+
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
+index f051d385b..84910d7b7 100644
+--- a/components/media/backends/android/android_impl/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
+@@ -899,8 +899,17 @@ impl Pipeline {
+             // rebase restarts the wall clock; freeze it again while paused.
+             self.clock.pause();
+         }
+-        if !self.aaudio.is_null() && !self.shared.get().paused && !held {
+-            unsafe { sys::AAudioStream_requestStart(self.aaudio) };
++        if !self.aaudio.is_null() {
++            unsafe {
++                // Discard pre-seek audio still queued in the stream; without
++                // this it audibly tails after the seek while the clock has
++                // already rebased to the target.
++                sys::AAudioStream_requestStop(self.aaudio);
++                sys::AAudioStream_requestFlush(self.aaudio);
++                if !self.shared.get().paused && !held {
++                    sys::AAudioStream_requestStart(self.aaudio);
++                }
++            }
+         }
+         send_event(&self.sender, PlayerEvent::SeekDone(time));
+     }
+diff --git a/components/media/backends/android/android_impl/sys.rs b/components/media/backends/android/android_impl/sys.rs
+index eb2ba01e6..81953cad8 100644
+--- a/components/media/backends/android/android_impl/sys.rs
++++ b/components/media/backends/android/android_impl/sys.rs
+@@ -226,6 +226,8 @@ unsafe extern "C" {
+     pub fn AAudioStream_close(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_requestStart(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_requestStop(stream: *mut AAudioStream) -> aaudio_result_t;
++    /// API 28+ (minSdk is 29): discard queued-but-unplayed audio.
++    pub fn AAudioStream_requestFlush(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_write(
+         stream: *mut AAudioStream,
+         buffer: *const c_void,
