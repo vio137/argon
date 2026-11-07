@@ -205,7 +205,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         Blocklist.apply(this, adblock)
         history = HistoryStore(this)
         bookmarks = BookmarkStore(this)
-        val startPageUrl = StartPage.write(this, bookmarks.entries, searchEngine)
+        val startPageUrl = StartPage.write(this, bookmarks.entries, history.entries, searchEngine)
         // Experiment: user stylesheet declaring script-fallback family names
         // from the device's own font files (bounded size; no default-family
         // replacement). Null when no usable fonts found.
@@ -349,12 +349,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                     screen = Screen.Browser
                                 },
                                 onBack = {
-                                    StartPage.write(this@MainActivity, bookmarks.entries, searchEngine)
+                                    StartPage.write(this@MainActivity, bookmarks.entries, history.entries, searchEngine)
                                     screen = Screen.Browser
                                 },
                             )
                             BackHandler {
-                                StartPage.write(this@MainActivity, bookmarks.entries, searchEngine)
+                                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, searchEngine)
                                 screen = Screen.Browser
                             }
                         }
@@ -373,7 +373,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onEngineChange = {
                                 searchEngine = it
                                 prefs.edit().putString("engine", it.name.lowercase()).apply()
-                                StartPage.write(this@MainActivity, bookmarks.entries, it)
+                                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, it)
                             },
                             onDone = {
                                 prefs.edit().putBoolean("onboarded", true).apply()
@@ -421,7 +421,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onAddToStart = {
                                 showMenu = false
                                 bookmarks.add(currentTitle, currentUrl)
-                                StartPage.write(this@MainActivity, bookmarks.entries, searchEngine)
+                                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, searchEngine)
                             },
                             onHistory = {
                                 showMenu = false
@@ -592,7 +592,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
             onSearchEngine = {
                 searchEngine = it
                 prefs.edit().putString("engine", it.name.lowercase()).apply()
-                StartPage.write(this@MainActivity, bookmarks.entries, it)
+                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, it)
             },
             experimental = experimental,
             onExperimental = {
