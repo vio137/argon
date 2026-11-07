@@ -571,6 +571,20 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     if (showAbout) {
                         AboutDialog(onDismiss = { showAbout = false })
                     }
+                    if (StoreHealth.writeError.value) {
+                        AlertDialog(
+                            onDismissRequest = { StoreHealth.writeError.value = false },
+                            title = { Text("Couldn't save") },
+                            text = {
+                                Text(
+                                    "Writing to device storage failed, so the last change may not be kept. Free up storage space and try again."
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = { StoreHealth.writeError.value = false }) { Text("OK") }
+                            },
+                        )
+                    }
                     if (restartDialog) {
                         AlertDialog(
                             onDismissRequest = { restartDialog = false },

@@ -12,6 +12,48 @@ import kotlinx.serialization.json.Json
 
 private val storeJson = Json { ignoreUnknownKeys = true }
 
+/**
+ * Set when any store write fails, so the UI can tell the user a change may
+ * not have been saved instead of silently reporting success. Compose-visible.
+ */
+object StoreHealth {
+    val writeError = androidx.compose.runtime.mutableStateOf(false)
+}
+
+/** Atomic store write: serialize to a sibling temp file, then rename over
+ * the target, so a crash mid-write can never leave a truncated store.
+ * Returns success; failures are surfaced via [StoreHealth] and never
+ * swallowed silently. */
+private fun writeStore(file: File, payload: String): Boolean {
+    val tmp = File(file.parentFile, file.name + ".tmp")
+    return runCatching {
+            tmp.writeText(payload)
+            if (!tmp.renameTo(file)) {
+                // Some filesystems refuse rename-over-existing; fall back to
+                // delete+rename, still never writing the target in place.
+                file.delete()
+                check(tmp.renameTo(file))
+            }
+        }
+        .onFailure { StoreHealth.writeError.value = true }
+        .isSuccess
+}
+
+/**
+ * Load a JSON store. A present-but-undecodable file is RENAMED ASIDE
+ * (preserved as <name>.corrupt) instead of being left in place where the
+ * next save would silently overwrite potentially recoverable data.
+ */
+private inline fun <reified T> loadStore(file: File, fallback: List<T>): List<T> {
+    val decoded = runCatching { storeJson.decodeFromString<List<T>>(file.readText()) }
+    return decoded.getOrElse {
+        if (file.exists() && file.length() > 0) {
+            runCatching { file.renameTo(File(file.parentFile, file.name + ".corrupt")) }
+        }
+        fallback
+    }
+}
+
 class HistoryStore(context: Context) {
     private val file = File(context.filesDir, "history.json")
 
@@ -19,11 +61,7 @@ class HistoryStore(context: Context) {
         private set
 
     init {
-        entries =
-            runCatching {
-                    storeJson.decodeFromString<List<HistoryEntry>>(file.readText())
-                }
-                .getOrDefault(emptyList())
+        entries = loadStore(file, emptyList())
     }
 
     @Synchronized
@@ -54,7 +92,7 @@ class HistoryStore(context: Context) {
     }
 
     private fun save() {
-        runCatching { file.writeText(storeJson.encodeToString(entries)) }
+        writeStore(file, storeJson.encodeToString(entries))
     }
 }
 
@@ -65,13 +103,9 @@ class BookmarkStore(context: Context) {
         private set
 
     init {
-        entries =
-            runCatching {
-                    storeJson.decodeFromString<List<Bookmark>>(file.readText())
-                }
-                // No shipped bookmarks: the start page must only ever show
-                // pages the user actually starred (same rule as history).
-                .getOrDefault(emptyList())
+        // No shipped bookmarks: the start page must only ever show pages
+        // the user actually starred (same rule as history).
+        entries = loadStore(file, emptyList())
     }
 
     @Synchronized
@@ -97,6 +131,6 @@ class BookmarkStore(context: Context) {
     }
 
     private fun save() {
-        runCatching { file.writeText(storeJson.encodeToString(entries)) }
+        writeStore(file, storeJson.encodeToString(entries))
     }
 }

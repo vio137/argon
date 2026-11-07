@@ -48,7 +48,8 @@ Reinstall: git clone --depth 1 <url> for each into the agent workspace.
 
 ## Verification honesty
 - Start page: pixel-verified (headless Chrome against the live template).
-- Compose screens (menu, pages, reader, onboarding, chrome): compile + CI lint verified only; no device rendering performed. Treat as visually unverified until a device run exists.
+- Compose screens (menu, pages, onboarding, chrome): compile + CI lint verified only; no device rendering performed. Treat as visually unverified until a device run exists.
+- The 2026-11-07 passes over all screens were a STATIC FLOW REVIEW (code-level walk of states, enabled gates, escape paths and store handling). They are not visual, spatial or runtime verification.
 
 ## User-directed exclusions (2026-11-07, user's own words)
 - Reader view and View DOM: user tried them on the delivered candidate, said they do not work and "I don't want those features". Both removed from the next build: menu rows, overlays, ReaderMode.kt, ViewDom.kt, readability.js asset, icons, About credit, serif article type styles. The engine's evaluateScript bridge stays in the servo package (it is engine API, unused features cost nothing).
