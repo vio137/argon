@@ -1,0 +1,197 @@
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index fdcbbaef9..cf9a8c9c3 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -35,6 +35,7 @@ struct State {
+     volume: f64,
+     stopped: bool,
+     input_ended: bool,
++    output_ended: bool,
+     pending_seek: Option<u64>,
+     buffers: BTreeMap<u32, BufferState>,
+     buffered: Vec<Range<f64>>,
+@@ -73,6 +74,7 @@ impl AndroidAppendPlayer {
+             volume: 1.0,
+             stopped: false,
+             input_ended: false,
++            output_ended: false,
+             pending_seek: None,
+             buffers: BTreeMap::new(),
+             buffered: vec![],
+@@ -105,6 +107,7 @@ impl AndroidAppendPlayer {
+                     } => {
+                         let mut s = shared.lock().unwrap();
+                         if s.finish_seek(operation) {
++                            s.output_ended = false;
+                             send(PlayerEvent::AppendSeekDone {
+                                 operation,
+                                 position: target_us as f64 / 1e6,
+@@ -254,7 +257,7 @@ impl AndroidAppendPlayer {
+                             {
+                                 let mut s = shared.lock().unwrap();
+                                 s.paused = true;
+-                                s.stopped = true;
++                                s.output_ended = true;
+                                 s.pending_seek = None;
+                             }
+                             send(PlayerEvent::EndOfStream);
+@@ -371,7 +374,7 @@ impl MediaInstance for AndroidAppendPlayer {
+ impl Player for AndroidAppendPlayer {
+     fn play(&self) -> Result<(), PlayerError> {
+         let mut s = self.state.lock().unwrap();
+-        if s.stopped {
++        if s.stopped || (s.output_ended && s.pending_seek.is_none()) {
+             return Err(error());
+         }
+         self.command(Command::Playing(true))?;
+@@ -960,4 +963,45 @@ mod tests {
+         assert_eq!(s.pending_seek, None);
+         assert!(!s.stopped);
+     }
++    #[test]
++    fn player_eos_is_not_close_and_retains_controls_and_seekability() {
++        let (tx, rx) = mpsc::channel();
++        let player = AndroidAppendPlayer::new(
++            78,
++            GenericCallback::new(move |m| {
++                if let Ok(e) = m {
++                    let _ = tx.send(e);
++                }
++            })
++            .unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        player.lock().unwrap().play().unwrap();
++        player.lock().unwrap().end_of_stream().unwrap();
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                PlayerEvent::EndOfStream => break,
++                PlayerEvent::Error(_) => panic!("EOS failed"),
++                _ => (),
++            }
++        }
++        let p = player.lock().unwrap();
++        {
++            let mut s = p.state.lock().unwrap();
++            assert!(s.output_ended);
++            assert!(!s.stopped);
++            s.buffered = vec![0.0..2.0];
++        }
++        assert!(p.can_resume());
++        assert!(p.paused());
++        assert!(!p.seekable().is_empty());
++        assert!(p.play().is_err());
++        p.set_volume(0.5).unwrap();
++        p.pause().unwrap();
++        p.close();
++        assert!(p.seekable().is_empty());
++        assert!(!p.can_resume());
++    }
+ }
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index 7d2bdeb9d..4354a780e 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -98,6 +98,7 @@ impl Worker {
+                     let mut previous_playing = false;
+                     let mut last_status = Instant::now();
+                     let mut pending_seek = None;
++                    let mut output_finished = false;
+                     loop {
+                         if cancelled.load(Ordering::Acquire) {
+                             break;
+@@ -132,6 +133,7 @@ impl Worker {
+                                             event(Event::SeekRejected(operation));
+                                             continue;
+                                         }
++                                        output_finished = false;
+                                         pending_seek = Some((operation, target_us));
+                                         Ok(())
+                                     },
+@@ -168,6 +170,15 @@ impl Worker {
+                         if cancelled.load(Ordering::Acquire) {
+                             break;
+                         }
++                        // Keep the worker and retained sessions alive after EOS. A
++                        // later seek can reset the native output epoch. Do not pump
++                        // the completed epoch or emit repeated EndOfStream reports.
++                        if output_finished {
++                            if let Some(ack) = applied_ack {
++                                event(Event::CommandApplied(ack));
++                            }
++                            continue;
++                        }
+                         let status = match playback.pump() {
+                             Ok(s) => s,
+                             Err(()) => {
+@@ -209,7 +220,7 @@ impl Worker {
+                         }
+                         if status.finished {
+                             playback.set_playing(false)?;
+-                            break;
++                            output_finished = true;
+                         }
+                     }
+                     Ok::<(), ()>(())
+@@ -440,4 +451,59 @@ mod tests {
+             }
+         }
+     }
++    #[test]
++    fn completed_output_keeps_worker_alive_without_repeating_eos() {
++        let (tx, rx) = mpsc::channel();
++        let worker = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |e| {
++                let _ = tx.send(e);
++            }),
++        )
++        .unwrap();
++        assert!(worker.try_command(Command::Playing(true)).is_ok());
++        assert!(worker.try_command(Command::EndInput).is_ok());
++        let mut finished = 0;
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::Status(s) if s.finished => finished += 1,
++                Event::CommandApplied(Applied::InputEnded) => break,
++                Event::Error => panic!("empty EOS failed"),
++                _ => (),
++            }
++        }
++        assert_eq!(finished, 1);
++        assert!(
++            worker
++                .try_command(Command::Seek {
++                    operation: 77,
++                    target_us: 0
++                })
++                .is_ok()
++        );
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::SeekRejected(77) => break,
++                Event::Status(s) if s.finished => panic!("repeated EOS"),
++                Event::Error => panic!("rejected seek poisoned EOS worker"),
++                _ => (),
++            }
++        }
++        assert!(
++            worker
++                .try_command(Command::Volume {
++                    volume: 0.5,
++                    muted: true
++                })
++                .is_ok()
++        );
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::CommandApplied(Applied::Volume) => break,
++                Event::Status(s) if s.finished => panic!("repeated EOS"),
++                Event::Error => panic!("completed worker failed"),
++                _ => (),
++            }
++        }
++    }
+ }
