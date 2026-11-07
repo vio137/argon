@@ -62,3 +62,48 @@ Reinstall: git clone --depth 1 <url> for each into the agent workspace.
   scale and jumps to end state; the start page gates its CSS on
   prefers-reduced-motion: no-preference.
 - Frame-rate values read inside graphicsLayer blocks, never in composition.
+
+## System-back precedence (static review, 2026-11-07; compile-verified, not runtime-tested)
+
+Compose rule: the last-composed ENABLED BackHandler in the window wins. Gates
+below make the activity-level handlers mutually exclusive by construction.
+Dialog windows (M3 ModalBottomSheet, every AlertDialog: engine alert, restart,
+rename, clear-history, engine picker, About) are separate windows - system
+back is delivered to the dialog and dismisses it; activity BackHandlers never
+see it. IME up: the system consumes the first back to collapse the keyboard
+before any Compose handler runs.
+
+Composition order and gates:
+1. Omnibox focused + blank query -> clearFocus (editing exits first).
+2. Omnibox focused + query -> clearFocus (closes suggestions, restores host).
+3. History/Bookmarks/Settings screen -> back to Browser (Bookmarks refreshes
+   the start page). Only composed on that screen.
+4. Onboarding overlay: BackHandler(enabled = page > 0) steps back a page; on
+   page 0 no handler is enabled, so back exits first run (Skip is on screen).
+5. Browser back chain, gated on: Browser screen, no onboarding, no menu, no
+   find bar, omnibox NOT focused. Order inside: find is closed by its own
+   handler (6); page history via navigator.canGoBack; at the root, first
+   press arms a 2.5s window with a toast, second press finishAndRemoveTask().
+   The arm resets on every onUrlChanged so it cannot leak onto a later root.
+6. Find bar visible -> closeFind (composed after 5; 5 is gated !findVisible).
+
+Known limitation: precedence is established statically from composition order
+and gates; no device run has exercised the matrix.
+
+## Next-build inclusion list (exact; nothing else rides along)
+
+Included since the delivered candidate (vc18): theme/menu/onboarding revamp,
+start page v3 + integrity hardening, local suggestions, share target
+(hardened), share page with title, copy link, open in another app, bookmarks
+screen + import/export + rename, history filter/remove/day-grouping/time-range
+clear, find in page (EXPERIMENTAL: bridge runtime-unverified), motion layer +
+reduced-motion compliance, 48dp touch targets, state-aware star toggle,
+onboarding skip + back steps, system-back chain with press-again exit,
+About version from BuildConfig, no shipped sample bookmarks, no Reader/ViewDOM
+(user-directed, permanent).
+
+Excluded from the next build: Reader view and View DOM (user's own words,
+2026-11-07). Toolbar-on-top ships as experimental-only (settings row visible
+only under "Experimental web features", inert otherwise) until the flipped
+layout has spatial evidence gathered under allowed methods. Tabs and the
+network-error page are open gaps under investigation, not in this build.

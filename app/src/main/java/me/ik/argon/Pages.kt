@@ -345,6 +345,7 @@ fun SettingsScreen(
     clearOnExit: Boolean,
     onClearOnExit: (Boolean) -> Unit,
     toolbarTop: Boolean,
+    toolbarTopVisible: Boolean,
     onToolbarTop: (Boolean) -> Unit,
     onExportBookmarks: () -> Unit,
     onImportBookmarks: () -> Unit,
@@ -376,12 +377,14 @@ fun SettingsScreen(
                     checked = httpsOnly,
                     onCheckedChange = onHttpsOnly,
                 )
-                SettingSwitch(
-                    title = "Toolbar on top",
-                    subtitle = "Move the address bar to the top of the screen",
-                    checked = toolbarTop,
-                    onCheckedChange = onToolbarTop,
-                )
+                if (toolbarTopVisible) {
+                    SettingSwitch(
+                        title = "Toolbar on top (experimental)",
+                        subtitle = "Move the address bar to the top. Layout not yet visually verified; default bottom is unaffected",
+                        checked = toolbarTop,
+                        onCheckedChange = onToolbarTop,
+                    )
+                }
                 SettingSwitch(
                     title = "Clear history on exit",
                     subtitle = "Clears Argon's history list when the app is closed. Engine cookies and cache are not cleared",
@@ -624,7 +627,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
         title = { Text("Argon") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Version 1.0 · package me.ik.argon", style = ArgonType.BodySmall)
+                Text("Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · package me.ik.argon", style = ArgonType.BodySmall)
                 Text("Web engine: Servo nightly 2026-11-05 (servo/servo@b6c9df76), MPL-2.0 · servo.org", style = ArgonType.BodySmall)
                 Text("Ad and tracker list: StevenBlack/hosts, MIT license", style = ArgonType.BodySmall)
                 Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", style = ArgonType.BodySmall)

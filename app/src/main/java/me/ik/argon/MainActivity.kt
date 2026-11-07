@@ -206,7 +206,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private val navigator get() = ServoHolder.navigator
 
     /** Run a find-in-page script, binding the result to the document it was
-     * issued on (generation advances on every load start, like the reader
+     * issued on (generation advances on every load start, like find-in-page
      * binding did). Runtime behavior of the bridge is unverified on device;
      * the symbol is confirmed exported by the shipped v15 .so. */
     private fun runFindScript(script: String) {
@@ -241,7 +241,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
         prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         adblock = prefs.getBoolean("adblock", true)
         showOnboarding = !prefs.getBoolean("onboarded", false)
-        toolbarTop = prefs.getBoolean("toolbar_top", false)
+        // Experimental-only until the flipped layout has spatial evidence;
+        // stays bottom otherwise even if the pref was once set.
+        toolbarTop = prefs.getBoolean("toolbar_top", false) && prefs.getBoolean("experimental", false)
         httpsOnly = prefs.getBoolean("https_only", false)
         clearOnExit = prefs.getBoolean("clear_on_exit", false)
         experimental = prefs.getBoolean("experimental", false)
@@ -363,6 +365,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         modifier = Modifier.align(if (toolbarTop) Alignment.TopCenter else Alignment.BottomCenter),
                     )
                     val omniboxQuery = urlState.text.toString()
+                    if (omniboxFocused && omniboxQuery.isBlank()) {
+                        // Suggestions only exist for a non-blank query; the
+                        // blank-query case still backs out of editing first.
+                        BackHandler { focusManager.clearFocus() }
+                    }
                     if (omniboxFocused && omniboxQuery.isNotBlank()) {
                         OmniboxSuggestions(
                             query = omniboxQuery,
@@ -519,7 +526,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     }
                     // System back on the browser screen walks page history
                     // first; at the root it asks for a second press to exit.
-                    if (screen == Screen.Browser && !showOnboarding && !showMenu && !findVisible) {
+                    if (screen == Screen.Browser && !showOnboarding && !showMenu && !findVisible && !omniboxFocused) {
                         BackHandler {
                             when {
                                 navigator.canGoBack -> navigator.back()
@@ -696,6 +703,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
             onExperimental = {
                 experimental = it
                 prefs.edit().putBoolean("experimental", it).apply()
+                if (!it && toolbarTop) {
+                    toolbarTop = false
+                    prefs.edit().putBoolean("toolbar_top", false).apply()
+                }
             },
             httpsOnly = httpsOnly,
             onHttpsOnly = {
@@ -708,6 +719,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 prefs.edit().putBoolean("clear_on_exit", it).apply()
             },
             toolbarTop = toolbarTop,
+            toolbarTopVisible = experimental,
             onToolbarTop = {
                 toolbarTop = it
                 prefs.edit().putBoolean("toolbar_top", it).apply()
@@ -746,6 +758,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     override fun onUrlChanged(url: String) {
         currentUrl = url
+        exitArmedAt = 0L
         if (!omniboxFocused) {
             urlState.edit { replace(0, length, hostOf(displayableUrl(url))) }
         }
