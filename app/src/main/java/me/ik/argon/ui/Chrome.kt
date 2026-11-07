@@ -75,7 +75,6 @@ import me.ik.argon.R
 @Composable
 fun ArgonCommandBar(
     urlState: TextFieldState,
-    omniboxText: String,
     currentDisplayUrl: String,
     canGoBack: Boolean,
     isLoading: Boolean,
@@ -166,7 +165,7 @@ fun ArgonCommandBar(
                     if (secure) ArgonColors.Accent else ArgonColors.Text3,
                 )
                 Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                    if (omniboxText.isEmpty()) {
+                    if (urlState.text.isEmpty()) {
                         androidx.compose.material3.Text(
                             "Search or enter address",
                             color = ArgonColors.Text3,
@@ -200,7 +199,7 @@ fun ArgonCommandBar(
                                 .onFocusChanged { onFocusChange(it.isFocused) },
                     )
                 }
-                AnimatedVisibility(visible = omniboxText.isNotEmpty() && focused) {
+                AnimatedVisibility(visible = urlState.text.isNotEmpty() && focused) {
                     ChromeIconButton(
                         onClick = { urlState.edit { replace(0, length, "") } },
                         description = "Clear",

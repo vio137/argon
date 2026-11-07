@@ -25,6 +25,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -47,6 +48,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -380,29 +382,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onDismiss = { loadError = null },
                         )
                     }
-                    val stripTabs =
-                        tabStripVersion.let {
-                            tabManager.order.map { id ->
-                                val t = tabManager.states[id]
-                                id to (
-                                    t?.title?.ifBlank { null }
-                                        ?: hostOf(displayableUrl(t?.url ?: "")).ifBlank { "New tab" }
-                                    )
-                            }
-                        }
-                    if (stripTabs.isNotEmpty()) {
-                        me.ik.argon.ui.ArgonTabStrip(
-                            tabs = stripTabs,
-                            activeId = tabManager.activeId,
-                            onSelect = { switchToTab(it) },
-                            onClose = { closeTab(it) },
-                            onNew = { openNewTab(startPageUrl) },
-                            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),
-                        )
-                    }
+                    TabStripHost()
+
                     me.ik.argon.ui.ArgonCommandBar(
                         urlState = urlState,
-                        omniboxText = urlState.text.toString(),
                         currentDisplayUrl = hostOf(displayableUrl(currentUrl)),
                         canGoBack = navigator.canGoBack,
                         isLoading = isLoading,
@@ -429,47 +412,23 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         onMenu = { showMenu = true },
                         loadingArc = { LoadingArc() },
                         onEscape = { focusManager.clearFocus() },
+                        // Computed only when the URL or the store snapshot
+                        // changes - not on every keystroke/parent recompose
+                        // (perf audit 1.0.17).
                         recentHistory =
-                            history.entries
-                                .filter { it.url != currentUrl }
-                                .take(8)
-                                .map { it.title to it.url },
+                            remember(currentUrl, history.entries) {
+                                history.entries
+                                    .filter { it.url != currentUrl }
+                                    .take(8)
+                                    .map { it.title to it.url }
+                            },
                         onPickHistory = { url ->
                             navigate(url)
                             servoFocusRequester.requestFocus()
                         },
                         modifier = Modifier.align(Alignment.BottomCenter),
                     )
-                    val omniboxQuery = urlState.text.toString()
-                    if (omniboxFocused && omniboxQuery.isBlank()) {
-                        // Suggestions only exist for a non-blank query; the
-                        // blank-query case still backs out of editing first.
-                        BackHandler { focusManager.clearFocus() }
-                    }
-                    // Hidden while the find bar owns the slot above the
-                    // omnibox - both anchor there and would overlap.
-                    if (omniboxFocused && omniboxQuery.isNotBlank() && !findVisible) {
-                        OmniboxSuggestions(
-                            query = omniboxQuery,
-                            engine = searchEngine,
-                            history = history.entries,
-                            bookmarks = bookmarks.entries,
-                            onSearch = {
-                                submitOmnibox()
-                                servoFocusRequester.requestFocus()
-                            },
-                            onPick = { url ->
-                                navigate(url)
-                                servoFocusRequester.requestFocus()
-                            },
-                            modifier =
-                                Modifier.align(Alignment.BottomCenter)
-                                    .padding(start = 12.dp, end = 12.dp, bottom = 84.dp),
-                        )
-                        // Back closes the suggestions first; the focus-loss
-                        // handler restores the current host in the field.
-                        BackHandler { focusManager.clearFocus() }
-                    }
+                    SuggestionsHost(focusManager)
                     when (screen) {
                         Screen.History -> {
                             PageEntrance {
@@ -764,6 +723,75 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         startActivity(launch)
         Runtime.getRuntime().exit(0)
+    }
+
+    /** Reads tabStripVersion + tabManager inside its own composition scope so
+     * tab-state writes recompose only the strip, not the whole browser tree.
+     * The @Immutable TabStripData wrapper keeps ArgonTabStrip skippable (its
+     * old List<Pair<..>> parameter was unstable, forcing recomposition on
+     * every parent pass, including per-keystroke). Perf audit 1.0.17. */
+    @Composable
+    private fun BoxScope.TabStripHost() {
+        val data =
+            remember(tabStripVersion) {
+                me.ik.argon.ui.TabStripData(
+                    chips =
+                        tabManager.order.map { id ->
+                            val t = tabManager.states[id]
+                            id to (
+                                t?.title?.ifBlank { null }
+                                    ?: hostOf(displayableUrl(t?.url ?: "")).ifBlank { "New tab" }
+                                )
+                        },
+                    activeId = tabManager.activeId,
+                )
+            }
+        if (data.chips.isNotEmpty()) {
+            me.ik.argon.ui.ArgonTabStrip(
+                data = data,
+                onSelect = { switchToTab(it) },
+                onClose = { closeTab(it) },
+                onNew = { openNewTab(startPageUrl) },
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),
+            )
+        }
+    }
+
+    /** Owns the omnibox-query subscription: urlState.text changes on every
+     * keystroke, so reading it here keeps keystrokes recomposing only this
+     * subtree instead of the whole browser tree (the query used to be read in
+     * the root Box scope). Perf audit 1.0.17. Behavior unchanged: Back backs
+     * out of editing, suggestions only for a non-blank focused query, hidden
+     * while the find bar owns the slot. */
+    @Composable
+    private fun BoxScope.SuggestionsHost(focusManager: androidx.compose.ui.focus.FocusManager) {
+        val query = urlState.text.toString()
+        if (omniboxFocused && query.isBlank()) {
+            // Suggestions only exist for a non-blank query; the blank-query
+            // case still backs out of editing first.
+            BackHandler { focusManager.clearFocus() }
+        }
+        if (!(omniboxFocused && query.isNotBlank() && !findVisible)) return
+        OmniboxSuggestions(
+            query = query,
+            engine = searchEngine,
+            history = history.entries,
+            bookmarks = bookmarks.entries,
+            onSearch = {
+                submitOmnibox()
+                servoFocusRequester.requestFocus()
+            },
+            onPick = { url ->
+                navigate(url)
+                servoFocusRequester.requestFocus()
+            },
+            modifier =
+                Modifier.align(Alignment.BottomCenter)
+                    .padding(start = 12.dp, end = 12.dp, bottom = 84.dp),
+        )
+        // Back closes the suggestions first; the focus-loss handler restores
+        // the current host in the field.
+        BackHandler { focusManager.clearFocus() }
     }
 
     @Composable

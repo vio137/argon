@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -19,14 +20,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import me.ik.argon.ArgonColors
 
+/** Snapshot of the strip's presentation data. @Immutable so ArgonTabStrip is
+ * skippable: without a stable wrapper the List<Pair<..>> parameter makes every
+ * keystroke-level parent recomposition re-run the whole strip (perf audit
+ * 1.0.17). Build once per tab-state change with remember(version). */
+@Immutable
+data class TabStripData(val chips: List<Pair<String, String>>, val activeId: String)
+
 /** Horizontal tab strip: one chip per open tab (title, or host when untitled),
  * close affordance per chip, and a trailing new-tab button. Selection state
  * and per-tab data are owned by MainActivity's TabManager; this composable is
  * pure presentation. */
 @Composable
 fun ArgonTabStrip(
-    tabs: List<Pair<String, String>>,
-    activeId: String,
+    data: TabStripData,
     onSelect: (String) -> Unit,
     onClose: (String) -> Unit,
     onNew: () -> Unit,
@@ -37,8 +44,8 @@ fun ArgonTabStrip(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        tabs.forEach { (id, label) ->
-            val selected = id == activeId
+        data.chips.forEach { (id, label) ->
+            val selected = id == data.activeId
             Surface(
                 color = if (selected) ArgonColors.SurfaceHigh else ArgonColors.Surface,
                 shape = RoundedCornerShape(10.dp),
