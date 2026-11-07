@@ -400,14 +400,11 @@ fun MenuSheet(
     onBookmarks: () -> Unit,
     currentHost: String,
     onDismiss: () -> Unit,
-    readerEnabled: Boolean,
     onForward: () -> Unit,
-    onReader: () -> Unit,
     onAddToStart: () -> Unit,
     onHistory: () -> Unit,
     onSettings: () -> Unit,
     onAbout: () -> Unit,
-    onViewDom: () -> Unit,
     onExit: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = ArgonColors.Surface) {
@@ -433,8 +430,6 @@ fun MenuSheet(
             SheetLabel("This page")
             SheetRow(R.drawable.ic_share, "Share page", shareEnabled, onShare)
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
-            SheetRow(R.drawable.ic_reader, "Reader view", readerEnabled, onReader)
-            SheetRow(R.drawable.ic_code, "View DOM (current page)", readerEnabled, onViewDom)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetLabel("App")
             SheetRow(R.drawable.ic_star, "Bookmarks", true, onBookmarks)
@@ -504,7 +499,6 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 Text("Version 1.0 · package me.ik.argon", style = ArgonType.BodySmall)
                 Text("Web engine: Servo nightly 2026-11-05 (servo/servo@b6c9df76), MPL-2.0 · servo.org", style = ArgonType.BodySmall)
                 Text("Ad and tracker list: StevenBlack/hosts, MIT license", style = ArgonType.BodySmall)
-                Text("Reader view: Mozilla Readability 0.6.0, Apache-2.0", style = ArgonType.BodySmall)
                 Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", style = ArgonType.BodySmall)
                 Text("Reviewed against Apple's Human Interface Guidelines (apple-design-skill) and mobile-app-ui-design", style = ArgonType.BodySmall)
                 Text("Argon is an independent shell and is not affiliated with the Servo project.", style = ArgonType.Caption, color = ArgonColors.Text2)

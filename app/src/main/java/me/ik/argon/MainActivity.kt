@@ -49,7 +49,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -102,14 +101,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var currentTitle by mutableStateOf("")
     private var alertMessage by mutableStateOf<String?>(null)
     private var screen by mutableStateOf(Screen.Browser)
-    private var domLoading by mutableStateOf(false)
     private var showMenu by mutableStateOf(false)
-    private var readerLoading by mutableStateOf(false)
-    private var readerArticle by mutableStateOf<ReaderArticle?>(null)
-    private var readerError by mutableStateOf<String?>(null)
-    private var readerRequestGen = 0
     private var showAbout by mutableStateOf(false)
-    private var domText by mutableStateOf<String?>(null)
     private var adblock by mutableStateOf(true)
     private var showOnboarding by mutableStateOf(false)
     private var httpsOnly by mutableStateOf(false)
@@ -390,7 +383,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             },
                         )
                     }
-                    val readerScope = rememberCoroutineScope()
                     if (showMenu) {
                         MenuSheet(
                             canGoForward = navigator.canGoForward,
@@ -406,26 +398,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 screen = Screen.Bookmarks
                             },
-                            readerEnabled = ReaderMode.bridgeAvailable.value,
                             currentHost = hostOf(displayableUrl(currentUrl)),
                             onDismiss = { showMenu = false },
                             onForward = {
                                 showMenu = false
                                 navigator.forward()
-                            },
-                            onReader = {
-                                showMenu = false
-                                readerLoading = true
-                                val gen = ++readerRequestGen
-                                ReaderMode.evaluate(this@MainActivity, readerScope) { article, error ->
-                                    if (gen != readerRequestGen) return@evaluate
-                                    readerLoading = false
-                                    when {
-                                        article != null -> readerArticle = article
-                                        error == ReaderMode.STALE -> Unit // navigated away; discard
-                                        else -> readerError = error ?: "Couldn't extract the article."
-                                    }
-                                }
                             },
                             onAddToStart = {
                                 showMenu = false
@@ -444,17 +421,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 showAbout = true
                             },
-                            onViewDom = {
-                                showMenu = false
-                                domLoading = true
-                                val gen = ++readerRequestGen
-                                ViewDom.fetch(readerScope) { dom, error ->
-                                    if (gen != readerRequestGen) return@fetch
-                                    domLoading = false
-                                    if (dom != null) domText = dom
-                                    else if (error != ReaderMode.STALE) readerError = error
-                                }
-                            },
                             onExit = {
                                 showMenu = false
                                 finishAndRemoveTask()
@@ -463,40 +429,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     }
                     if (showAbout) {
                         AboutDialog(onDismiss = { showAbout = false })
-                    }
-                    val dom = domText
-                    if (dom != null) {
-                        DomPage(dom = dom, onBack = { domText = null })
-                        BackHandler { domText = null }
-                    }
-                    if (readerLoading) {
-                        // Non-blocking pill: no touch interception, page stays usable
-                        // while extraction runs; results from a navigated-away page
-                        // are discarded by the request's URL binding.
-                        Row(
-                            Modifier.align(Alignment.TopCenter)
-                                .statusBarsPadding()
-                                .padding(top = 8.dp)
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(ArgonColors.SurfaceHigh)
-                                .padding(horizontal = 14.dp, vertical = 8.dp),
-                        ) {
-                            Text("Preparing reader view...", color = ArgonColors.Text, style = ArgonType.Caption)
-                        }
-                    }
-                    readerArticle?.let { article ->
-                        ReaderOverlay(article = article, onClose = { readerArticle = null })
-                        BackHandler { readerArticle = null }
-                    }
-                    readerError?.let { message ->
-                        AlertDialog(
-                            onDismissRequest = { readerError = null },
-                            confirmButton = {
-                                TextButton(onClick = { readerError = null }) { Text("OK") }
-                            },
-                            title = { Text("Reader view") },
-                            text = { Text(message) },
-                        )
                     }
                     if (restartDialog) {
                         AlertDialog(
