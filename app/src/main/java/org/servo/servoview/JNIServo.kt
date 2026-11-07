@@ -81,10 +81,23 @@ internal class JNIServo {
 
         fun onUrlChanged(url: String)
 
-        /** Argon (engine patch 020): a top-level page load failed. kind is
-         * "network" | "tls" | "crash"; reason is bounded (160 chars) and
-         * engine-generated. Iframe and subresource failures never fire this. */
-        fun onLoadError(url: String, kind: String, reason: String)
+        /** Argon (engine patch 020 v3): a top-level page load failed. kind is
+         * "network" | "tls" | "crash"; reason is a fixed ASCII category token.
+         * (webviewId, pipelineId, generation) identify the failing load; show
+         * only when they match the current request identity. Iframe and
+         * subresource failures never fire this. */
+        fun onLoadError(
+            webviewId: String,
+            pipelineId: String,
+            url: String,
+            kind: String,
+            reason: String,
+            generation: Long,
+        )
+
+        /** Argon (engine patch 020 v3): a top-level load started; carries its
+         * request identity. Always precedes any error of the same load. */
+        fun onTopLevelLoad(webviewId: String, pipelineId: String, url: String, generation: Long)
 
         fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean)
 

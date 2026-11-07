@@ -1,8 +1,28 @@
 diff --git a/components/constellation/constellation.rs b/components/constellation/constellation.rs
-index 7018074..8eb56fb 100644
+index 7018074..233a598 100644
 --- a/components/constellation/constellation.rs
 +++ b/components/constellation/constellation.rs
-@@ -2048,6 +2048,36 @@ where
+@@ -381,6 +381,11 @@ pub struct Constellation<STF, SWF> {
+     /// Bookkeeping data for all webviews in the constellation.
+     webviews: FxHashMap<WebViewId, ConstellationWebView>,
+ 
++    /// Argon: top-level load generation per pipeline, assigned at top-level
++    /// load start (see `argon_note_top_level_load_started`). Removed when the
++    /// pipeline closes.
++    load_generations: FxHashMap<PipelineId, u64>,
++
+     /// Channels for the constellation to send messages to the public
+     /// resource-related threads. There are two groups of resource threads: one
+     /// for public browsing, and one for private browsing.
+@@ -708,6 +713,7 @@ where
+                     constellation_to_embedder_proxy: state.constellation_to_embedder_proxy,
+                     paint_proxy: state.paint_proxy,
+                     webviews: Default::default(),
++                    load_generations: Default::default(),
+                     #[cfg(feature = "devtools")]
+                     devtools_sender: state.devtools_sender,
+                     #[cfg(feature = "devtools")]
+@@ -2048,6 +2054,38 @@ where
                      pipeline.title = title;
                  }
              },
@@ -11,17 +31,18 @@ index 7018074..8eb56fb 100644
 +                // identity, not URL equality. Forward only when the failed
 +                // pipeline is the webview's current active top-level document
 +                // or the target of an in-flight navigation request; stale,
-+                // superseded, and iframe pipelines are dropped here. The
-+                // category is a fixed ASCII token; the URL attached is the
-+                // pipeline's recorded one, for secondary host-side matching.
++                // superseded, and iframe pipelines are dropped here. The event
++                // carries the failing load's (webview, pipeline, generation)
++                // identity so the app can additionally reject any failure that
++                // no longer matches its current request. The category is a
++                // fixed ASCII token; the URL is display payload only, never
++                // part of the identity match (redirects change it mid-load).
 +                if let Some(pipeline) = self.pipelines.get(&pipeline_id) {
 +                    let webview_id = pipeline.webview_id;
++                    let generation = self.load_generations.get(&pipeline_id).copied().unwrap_or(0);
 +                    let is_current = self.webviews.get(&webview_id).is_some_and(|webview| {
 +                        webview.active_top_level_pipeline_id == Some(pipeline_id) ||
-+                            webview
-+                                .pending_changes
-+                                .iter()
-+                                .any(|change| change.new_pipeline_id == pipeline_id)
++                            webview.pipeline_is_pending(pipeline_id)
 +                    });
 +                    if is_current {
 +                        self.constellation_to_embedder_proxy.send(
@@ -31,6 +52,7 @@ index 7018074..8eb56fb 100644
 +                                pipeline.url.clone(),
 +                                kind,
 +                                category,
++                                generation,
 +                            ),
 +                        );
 +                    }
@@ -39,8 +61,143 @@ index 7018074..8eb56fb 100644
              ScriptToConstellationMessage::IFrameSizes(iframe_sizes) => {
                  self.handle_iframe_size_msg(webview_id, iframe_sizes)
              },
+@@ -3058,6 +3096,7 @@ where
+         debug!("{}: Exited", pipeline_id);
+         self.remove_worker_animation_frame_providers_for_pipeline(pipeline_id);
+ 
++        self.load_generations.remove(&pipeline_id);
+         let Some(pipeline) = self.pipelines.remove(&pipeline_id) else {
+             return;
+         };
+@@ -3197,6 +3236,7 @@ where
+             ..old_load_data.clone()
+         };
+ 
++        let top_level_load_url = new_load_data.url.clone();
+         let is_private = false;
+         self.new_pipeline(
+             new_pipeline_id,
+@@ -3224,6 +3264,10 @@ where
+             new_browsing_context_info: None,
+             viewport_details,
+         });
++        // Argon: the crash-recovery page is a new top-level load; advance the
++        // request identity so the app does not treat its failure as the
++        // crashed load's.
++        self.argon_note_top_level_load_started(webview_id, new_pipeline_id, top_level_load_url);
+     }
+ 
+     #[servo_tracing::instrument(skip_all)]
+@@ -4273,6 +4317,36 @@ where
+     }
+ 
+     #[servo_tracing::instrument(skip_all)]
++    /// Argon: record a top-level load's request identity and notify the
++    /// embedder. Called at every top-level load start: fresh navigations
++    /// (`load_url`), history-traversal reloads
++    /// (`activate_history_entry_in_browsing_context`), and crash-recovery
++    /// loads (`handle_panic_in_webview`). The generation is per-webview and
++    /// saturating; u64 overflow is unreachable in practice and saturation
++    /// keeps the identity monotonic regardless.
++    fn argon_note_top_level_load_started(
++        &mut self,
++        webview_id: WebViewId,
++        pipeline_id: PipelineId,
++        url: ServoUrl,
++    ) {
++        if let Some(webview) = self.webviews.get_mut(&webview_id) {
++            webview.next_top_level_load_generation = webview
++                .next_top_level_load_generation
++                .saturating_add(1);
++            let generation = webview.next_top_level_load_generation;
++            self.load_generations.insert(pipeline_id, generation);
++            self.constellation_to_embedder_proxy.send(
++                ConstellationToEmbedderMsg::TopLevelLoadStarted(
++                    webview_id,
++                    pipeline_id,
++                    url,
++                    generation,
++                ),
++            );
++        }
++    }
++
+     fn load_url(
+         &mut self,
+         webview_id: WebViewId,
+@@ -4391,6 +4465,7 @@ where
+                     None
+                 };
+ 
++                let top_level_load_url = load_data.url.clone();
+                 let new_pipeline_id = PipelineId::new();
+                 self.new_pipeline(
+                     new_pipeline_id,
+@@ -4418,6 +4493,13 @@ where
+                 } else {
+                     warn!("Could not find WebView for URL load: ({webview_id:?})");
+                 }
++                // Argon: top-level load identity for the load-error contract
++                // (no-op if the webview is gone; warned above).
++                self.argon_note_top_level_load_started(
++                    webview_id,
++                    new_pipeline_id,
++                    top_level_load_url,
++                );
+ 
+                 Some(new_pipeline_id)
+             },
+@@ -4788,6 +4870,7 @@ where
+                 // Step 8. Otherwise, if entry's document state's ever populated is true, then set request's history-navigation flag.
+                 load_data.history_navigation = true;
+                 load_data.reload_navigation = false;
++                let top_level_load_url = load_data.url.clone();
+ 
+                 let (webview_id, old_pipeline_id, parent_pipeline_id, viewport_details, is_private) =
+                     match self.browsing_contexts.get(&browsing_context_id) {
+@@ -4837,6 +4920,16 @@ where
+                     new_browsing_context_info: None,
+                     viewport_details,
+                 });
++                // Argon: only top-level traversal reloads carry request
++                // identity; iframe traversal pipelines keep generation 0 and
++                // their failures are rejected at display.
++                if parent_pipeline_id.is_none() {
++                    self.argon_note_top_level_load_started(
++                        webview_id,
++                        new_pipeline_id,
++                        top_level_load_url,
++                    );
++                }
+                 return Some(new_pipeline_id);
+             },
+         };
+diff --git a/components/constellation/constellation_webview.rs b/components/constellation/constellation_webview.rs
+index 9b0995b..64ffa96 100644
+--- a/components/constellation/constellation_webview.rs
++++ b/components/constellation/constellation_webview.rs
+@@ -35,6 +35,11 @@ pub(crate) struct ConstellationWebView {
+     /// A counter for changes to [`Self::active_top_level_pipeline_id`].
+     pub active_top_level_pipeline_epoch: Epoch,
+ 
++    /// Argon: monotonically increasing generation of top-level loads on this
++    /// webview. Incremented (saturating) once per top-level load start so a
++    /// failing load can be matched against the app-side current request.
++    pub next_top_level_load_generation: u64,
++
+     /// When a navigation is performed, we do not immediately update
+     /// the session history, instead we ask the event loop to begin loading
+     /// the new document, and do not update the browsing context until the
+@@ -117,6 +122,7 @@ impl ConstellationWebView {
+             user_content_manager_id,
+             active_top_level_pipeline_id: None,
+             active_top_level_pipeline_epoch: Epoch::default(),
++            next_top_level_load_generation: 0,
+             pending_changes: Default::default(),
+             browsing_context_group,
+             focused_browsing_context_id,
 diff --git a/components/constellation/embedder.rs b/components/constellation/embedder.rs
-index af264da..4d6cbbc 100644
+index af264da..e46bccf 100644
 --- a/components/constellation/embedder.rs
 +++ b/components/constellation/embedder.rs
 @@ -4,7 +4,7 @@
@@ -52,7 +209,7 @@ index af264da..4d6cbbc 100644
  };
  use servo_base::generic_channel::GenericSender;
  use servo_base::id::{PipelineId, WebViewId};
-@@ -40,6 +40,12 @@ pub enum ConstellationToEmbedderMsg {
+@@ -40,6 +40,16 @@ pub enum ConstellationToEmbedderMsg {
      AllowNavigationRequest(WebViewId, PipelineId, ServoUrl),
      /// The history state has changed.
      HistoryChanged(WebViewId, Vec<ServoUrl>, usize),
@@ -61,7 +218,11 @@ index af264da..4d6cbbc 100644
 +    /// document or pending navigation target. Carries the pipeline's
 +    /// recorded URL for secondary host-side matching and a fixed ASCII
 +    /// category token, never raw server/provider detail.
-+    LoadError(WebViewId, PipelineId, ServoUrl, LoadErrorKind, String),
++    /// Argon: a top-level load failed. The u64 is the failing load's
++    /// top-level load generation (0 = unknown / predates tracking).
++    LoadError(WebViewId, PipelineId, ServoUrl, LoadErrorKind, String, u64),
++    /// Argon: a top-level load started, carrying its request identity.
++    TopLevelLoadStarted(WebViewId, PipelineId, ServoUrl, u64),
      /// A pipeline exited, whether cleanly or because its content process died.
      PipelineExited(PipelineId),
  }
@@ -121,25 +282,52 @@ index 7648ad5..44e2c5c 100644
                  NetworkError::SslValidation(reason, bytes) => {
                      let page = resources::read_string(Resource::BadCertHTML);
 diff --git a/components/servo/servo.rs b/components/servo/servo.rs
-index bb4fb92..e182a95 100644
+index bb4fb92..18807e1 100644
 --- a/components/servo/servo.rs
 +++ b/components/servo/servo.rs
-@@ -933,6 +933,13 @@ impl ServoInner {
+@@ -933,6 +933,40 @@ impl ServoInner {
                          .notify_crashed(webview, reason, backtrace);
                  }
              },
-+            ConstellationToEmbedderMsg::LoadError(webview_id, _pipeline_id, url, kind, reason) => {
++            ConstellationToEmbedderMsg::LoadError(
++                webview_id,
++                pipeline_id,
++                url,
++                kind,
++                reason,
++                generation,
++            ) => {
 +                if let Some(webview) = self.get_webview_handle(webview_id) {
-+                    webview
-+                        .delegate()
-+                        .notify_load_error(webview, url.into_url(), kind, reason);
++                    webview.delegate().notify_load_error(
++                        webview,
++                        format!("{pipeline_id:?}"),
++                        url.into_url(),
++                        kind,
++                        reason,
++                        generation,
++                    );
++                }
++            },
++            ConstellationToEmbedderMsg::TopLevelLoadStarted(
++                webview_id,
++                pipeline_id,
++                url,
++                generation,
++            ) => {
++                if let Some(webview) = self.get_webview_handle(webview_id) {
++                    webview.delegate().notify_top_level_load_started(
++                        webview,
++                        format!("{pipeline_id:?}"),
++                        url.into_url(),
++                        generation,
++                    );
 +                }
 +            },
              ConstellationToEmbedderMsg::PipelineExited(pipeline_id) => {
                  let orphaned = self
                      .geolocation_watches
 diff --git a/components/servo/webview_delegate.rs b/components/servo/webview_delegate.rs
-index 36fdea4..98a241a 100644
+index 36fdea4..f1e995a 100644
 --- a/components/servo/webview_delegate.rs
 +++ b/components/servo/webview_delegate.rs
 @@ -9,7 +9,8 @@ use embedder_traits::{
@@ -152,7 +340,7 @@ index 36fdea4..98a241a 100644
      NewWebViewDetails, Notification, PermissionFeature, PromptResponse, RgbColor, ScreenGeometry,
      SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, TraversalId,
      WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
-@@ -939,6 +940,20 @@ pub trait WebViewDelegate {
+@@ -939,6 +940,32 @@ pub trait WebViewDelegate {
      /// The `LoadStatus` of the currently loading or loaded page in this [`WebView`] has changed. The new
      /// status can accessed via [`WebView::load_status`].
      fn notify_load_status_changed(&self, _webview: WebView, _status: LoadStatus) {}
@@ -165,9 +353,21 @@ index 36fdea4..98a241a 100644
 +    fn notify_load_error(
 +        &self,
 +        _webview: WebView,
++        _pipeline_id: String,
 +        _url: Url,
 +        _kind: LoadErrorKind,
 +        _reason: String,
++        _generation: u64,
++    ) {
++    }
++    /// Argon: a top-level load started on this [`WebView`], carrying the
++    /// load's request identity (pipeline debug form + per-webview generation).
++    fn notify_top_level_load_started(
++        &self,
++        _webview: WebView,
++        _pipeline_id: String,
++        _url: Url,
++        _generation: u64,
 +    ) {
 +    }
      /// The [`Cursor`] of the currently loaded page in this [`WebView`] has changed. The new
@@ -225,7 +425,7 @@ index a842ae1..e57f498 100644
  /// when the [Notification API](<https://notifications.spec.whatwg.org/#notifications>) is called.
  #[derive(Clone, Debug, Deserialize, Serialize)]
 diff --git a/ports/servoshell/egl/android/mod.rs b/ports/servoshell/egl/android/mod.rs
-index dab1f04..9631849 100644
+index dab1f04..20d4df6 100644
 --- a/ports/servoshell/egl/android/mod.rs
 +++ b/ports/servoshell/egl/android/mod.rs
 @@ -25,7 +25,8 @@ use raw_window_handle::{
@@ -238,22 +438,37 @@ index dab1f04..9631849 100644
  };
  
  use super::app::{App, AppInitOptions};
-@@ -703,6 +704,37 @@ impl HostTrait for HostCallbacks {
+@@ -703,6 +704,98 @@ impl HostTrait for HostCallbacks {
      fn on_show_select_element(&self, _webview_id: WebViewId, _prompt: SelectElement) {}
  
      fn on_panic(&self, _reason: String, _backtrace: Option<String>) {}
 +
 +    /// Argon: forward top-level load failures to the app. Only the kind is
 +    /// logged; the url stays private and reason is a fixed category token.
-+    fn on_load_error(&self, url: String, kind: LoadErrorKind, reason: String) {
++    fn on_load_error(
++        &self,
++        webview_id: WebViewId,
++        pipeline_id: String,
++        url: String,
++        kind: LoadErrorKind,
++        reason: String,
++        generation: u64,
++    ) {
 +        debug!("on_load_error: {kind:?}");
 +        let kind_str = match kind {
 +            LoadErrorKind::Network => "network",
 +            LoadErrorKind::Tls => "tls",
 +            LoadErrorKind::Crash => "crash",
 +        };
++        let webview_id = webview_id.to_string();
 +        self.jvm
 +            .attach_current_thread(|env| -> Result<(), Error> {
++                let Ok(wv_string) = new_string_as_jvalue(env, &webview_id) else {
++                    return Ok(());
++                };
++                let Ok(pid_string) = new_string_as_jvalue(env, &pipeline_id) else {
++                    return Ok(());
++                };
 +                let Ok(url_string) = new_string_as_jvalue(env, &url) else {
 +                    return Ok(());
 +                };
@@ -266,8 +481,54 @@ index dab1f04..9631849 100644
 +                env.call_method(
 +                    callback_ref(),
 +                    jni_str!("onLoadError"),
-+                    jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
-+                    &[(&url_string).into(), (&kind_string).into(), (&reason_string).into()],
++                    jni_sig!(
++                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V"
++                    ),
++                    &[
++                        (&wv_string).into(),
++                        (&pid_string).into(),
++                        (&url_string).into(),
++                        (&kind_string).into(),
++                        (&reason_string).into(),
++                        (generation as i64).into(),
++                    ],
++                )?;
++                Ok(())
++            })
++            .unwrap();
++    }
++
++    /// Argon: identity of the current top-level load; the app uses it to
++    /// reject stale load-error events at display time.
++    fn on_top_level_load(
++        &self,
++        webview_id: WebViewId,
++        pipeline_id: String,
++        url: String,
++        generation: u64,
++    ) {
++        let webview_id = webview_id.to_string();
++        self.jvm
++            .attach_current_thread(|env| -> Result<(), Error> {
++                let Ok(wv_string) = new_string_as_jvalue(env, &webview_id) else {
++                    return Ok(());
++                };
++                let Ok(pid_string) = new_string_as_jvalue(env, &pipeline_id) else {
++                    return Ok(());
++                };
++                let Ok(url_string) = new_string_as_jvalue(env, &url) else {
++                    return Ok(());
++                };
++                env.call_method(
++                    callback_ref(),
++                    jni_str!("onTopLevelLoad"),
++                    jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V"),
++                    &[
++                        (&wv_string).into(),
++                        (&pid_string).into(),
++                        (&url_string).into(),
++                        (generation as i64).into(),
++                    ],
 +                )?;
 +                Ok(())
 +            })
@@ -277,7 +538,7 @@ index dab1f04..9631849 100644
  
  unsafe extern "C" {
 diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
-index 4329cf0..afda40c 100644
+index 4329cf0..2446e75 100644
 --- a/ports/servoshell/egl/app.rs
 +++ b/ports/servoshell/egl/app.rs
 @@ -12,7 +12,8 @@ use raw_window_handle::{DisplayHandle, RawWindowHandle, WindowHandle};
@@ -290,19 +551,45 @@ index 4329cf0..afda40c 100644
      Opts, Preferences, RefreshDriver, RenderingContext, ScreenGeometry, Scroll, Servo,
      ServoBuilder, SimpleDialog, TouchEvent, TouchEventType, TouchId, TouchPointerType,
      UserContentManager, WebView, WebViewId, WindowRenderingContext, convert_rect_to_css_pixel,
-@@ -213,6 +214,10 @@ impl PlatformWindow for EmbeddedPlatformWindow {
+@@ -213,6 +214,36 @@ impl PlatformWindow for EmbeddedPlatformWindow {
          self.host.on_panic(reason, backtrace);
      }
  
-+    fn notify_load_error(&self, _webview: WebView, url: Url, kind: LoadErrorKind, reason: String) {
-+        self.host.on_load_error(url.to_string(), kind, reason);
++    fn notify_load_error(
++        &self,
++        _webview: WebView,
++        pipeline_id: String,
++        url: Url,
++        kind: LoadErrorKind,
++        reason: String,
++        generation: u64,
++    ) {
++        self.host.on_load_error(
++            _webview.id(),
++            pipeline_id,
++            url.to_string(),
++            kind,
++            reason,
++            generation,
++        );
++    }
++
++    fn notify_top_level_load_started(
++        &self,
++        _webview: WebView,
++        pipeline_id: String,
++        url: Url,
++        generation: u64,
++    ) {
++        self.host
++            .on_top_level_load(_webview.id(), pipeline_id, url.to_string(), generation);
 +    }
 +
      fn show_console_message(&self, level: servo::ConsoleLogLevel, message: &str) {
          log::log!(level.into(), "{message}");
      }
 diff --git a/ports/servoshell/egl/host_trait.rs b/ports/servoshell/egl/host_trait.rs
-index 89bc803..3171b2e 100644
+index 89bc803..568f43f 100644
 --- a/ports/servoshell/egl/host_trait.rs
 +++ b/ports/servoshell/egl/host_trait.rs
 @@ -2,7 +2,7 @@
@@ -314,14 +601,36 @@ index 89bc803..3171b2e 100644
  
  /// Callbacks implemented by embedder. Called by our RunningAppState, generally on behalf of Servo.
  pub trait HostTrait {
-@@ -19,6 +19,10 @@ pub trait HostTrait {
+@@ -19,6 +19,32 @@ pub trait HostTrait {
      ///  - "Stop button" should be disabled.
      ///  - Throbber stops spinning.
      fn notify_load_status_changed(&self, load_status: LoadStatus);
 +    /// A top-level load failed; `url` is the failed pipeline's recorded URL
 +    /// and `reason` is a fixed ASCII category token.
 +    /// [`LoadErrorKind::Tls`] failures never offer bypass.
-+    fn on_load_error(&self, _url: String, _kind: LoadErrorKind, _reason: String) {}
++    /// `webview_id`, `pipeline_id` and `generation` identify the failing
++    /// load; the app shows the error only when they match its current
++    /// request identity.
++    fn on_load_error(
++        &self,
++        _webview_id: WebViewId,
++        _pipeline_id: String,
++        _url: String,
++        _kind: LoadErrorKind,
++        _reason: String,
++        _generation: u64,
++    ) {
++    }
++    /// Argon: a top-level load started; the app replaces its current-request
++    /// identity with (webview_id, pipeline_id, generation).
++    fn on_top_level_load(
++        &self,
++        _webview_id: WebViewId,
++        _pipeline_id: String,
++        _url: String,
++        _generation: u64,
++    ) {
++    }
      /// Page title has changed.
      fn on_title_changed(&self, title: Option<String>);
      /// Page URL has changed.

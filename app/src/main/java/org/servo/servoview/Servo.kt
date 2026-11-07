@@ -255,6 +255,11 @@ class ServoNavigator {
         }
     }
 
+    /** Argon: invoked synchronously when the user initiates any navigation,
+     * before the engine's load-start callback, so stale error events from the
+     * previous request are dropped at display. Set by MainActivity. */
+    var onNavigationInitiated: (() -> Unit)? = null
+
     var canGoBack by mutableStateOf(false)
         internal set
 
@@ -262,22 +267,27 @@ class ServoNavigator {
         internal set
 
     fun navigate(uri: String) {
+        onNavigationInitiated?.invoke()
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.Navigate(uri)) }
     }
 
     fun back() {
+        onNavigationInitiated?.invoke()
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.Back) }
     }
 
     fun forward() {
+        onNavigationInitiated?.invoke()
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.Forward) }
     }
 
     fun reload() {
+        onNavigationInitiated?.invoke()
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.Reload) }
     }
 
     fun stop() {
+        onNavigationInitiated?.invoke()
         coroutineScope.launch { navigationEvents.emit(NavigationEvent.Stop) }
     }
 }
@@ -556,7 +566,16 @@ internal constructor(
 
         fun onUrlChanged(url: String)
 
-        fun onLoadError(url: String, kind: String, reason: String)
+        fun onLoadError(
+            webviewId: String,
+            pipelineId: String,
+            url: String,
+            kind: String,
+            reason: String,
+            generation: Long,
+        )
+
+        fun onTopLevelLoad(webviewId: String, pipelineId: String, url: String, generation: Long)
     }
 
     private class Callbacks(
@@ -632,9 +651,21 @@ internal constructor(
             scope.launch { client.onUrlChanged(url) }
         }
 
-        override fun onLoadError(url: String, kind: String, reason: String) {
-            Log.i("ArgonNav", "loadError kind=$kind")
-            scope.launch { client.onLoadError(url, kind, reason) }
+        override fun onLoadError(
+            webviewId: String,
+            pipelineId: String,
+            url: String,
+            kind: String,
+            reason: String,
+            generation: Long,
+        ) {
+            Log.i("ArgonNav", "loadError kind=$kind gen=$generation")
+            scope.launch { client.onLoadError(webviewId, pipelineId, url, kind, reason, generation) }
+        }
+
+        override fun onTopLevelLoad(webviewId: String, pipelineId: String, url: String, generation: Long) {
+            Log.i("ArgonNav", "topLevelLoad gen=$generation")
+            scope.launch { client.onTopLevelLoad(webviewId, pipelineId, url, generation) }
         }
 
         override fun onJsResult(requestId: Int, json: String?, error: String?) {

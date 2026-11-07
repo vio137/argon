@@ -67,11 +67,17 @@ site-loading and browsing performance before drawing conclusions.
 - 020 adds a top-level load-error signal: servoparser NetworkError choke point
   -> ScriptToConstellationMessage::LoadError -> ConstellationToEmbedderMsg::LoadError
   -> WebViewDelegate::notify_load_error -> HostTrait::on_load_error -> JNI
-  onLoadError(url, kind, reason). Top-level-only at the source
-  (window.is_top_level); reason bounded to 160 chars and never logged; TLS
-  failures are a distinct kind with no bypass affordance.
-- App side: MainActivity LoadErrorCard overlay; events bound to
-  currentUrl/lastRequestedUrl, dropped when stale.
+  onLoadError(webviewId, pipelineId, url, kind, reason, generation). Top-level
+  only at the source (window.is_top_level); reason is a fixed ASCII category
+  token, never logged raw; TLS failures are a distinct kind with no bypass
+  affordance. A second signal, TopLevelLoadStarted, announces every top-level
+  load start with its request identity (webview, pipeline, generation).
+- App side: MainActivity LoadErrorCard overlay gated by LoadErrorGate: the
+  error card shows only when the event's (webviewId, pipelineId, generation)
+  triple exactly matches the current request identity. URL is display payload
+  only (redirects change it mid-load). App-initiated navigation (omnibox
+  submit, back/forward/reload/stop) invalidates the identity immediately,
+  before the engine's start callback arrives.
 
 ### 020 revision history
 - v1 (2ad46c0): initial signal; raw bounded reason string (RETRACTED:
@@ -85,3 +91,21 @@ site-loading and browsing performance before drawing conclusions.
   when the failed pipeline is the webview's active top-level document or an
   in-flight navigation target (pipeline identity, not URL equality).
   App-side URL matching remains secondary defense.
+- v3 (current): end-to-end request identity. The constellation assigns a
+  per-webview top-level load generation (u64, saturating) at every top-level
+  load start - fresh navigations (load_url), history-traversal reloads
+  (activate_history_entry_in_browsing_context, top-level browsing contexts
+  only), and crash-recovery loads (handle_panic_in_webview) - records it per
+  pipeline, and emits TopLevelLoadStarted(webview, pipeline, url, generation).
+  LoadError events carry the failing load's generation. The app
+  (LoadErrorGate) shows the card only on exact triple match and invalidates
+  immediately on any app-initiated navigation; both engine signals travel the
+  same FIFO constellation->embedder channel and the same main-dispatcher
+  dispatch, so a load's start always precedes its failure. Generation 0 marks
+  untracked loads (iframe traversal pipelines, pre-tracking pipelines) and
+  never matches. Pipeline-close removes the generation entry. Kotlin
+  LoadErrorGate state machine covered by 16 standalone assertions
+  (LoadErrorGateTest: stale-before-new-start, repeated same URL, redirect,
+  superseded pending load, out-of-order delivery, untracked gen, lifecycle
+  reset) - compiled and run with the standalone kotlinc recipe, all pass;
+  the full Gradle unit-test task remains unrun.

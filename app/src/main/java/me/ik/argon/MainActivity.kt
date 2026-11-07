@@ -101,11 +101,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var currentTitle by mutableStateOf("")
     private var alertMessage by mutableStateOf<String?>(null)
 
-    // Top-level load failure reported by the engine (patch 020); bound to
-    // page identity before surfacing. lastRequestedUrl covers the window
-    // before the failed document's own onUrlChanged arrives.
+    // Top-level load failure reported by the engine (patch 020 v3); shown
+    // only when its (webviewId, pipelineId, generation) triple matches the
+    // current request identity held by loadErrorGate. URL is display payload
+    // only, never part of the match (redirects change it mid-load).
     private data class LoadError(val url: String, val kind: String, val reason: String)
     private var loadError by mutableStateOf<LoadError?>(null)
+    private val loadErrorGate = LoadErrorGate()
     private var lastRequestedUrl = ""
     private var screen by mutableStateOf(Screen.Browser)
     private var showMenu by mutableStateOf(false)
@@ -243,6 +245,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // App-initiated navigation invalidates the load-error identity
+        // immediately, before the engine's load-start callback arrives.
+        ServoHolder.navigator.onNavigationInitiated = {
+            loadErrorGate.onNavigationInitiated()
+            loadError = null
+        }
         MediaFocus.start(this)
         prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         adblock = prefs.getBoolean("adblock", true)
@@ -825,12 +833,29 @@ class MainActivity : ComponentActivity(), Servo.Client {
         }
     }
 
-    override fun onLoadError(url: String, kind: String, reason: String) {
-        // Identity binding: only a failure of the page we are showing or
-        // just asked the engine to load may surface; stale or non-top-level
-        // events are dropped (the engine already excludes iframe failures).
-        if (url != currentUrl && url != lastRequestedUrl) return
+    override fun onLoadError(
+        webviewId: String,
+        pipelineId: String,
+        url: String,
+        kind: String,
+        reason: String,
+        generation: Long,
+    ) {
+        // Identity binding: only a failure whose (webview, pipeline,
+        // generation) triple matches the current request may surface; stale,
+        // superseded, untracked, and non-top-level events are dropped here
+        // (the engine already gates them at the constellation).
+        if (!loadErrorGate.shouldShowError(webviewId, pipelineId, generation)) {
+            Log.i("ArgonNav", "loadError dropped: stale identity gen=$generation")
+            return
+        }
         loadError = LoadError(url, kind, reason)
+    }
+
+    override fun onTopLevelLoad(webviewId: String, pipelineId: String, url: String, generation: Long) {
+        // A new top-level request supersedes any error card still showing.
+        loadErrorGate.onTopLevelLoad(webviewId, pipelineId, generation)
+        loadError = null
     }
 
     override fun onDestroy() {
