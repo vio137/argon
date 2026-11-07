@@ -1,0 +1,30 @@
+diff --git a/components/fonts/platform/freetype/android/font_list.rs b/components/fonts/platform/freetype/android/font_list.rs
+index 06b087d12..5b3db80a5 100644
+--- a/components/fonts/platform/freetype/android/font_list.rs
++++ b/components/fonts/platform/freetype/android/font_list.rs
+@@ -15,8 +15,8 @@ use style::values::computed::{
+ 
+ use super::xml::{Attribute, Node};
+ use crate::{
+-    FallbackFontSelectionOptions, FontIdentifier, FontTemplate, FontTemplateDescriptor,
+-    LocalFontIdentifier, LowercaseFontFamilyName,
++    EmojiPresentationPreference, FallbackFontSelectionOptions, FontIdentifier, FontTemplate,
++    FontTemplateDescriptor, LocalFontIdentifier, LowercaseFontFamilyName,
+ };
+ 
+ static FONT_LIST: LazyLock<FontList> = LazyLock::new(FontList::new);
+@@ -560,6 +560,14 @@ where
+ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'static str> {
+     let mut families = vec![];
+ 
++    // Emoji presentation requests resolve to Android's color emoji font, which
++    // the FreeType backend rasterizes via FT_LOAD_COLOR + embedded bitmaps
++    // (mirrors the fontconfig backend's fallback). Scoped gap fix: the Android
++    // list previously had no emoji arm at all.
++    if options.presentation_preference == EmojiPresentationPreference::Emoji {
++        families.push("Noto Color Emoji");
++    }
++
+     if let Some(block) = options.character.block() {
+         match block {
+             UnicodeBlock::Armenian => {
