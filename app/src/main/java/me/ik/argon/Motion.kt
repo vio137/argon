@@ -1,5 +1,8 @@
 package me.ik.argon
 
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -8,7 +11,9 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -27,12 +32,32 @@ object ArgonMotion {
     val Effects = tween<Float>(durationMillis = 160, easing = FastOutSlowInEasing)
 }
 
+private fun motionEnabledNow(resolver: android.content.ContentResolver): Boolean =
+    // Both gates: a zero on EITHER scale means the user asked for no motion
+    // (transition scale covers window/transition motion, animator duration
+    // scale covers value animators like ours).
+    Settings.Global.getFloat(resolver, Settings.Global.TRANSITION_ANIMATION_SCALE, 1f) != 0f &&
+        Settings.Global.getFloat(resolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f
+
+/** Live read of the system motion preference: observes both animation
+ * scales and re-evaluates when either changes, so toggling the setting
+ * while Argon runs takes effect on the next entrance. */
 @Composable
 fun rememberMotionEnabled(): Boolean {
     val resolver = LocalContext.current.contentResolver
-    return remember {
-        Settings.Global.getFloat(resolver, Settings.Global.TRANSITION_ANIMATION_SCALE, 1f) != 0f
+    val enabled = remember { mutableStateOf(motionEnabledNow(resolver)) }
+    DisposableEffect(resolver) {
+        val observer =
+            object : ContentObserver(Handler(Looper.getMainLooper())) {
+                override fun onChange(selfChange: Boolean) {
+                    enabled.value = motionEnabledNow(resolver)
+                }
+            }
+        resolver.registerContentObserver(Settings.Global.getUriFor(Settings.Global.TRANSITION_ANIMATION_SCALE), false, observer)
+        resolver.registerContentObserver(Settings.Global.getUriFor(Settings.Global.ANIMATOR_DURATION_SCALE), false, observer)
+        onDispose { resolver.unregisterContentObserver(observer) }
     }
+    return enabled.value
 }
 
 /**
@@ -50,6 +75,10 @@ fun PageEntrance(content: @Composable () -> Unit) {
         if (motion) {
             launch { alpha.animateTo(1f, ArgonMotion.Effects) }
             launch { rise.animateTo(0f, ArgonMotion.Spatial) }
+        } else {
+            // Motion switched off (possibly mid-entrance): land on end state.
+            alpha.snapTo(1f)
+            rise.snapTo(0f)
         }
     }
     Box(
