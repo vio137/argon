@@ -165,7 +165,7 @@ private fun WelcomePage() {
         )
         FeatureLine("Ad and tracker blocking", "On by default, no account needed.")
         Spacer(Modifier.height(20.dp))
-        FeatureLine("Find in page", "Jump straight to any word on a page, from the menu.")
+        FeatureLine("Your search, your choice", "Pick Google, DuckDuckGo, Brave or Bing, and switch anytime.")
         Spacer(Modifier.height(20.dp))
         FeatureLine("Your data stays here", "History and bookmarks never leave the device.")
     }

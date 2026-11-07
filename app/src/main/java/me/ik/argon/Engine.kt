@@ -35,6 +35,25 @@ fun locationFor(input: String, engine: SearchEngine, httpsOnly: Boolean = false)
     }
 }
 
+/**
+ * Resolver for text arriving from OTHER APPS (ACTION_SEND shares). Stricter
+ * than [locationFor]: only http(s) URLs and bare host names are treated as
+ * destinations, so a crafted share can never make the browser load a data:,
+ * file:, content:, intent:, javascript: or any other non-http(s) location.
+ * Anything else becomes an ordinary search with the chosen engine.
+ */
+fun locationForExternal(input: String, engine: SearchEngine, httpsOnly: Boolean = false): String {
+    val raw = input.trim()
+    val trimmed =
+        if (httpsOnly && raw.matches(Regex("^(?i)http://.+"))) "https://" + raw.substring(7)
+        else raw
+    return when {
+        trimmed.matches(Regex("^(?i)https?://.+")) -> trimmed
+        trimmed.matches(Regex("^[A-Za-z0-9.-]+\\.[A-Za-z]{2,}(/\\S*)?$")) -> "https://$trimmed"
+        else -> engine.urlFor(trimmed)
+    }
+}
+
 // URLs the omnibox may display. The internal start page is an app-private
 // file: document - never show its path; an empty field shows the placeholder.
 fun displayableUrl(url: String): String = if (url.startsWith("file://")) "" else url

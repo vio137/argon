@@ -109,6 +109,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var findIndex by mutableStateOf(0)
     private var adblock by mutableStateOf(true)
     private var showOnboarding by mutableStateOf(false)
+    // External (share/view) navigation queued while onboarding is showing, so
+    // a cold-start share never loads a page behind or instead of onboarding.
+    private var pendingExternalUrl: String? = null
+    // Last handled ACTION_SEND payload, for dropping duplicate deliveries of
+    // the same share (re-created activity, rapid re-send of one intent).
+    private var lastShareText: String? = null
+    private var lastShareAt: Long = 0L
     private var httpsOnly by mutableStateOf(false)
     private var clearOnExit by mutableStateOf(false)
 
@@ -149,6 +156,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var experimental by mutableStateOf(false)
 
     companion object {
+        // Shares from other apps: cap the accepted text and ignore a second
+        // delivery of the identical payload inside this window.
+        private const val MAX_SHARED_TEXT_LEN = 2048
+        private const val SHARE_DEDUPE_WINDOW_MS = 3000L
+
         private const val ENGINE_UA =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Mobile Safari/537.36"
 
@@ -278,10 +290,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 // Shared text goes through locationFor, exactly like typed
                 // omnibox input: URLs open, anything else becomes a search.
                 intent?.action == Intent.ACTION_SEND ->
-                    intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
-                        ?.let { locationFor(it, searchEngine, httpsOnly) }
+                    handleSharedText(intent.getStringExtra(Intent.EXTRA_TEXT))
                 else -> null
             }
+        if (showOnboarding && intentUrl != null) {
+            pendingExternalUrl = intentUrl
+        }
 
         setContent {
             ArgonTheme {
@@ -294,7 +308,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         // model + major version), so sites serve their standard
                         // mobile experience. Verified website-visible in tests.
                         args = engineArgs,
-                        initialUrl = intentUrl ?: startPageUrl,
+                        initialUrl = if (showOnboarding) startPageUrl else intentUrl ?: startPageUrl,
                         logStr = null,
                         client = this@MainActivity,
                         navigator = navigator,
@@ -419,6 +433,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onDone = {
                                 prefs.edit().putBoolean("onboarded", true).apply()
                                 showOnboarding = false
+                                pendingExternalUrl?.let { navigator.navigate(it) }
+                                pendingExternalUrl = null
                             },
                         )
                     }
@@ -554,9 +570,26 @@ class MainActivity : ComponentActivity(), Servo.Client {
         super.onNewIntent(intent)
         when (intent.action) {
             Intent.ACTION_VIEW -> intent.data?.toString()?.let { navigate(it) }
-            Intent.ACTION_SEND ->
-                intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }?.let { navigate(it) }
+            Intent.ACTION_SEND -> handleSharedText(intent.getStringExtra(Intent.EXTRA_TEXT))?.let { navigateDest(it) }
         }
+    }
+
+    // Shared text from other apps: trimmed, length-bounded, duplicate
+    // deliveries dropped, then resolved with the strict external resolver so
+    // only http(s) locations can come out of a share. Returns the destination
+    // URL, or null when the share is empty, malformed or a duplicate.
+    private fun handleSharedText(raw: String?): String? {
+        val text = raw?.trim()?.take(MAX_SHARED_TEXT_LEN)?.takeIf { it.isNotEmpty() } ?: return null
+        val now = System.currentTimeMillis()
+        if (text == lastShareText && now - lastShareAt < SHARE_DEDUPE_WINDOW_MS) return null
+        lastShareText = text
+        lastShareAt = now
+        return locationForExternal(text, searchEngine, httpsOnly)
+    }
+
+    private fun navigateDest(dest: String) {
+        Log.i("ArgonNav", "share dest='$dest'")
+        navigator.navigate(dest)
     }
 
     private fun navigate(target: String) {
