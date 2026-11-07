@@ -277,8 +277,7 @@ object ServoHolder {
     @Volatile var lastWebviewId: String = ""
 }
 
-@Stable
-    /** Argon (engine patch 054): tracks one long-press gesture. [onEvent] arms a
+/** Argon (engine patch 054): tracks one long-press gesture. [onEvent] arms a
  * handler timer on DOWN and cancels it on slop-exceeding move, UP, CANCEL or
  * an extra pointer; on timeout it invokes the callback with the down
  * coordinates. [consumeFired] reports (once) that the current gesture already
@@ -353,6 +352,7 @@ private class LongPressState {
     }
 }
 
+@Stable
 class ServoNavigator {
     private sealed interface NavigationEvent : Interaction {
         data class Navigate(val uri: String) : NavigationEvent
