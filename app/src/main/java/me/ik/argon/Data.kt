@@ -46,6 +46,13 @@ class HistoryStore(context: Context) {
         save()
     }
 
+    /** Removes every entry visited at or after [sinceMs]; older entries stay. */
+    @Synchronized
+    fun clearSince(sinceMs: Long) {
+        entries = entries.filter { it.time < sinceMs }
+        save()
+    }
+
     private fun save() {
         runCatching { file.writeText(storeJson.encodeToString(entries)) }
     }

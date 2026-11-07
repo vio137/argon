@@ -673,7 +673,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
             },
             onExportBookmarks = { exportBookmarksLauncher.launch("argon-bookmarks.html") },
             onImportBookmarks = { importBookmarksLauncher.launch(arrayOf("text/html", "text/*", "application/octet-stream")) },
-            onClearHistory = { history.clear() },
+            onClearHistory = { since ->
+                if (since == null) history.clear() else history.clearSince(since)
+                refreshStartPage()
+            },
             onBack = { screen = Screen.Browser },
         )
         BackHandler { screen = Screen.Browser }

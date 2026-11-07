@@ -28,6 +28,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import java.util.Calendar
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -157,24 +158,57 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
         }
     }
     if (confirmClear) {
-        AlertDialog(
-            onDismissRequest = { confirmClear = false },
-            title = { Text("Clear history?") },
-            text = { Text("This deletes every entry in your browsing history.") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        history.clear()
-                        confirmClear = false
-                        onCleared()
-                    }
-                ) {
-                    Text("Clear", color = ArgonColors.Danger)
-                }
+        ClearHistoryDialog(
+            onDismiss = { confirmClear = false },
+            onClear = { since ->
+                if (since == null) history.clear() else history.clearSince(since)
+                confirmClear = false
+                onCleared()
             },
-            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
         )
     }
+}
+
+/** Start of today in the device's local zone, for "clear today" ranges. */
+private fun startOfTodayMs(): Long {
+    val cal = Calendar.getInstance()
+    cal.set(Calendar.HOUR_OF_DAY, 0)
+    cal.set(Calendar.MINUTE, 0)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    return cal.timeInMillis
+}
+
+/**
+ * Range picker for clearing history. [onClear] receives the cutoff: entries
+ * at or after it are deleted, or null for "delete everything".
+ */
+@Composable
+private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Clear history") },
+        text = {
+            Column {
+                listOf(
+                    Triple("Last hour", System.currentTimeMillis() - 3_600_000L, false),
+                    Triple("Today", startOfTodayMs(), false),
+                    Triple("Everything", null, true),
+                ).forEach { (label, cutoff, danger) ->
+                    Text(
+                        label,
+                        color = if (danger) ArgonColors.Danger else ArgonColors.Text,
+                        style = ArgonType.Body,
+                        modifier =
+                            Modifier.fillMaxWidth()
+                                .clickable { onClear(cutoff) }
+                                .padding(vertical = 12.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
@@ -233,7 +267,7 @@ fun SettingsScreen(
     onClearOnExit: (Boolean) -> Unit,
     onExportBookmarks: () -> Unit,
     onImportBookmarks: () -> Unit,
-    onClearHistory: () -> Unit,
+    onClearHistory: (Long?) -> Unit,
     onBack: () -> Unit,
 ) {
     var engineDialog by remember { mutableStateOf(false) }
@@ -325,21 +359,12 @@ fun SettingsScreen(
         )
     }
     if (confirmClear) {
-        AlertDialog(
-            onDismissRequest = { confirmClear = false },
-            title = { Text("Clear history?") },
-            text = { Text("This deletes every entry in your browsing history.") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        onClearHistory()
-                        confirmClear = false
-                    }
-                ) {
-                    Text("Clear", color = ArgonColors.Danger)
-                }
+        ClearHistoryDialog(
+            onDismiss = { confirmClear = false },
+            onClear = { since ->
+                onClearHistory(since)
+                confirmClear = false
             },
-            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
         )
     }
 }
