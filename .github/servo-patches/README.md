@@ -58,3 +58,17 @@ Diagnostic variant: disables HTTP/2 entirely (ALPN offers HTTP/1.1 only).
 Built once to test whether the h1 path makes Google properties load at all.
 Trade-off: all HTTPS sites lose h2 multiplexing. Never ship as latest; compare
 site-loading and browsing performance before drawing conclusions.
+
+## Load-error host signal build (exp-load-error)
+- servo_ref: b6c9df76bf2d79d479e4b0162f7ecb383d32d2fd (unchanged from v15)
+- patch set applied by the engine workflow in glob order: 006_media_backend,
+  020_load_error_host_signal, font_list, js_eval_bridge, net_connector_h1_client,
+  net_h2_h1_fallback, net_resource_thread_h1_state
+- 020 adds a top-level load-error signal: servoparser NetworkError choke point
+  -> ScriptToConstellationMessage::LoadError -> ConstellationToEmbedderMsg::LoadError
+  -> WebViewDelegate::notify_load_error -> HostTrait::on_load_error -> JNI
+  onLoadError(url, kind, reason). Top-level-only at the source
+  (window.is_top_level); reason bounded to 160 chars and never logged; TLS
+  failures are a distinct kind with no bypass affordance.
+- App side: MainActivity LoadErrorCard overlay; events bound to
+  currentUrl/lastRequestedUrl, dropped when stale.

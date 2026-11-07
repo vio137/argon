@@ -81,6 +81,11 @@ internal class JNIServo {
 
         fun onUrlChanged(url: String)
 
+        /** Argon (engine patch 020): a top-level page load failed. kind is
+         * "network" | "tls" | "crash"; reason is bounded (160 chars) and
+         * engine-generated. Iframe and subresource failures never fire this. */
+        fun onLoadError(url: String, kind: String, reason: String)
+
         fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean)
 
         fun onImeShow()

@@ -44,8 +44,8 @@ android {
             // point (org.servo.servoview, MediaFocus) and the serialization
             // models. Any new external/JNI class needs a rule before this
             // ships; verified by the androidTest matrix, not by compiling.
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

@@ -100,6 +100,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var currentUrl by mutableStateOf("")
     private var currentTitle by mutableStateOf("")
     private var alertMessage by mutableStateOf<String?>(null)
+
+    // Top-level load failure reported by the engine (patch 020); bound to
+    // page identity before surfacing. lastRequestedUrl covers the window
+    // before the failed document's own onUrlChanged arrives.
+    private data class LoadError(val url: String, val kind: String, val reason: String)
+    private var loadError by mutableStateOf<LoadError?>(null)
+    private var lastRequestedUrl = ""
     private var screen by mutableStateOf(Screen.Browser)
     private var showMenu by mutableStateOf(false)
     private var showAbout by mutableStateOf(false)
@@ -332,6 +339,25 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 .focusRequester(servoFocusRequester),
                     )
                     LaunchedEffect(Unit) { servoFocusRequester.requestFocus() }
+                    loadError?.let { err ->
+                        me.ik.argon.ui.LoadErrorCard(
+                            kind = err.kind,
+                            reason = err.reason,
+                            onGoBack = {
+                                loadError = null
+                                navigator.back()
+                            },
+                            onReload =
+                                if (err.kind == "tls") null
+                                else {
+                                    {
+                                        loadError = null
+                                        navigator.reload()
+                                    }
+                                },
+                            onDismiss = { loadError = null },
+                        )
+                    }
                     me.ik.argon.ui.ArgonCommandBar(
                         urlState = urlState,
                         omniboxText = urlState.text.toString(),
@@ -456,7 +482,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onDone = {
                                 prefs.edit().putBoolean("onboarded", true).apply()
                                 showOnboarding = false
-                                pendingExternalUrl?.let { navigator.navigate(it) }
+                                pendingExternalUrl?.let {
+                                    lastRequestedUrl = it
+                                    loadError = null
+                                    navigator.navigate(it)
+                                }
                                 pendingExternalUrl = null
                             },
                         )
@@ -665,12 +695,16 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     private fun navigateDest(dest: String) {
         Log.i("ArgonNav", "share dest='$dest'")
+        lastRequestedUrl = dest
+        loadError = null
         navigator.navigate(dest)
     }
 
     private fun navigate(target: String) {
         val dest = locationFor(target, searchEngine, httpsOnly)
         Log.i("ArgonNav", "submit target='$target' dest='$dest'")
+        lastRequestedUrl = dest
+        loadError = null
         navigator.navigate(dest)
     }
 
@@ -784,10 +818,19 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     override fun onUrlChanged(url: String) {
         currentUrl = url
+        if (loadError != null && loadError?.url != url) loadError = null
         exitArmedAt = 0L
         if (!omniboxFocused) {
             urlState.edit { replace(0, length, hostOf(displayableUrl(url))) }
         }
+    }
+
+    override fun onLoadError(url: String, kind: String, reason: String) {
+        // Identity binding: only a failure of the page we are showing or
+        // just asked the engine to load may surface; stale or non-top-level
+        // events are dropped (the engine already excludes iframe failures).
+        if (url != currentUrl && url != lastRequestedUrl) return
+        loadError = LoadError(url, kind, reason)
     }
 
     override fun onDestroy() {

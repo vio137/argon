@@ -555,6 +555,8 @@ internal constructor(
         fun onTitleChanged(title: String)
 
         fun onUrlChanged(url: String)
+
+        fun onLoadError(url: String, kind: String, reason: String)
     }
 
     private class Callbacks(
@@ -628,6 +630,11 @@ internal constructor(
             Log.i("ArgonNav", "urlChanged $url")
             ServoHolder.lastUrl = url
             scope.launch { client.onUrlChanged(url) }
+        }
+
+        override fun onLoadError(url: String, kind: String, reason: String) {
+            Log.i("ArgonNav", "loadError kind=$kind")
+            scope.launch { client.onLoadError(url, kind, reason) }
         }
 
         override fun onJsResult(requestId: Int, json: String?, error: String?) {
