@@ -1,0 +1,1042 @@
+From 56adb2720e902b771330546270d267f55b0a9861 Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sat, 7 Nov 2026 23:19:06 +0530
+Subject: [PATCH] 063 media: add dormant bounded fMP4 demux, frame store and
+ AVC input foundation
+
+---
+ components/media/backends/android/Cargo.toml  |   1 +
+ .../backends/android/hosttest/Cargo.lock      |   7 +
+ .../backends/android/hosttest/Cargo.toml      |   1 +
+ .../backends/android/hosttest/src/lib.rs      |   3 +
+ .../tests/fixtures/synthetic-fmp4.mp4         | Bin 0 -> 1727 bytes
+ .../android/hosttest/tests/mse_fixture.rs     | 142 +++++++
+ components/media/backends/android/lib.rs      |   3 +
+ .../backends/android/mse_demux/README.md      |  11 +
+ .../media/backends/android/mse_demux/avc.rs   | 127 ++++++
+ .../media/backends/android/mse_demux/mod.rs   | 379 ++++++++++++++++++
+ .../backends/android/mse_demux/timeline.rs    | 235 +++++++++++
+ 11 files changed, 909 insertions(+)
+ create mode 100644 components/media/backends/android/hosttest/tests/fixtures/synthetic-fmp4.mp4
+ create mode 100644 components/media/backends/android/hosttest/tests/mse_fixture.rs
+ create mode 100644 components/media/backends/android/mse_demux/README.md
+ create mode 100644 components/media/backends/android/mse_demux/avc.rs
+ create mode 100644 components/media/backends/android/mse_demux/mod.rs
+ create mode 100644 components/media/backends/android/mse_demux/timeline.rs
+
+diff --git a/components/media/backends/android/Cargo.toml b/components/media/backends/android/Cargo.toml
+index 44b9984d9..bea2644c1 100644
+--- a/components/media/backends/android/Cargo.toml
++++ b/components/media/backends/android/Cargo.toml
+@@ -18,6 +18,7 @@ name = "servo_media_android"
+ path = "lib.rs"
+ 
+ [dependencies]
++shiguredo_mp4 = "=2026.5.0"
+ crossbeam-channel = { workspace = true }
+ log = { workspace = true }
+ mime = { workspace = true }
+diff --git a/components/media/backends/android/hosttest/Cargo.lock b/components/media/backends/android/hosttest/Cargo.lock
+index 93424ad64..bf7223a2a 100644
+--- a/components/media/backends/android/hosttest/Cargo.lock
++++ b/components/media/backends/android/hosttest/Cargo.lock
+@@ -20,4 +20,11 @@ version = "0.0.0"
+ dependencies = [
+  "log",
+  "mime",
++ "shiguredo_mp4",
+ ]
++
++[[package]]
++name = "shiguredo_mp4"
++version = "2026.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "82e773aead88d11a806c8b78dbc2577afb3a20fcc80108aafb3724f6dbb9fbe0"
+diff --git a/components/media/backends/android/hosttest/Cargo.toml b/components/media/backends/android/hosttest/Cargo.toml
+index baa83e904..8c1cd66c6 100644
+--- a/components/media/backends/android/hosttest/Cargo.toml
++++ b/components/media/backends/android/hosttest/Cargo.toml
+@@ -10,5 +10,6 @@ publish = false
+ [workspace]
+ 
+ [dependencies]
++shiguredo_mp4 = "=2026.5.0"
+ log = "0.4"
+ mime = "0.3"
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+index 5e5a02c2f..13115b9fc 100644
+--- a/components/media/backends/android/hosttest/src/lib.rs
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -24,3 +24,6 @@ pub mod audio_state;
+ 
+ #[path = "../../audio_queue.rs"]
+ pub mod audio_queue;
++
++#[path = "../../mse_demux/mod.rs"]
++pub mod mse_demux;
+diff --git a/components/media/backends/android/hosttest/tests/fixtures/synthetic-fmp4.mp4 b/components/media/backends/android/hosttest/tests/fixtures/synthetic-fmp4.mp4
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccceda6b85f0b7e9b64c32b120f56210d973bf71
+GIT binary patch
+literal 1727
+zcmaJ>&u<$=6dpSbLKPB0N~;Q`((p^-5N~!J$G8!T0-?eODixvTfDo(k?re7Do!#}!
+z*s*&;z@g&Ep+^qf_zO58MTi4%;0l#0ArAby6mjEbzPB4UCWJnF=DqK|Z{CdGyfI^J
+zBet_LHN_5NO-34{tICcC{EI4z31ci%lO%#(l9k^p&|nPTQ~4Kw`wZSYWu9j>vEVnW
+z#Sp=F?XcQ&Wr=tu+an@pn0rL!CxbOUR8cAjsp#zQ+Jl?1TVGeIl|-4YEKHL$k_(&k
+z0dUb5d6Y@wG#r)YF^u(zs*)}r;rXbJZA4lUhlJu!jCICO><7jUGT5IPYZk>O&L?6L
+z;xZ~(&RKgn<E#&p2FZUJwf}U!GM@u%BI|zRwd0HPpV_5D==*n%UuSHEU7%_0<^HD)
+zb|Lxx$#1}2D}^bcDL0KZW37Q+2(Sqk0D2wx_7Wx&oUmB(y{IN~3e2spG=&!VmuPG-
+zj;w&=9VIJGv1gXA1y`v>SyJU5N-NEb1$yCgThOLgBT+4;4cMDv67Te!m%5JUy1)sV
+zobF^z#Sfc-h&R!Q<lnI5Z?Yb2_&HQFZ&az+x{V`Sn{d~1#p-bma}|R^CAu2YoG6?E
+z`mM)S=kpu)umADoulM?2+}-?<-+S)CpVM}?!&^KowB%lQo9k`2>++pw&=sPKK;Hpj
+z>&DINZ?ro6)q{O7BN-yFUzD><#+J8Tce~Yg+a8>WwdL;C*3r?CLv34RB6kXXxJA1-
+ziB%amMQPI_H@iF(0}=WzM{D{XkK`aL!lCc(;=@HQvYC;DxRO4e4L9QfESHyN20G?I
+zN51E{pkU%EoysVnT(lz4B0rSA*X3cN3nc<9_2|yCEHz;CroAY%Fv5|-97z$~E^_I&
+zy-m;Ku`o6$%`h#o=p@0Y42n25k`~!SV}U_1D~h2=0D@DW$<h!<SvXvt>uQTIRl?FS
+z(%ed&36S6)WMeI6L0G6#R0l$B&;e<V6d-CroLCDb>D)&$Jxpu~Yba+3BU^0*_!j^$
+zq0D7CrbN|ZDu|XQ0oI`(>X@qmsz7xF@Y~yt%SW`g?>e~mQAuekEvA0=8XU&T((mxJ
+zL`iXRsCWn0GxA;bKDz6Yyz|lSQy;UYH#%nf-}TtztKa_c9s=ieH#OuVx|=<Hes^;$
+zWB=3L?Af}z*=2d>gT_TV$=`n+v$wy(Np96AIZ&t`GQ47;Pu|Sp>C{hz@>jCbfYc_h
+Q6<htOcHx!k#sA2`KPG)y=l}o!
+
+literal 0
+HcmV?d00001
+
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+new file mode 100644
+index 000000000..b099b8949
+--- /dev/null
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -0,0 +1,142 @@
++use servo_media_android_hosttest::mse_demux::{BoxFramer, Demux};
++fn boxes() -> Vec<Vec<u8>> {
++    let bytes = include_bytes!("fixtures/synthetic-fmp4.mp4");
++    let mut f = BoxFramer::new(1 << 20);
++    let mut out = vec![];
++    for chunk in bytes.chunks(7) {
++        f.append(chunk).unwrap();
++        while let Some(b) = f.pop_box().unwrap() {
++            out.push(b);
++        }
++    }
++    f.finish().unwrap();
++    out
++}
++#[test]
++fn extract_real_muxed_avc_fragments_in_seven_byte_appends() {
++    let mut init = vec![];
++    let mut demux = Demux::new(1 << 20, 64);
++    let mut pending = vec![];
++    let mut units = vec![];
++    let mut initialized = false;
++    for b in boxes() {
++        match &b[4..8] {
++            b"ftyp" | b"moov" => {
++                init.extend(b);
++            }
++            b"moof" => {
++                if !initialized {
++                    demux.init(&init).unwrap();
++                    initialized = true;
++                }
++                pending = b;
++            }
++            b"mdat" => {
++                pending.extend(b);
++                units.extend(demux.media(&pending).unwrap());
++                pending.clear();
++            }
++            _ => {}
++        }
++    }
++    assert_eq!(units.len(), 2);
++    assert_eq!(units[0].dts_us, 0);
++    assert_eq!(units[1].dts_us, 500_000);
++    assert_eq!(units[0].duration_us, 500_000);
++    assert!(units.iter().all(|s| s.keyframe && !s.data.is_empty()));
++    assert!(units[0].codec_config.is_some());
++}
++#[test]
++fn quota_and_missing_init_fail_without_output() {
++    let mut d = Demux::new(8, 1);
++    assert!(d.init(&[0; 9]).is_err());
++    let mut d = Demux::new(1 << 20, 64);
++    for pair in boxes().windows(2) {
++        if &pair[0][4..8] == b"moof" && &pair[1][4..8] == b"mdat" {
++            let mut media = pair[0].clone();
++            media.extend_from_slice(&pair[1]);
++            assert!(d.media(&media).is_err());
++            break;
++        }
++    }
++}
++#[test]
++fn hostile_trun_count_is_rejected_before_demux_allocation() {
++    let bs = boxes();
++    let mut init = vec![];
++    for b in &bs {
++        if [&b"ftyp"[..], &b"moov"[..]].contains(&&b[4..8]) {
++            init.extend(b);
++        }
++    }
++    let mut d = Demux::new(1 << 20, 64);
++    d.init(&init).unwrap();
++    for pair in bs.windows(2) {
++        if &pair[0][4..8] == b"moof" && &pair[1][4..8] == b"mdat" {
++            let mut media = pair[0].clone();
++            media.extend_from_slice(&pair[1]);
++            let p = media.windows(4).position(|x| x == b"trun").unwrap();
++            media[p + 8..p + 12].copy_from_slice(&u32::MAX.to_be_bytes());
++            assert!(matches!(
++                d.media(&media),
++                Err(servo_media_android_hosttest::mse_demux::Error::Quota)
++            ));
++            break;
++        }
++    }
++}
++#[test]
++fn sample_in_second_mdat_with_ignored_boxes_preserves_offsets() {
++    let bs = boxes();
++    let mut init = vec![];
++    for b in &bs {
++        if [&b"ftyp"[..], &b"moov"[..]].contains(&&b[4..8]) {
++            init.extend(b);
++        }
++    }
++    let pair = bs
++        .windows(2)
++        .find(|p| &p[0][4..8] == b"moof" && &p[1][4..8] == b"mdat")
++        .unwrap();
++    let mut original = pair[0].clone();
++    original.extend_from_slice(&pair[1]);
++    let mut d = Demux::new(1 << 20, 64);
++    d.init(&init).unwrap();
++    let expected = d.media(&original).unwrap();
++    let mut media = pair[0].clone();
++    let p = media.windows(4).position(|x| x == b"trun").unwrap();
++    let offset = i32::from_be_bytes(media[p + 12..p + 16].try_into().unwrap());
++    media[p + 12..p + 16].copy_from_slice(&(offset + 16).to_be_bytes());
++    // free box between moof and mdat, followed by empty mdat, then real payload.
++    media.extend_from_slice(&[0, 0, 0, 8, b'f', b'r', b'e', b'e']);
++    media.extend_from_slice(&[0, 0, 0, 8, b'm', b'd', b'a', b't']);
++    media.extend_from_slice(&pair[1]);
++    media.extend_from_slice(&[0, 0, 0, 8, b'f', b'r', b'e', b'e']);
++    let mut d = Demux::new(1 << 20, 64);
++    d.init(&init).unwrap();
++    let got = d.media(&media).unwrap();
++    assert_eq!(got.len(), expected.len());
++    assert_eq!(got[0].data, expected[0].data);
++    assert_eq!(got[0].pts_us, expected[0].pts_us);
++}
++#[test]
++fn sample_pointer_into_box_header_is_rejected() {
++    let bs = boxes();
++    let mut init = vec![];
++    for b in &bs {
++        if [&b"ftyp"[..], &b"moov"[..]].contains(&&b[4..8]) {
++            init.extend(b);
++        }
++    }
++    let pair = bs
++        .windows(2)
++        .find(|p| &p[0][4..8] == b"moof" && &p[1][4..8] == b"mdat")
++        .unwrap();
++    let mut media = pair[0].clone();
++    media.extend_from_slice(&pair[1]);
++    let p = media.windows(4).position(|x| x == b"trun").unwrap();
++    media[p + 12..p + 16].copy_from_slice(&(pair[0].len() as i32).to_be_bytes());
++    let mut d = Demux::new(1 << 20, 64);
++    d.init(&init).unwrap();
++    assert!(d.media(&media).is_err());
++}
+diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
+index edc8e454d..c466e34fd 100644
+--- a/components/media/backends/android/lib.rs
++++ b/components/media/backends/android/lib.rs
+@@ -31,3 +31,6 @@ mod android_impl;
+ 
+ #[cfg(target_os = "android")]
+ pub use android_impl::AndroidBackend;
++
++// Dormant MSE demux/storage foundation. No DOM exposure or decoder wiring yet.
++pub mod mse_demux;
+diff --git a/components/media/backends/android/mse_demux/README.md b/components/media/backends/android/mse_demux/README.md
+new file mode 100644
+index 000000000..8c1751a44
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/README.md
+@@ -0,0 +1,11 @@
++# Dormant adaptive-media foundation
++
++Not connected to SourceBuffer, HTMLMediaElement or NDK decoders yet. Does not enable MSE support or change capability reporting. Existing DOM drafts040/041 must stay excluded from candidates.
++
++Dependency pinned to shiguredo_mp4=2026.5.0, Apache-2.0. Actual Servo toolchain1.99.1 meets its Rust1.93 requirement; this raises the experimental backend dependency's effective MSRV, not Servo's whole-workspace manifest promise. Registry checksum82e773aead88d11a806c8b78dbc2577afb3a20fcc80108aafb3724f6dbb9fbe0, source commit30e9b347f8863cd7d377e728ca7a81ac5a1b7770.
++
++Implemented incremental bounded box framing, transactional fMP4 sample extraction, signed timestamp conversion, sample bounds against original mdat payloads, raw trun count preflight before allocation. Multiple mdat/ignored boxes handled with byte-position-preserving parser envelope; returned samples must lie wholly in one ORIGINAL mdat payload. Coded-frame storage has byte quota, offset/window handling, random-access gating, overlap/dependent-frame removal and per-track ranges. AVC SPS/PPS CSD and length-prefix to AnnexB conversion prepared for Android decoder input.
++
++Not complete MSE: missing DOM event/state/object identity integration, native decoder bridge, source-buffer attachment/delivery, full coded-frame processing semantics (sequence mode, discontinuity detection, multiplexed-track range intersection, eviction), edit-list support, brand compatibility, WebM, and full parser security/resource review. Unsupported edits/DRM are rejected. Do not advertise codecs based solely on this parser.
++
++Host evidence: existing57 tests plus18 new checks (13 unit +5 fixture integration) pass. Fixture is a locally generated32x32 blue AVC fMP4 with2 frames, no user media. It demonstrates parsing, not codec playback. Generated using ffmpeg lavfi color blue/2fps/1s, libx264 ultrafast/g1, empty_moov+frag_keyframe+default_base_moof. Primary requirements: https://www.w3.org/TR/mse-byte-stream-format-isobmff/ and https://developer.android.com/reference/android/media/MediaCodec (CSD section).
+diff --git a/components/media/backends/android/mse_demux/avc.rs b/components/media/backends/android/mse_demux/avc.rs
+new file mode 100644
+index 000000000..3be053c43
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/avc.rs
+@@ -0,0 +1,127 @@
++//! AVC CSD and length-prefixed access-unit conversion for Android codec input.
++//! Format construction/codec invocation are separate, not implemented here.
++use shiguredo_mp4::boxes::SampleEntry;
++#[derive(Debug, PartialEq, Eq)]
++pub enum AvcError {
++    Unsupported,
++    Invalid,
++    Quota,
++}
++pub struct AvcConfig {
++    pub width: u16,
++    pub height: u16,
++    pub length_bytes: usize,
++    pub csd0: Vec<u8>,
++    pub csd1: Vec<u8>,
++}
++fn parameters(list: &[Vec<u8>], nal_type: u8, limit: usize) -> Result<Vec<u8>, AvcError> {
++    if list.is_empty() {
++        return Err(AvcError::Invalid);
++    }
++    let mut out = vec![];
++    for nal in list {
++        if nal.is_empty() || nal[0] & 31 != nal_type {
++            return Err(AvcError::Invalid);
++        }
++        if out
++            .len()
++            .checked_add(nal.len() + 4)
++            .ok_or(AvcError::Quota)?
++            > limit
++        {
++            return Err(AvcError::Quota);
++        }
++        out.extend_from_slice(&[0, 0, 0, 1]);
++        out.extend(nal);
++    }
++    Ok(out)
++}
++impl AvcConfig {
++    pub fn from_entry(entry: &SampleEntry, limit: usize) -> Result<Self, AvcError> {
++        let SampleEntry::Avc1(avc) = entry else {
++            return Err(AvcError::Unsupported);
++        };
++        let length_bytes = usize::from(avc.avcc_box.length_size_minus_one.get()) + 1;
++        if avc.visual.width == 0 || avc.visual.height == 0 || length_bytes == 3 {
++            return Err(AvcError::Invalid);
++        }
++        Ok(Self {
++            width: avc.visual.width,
++            height: avc.visual.height,
++            length_bytes,
++            csd0: parameters(&avc.avcc_box.sps_list, 7, limit)?,
++            csd1: parameters(&avc.avcc_box.pps_list, 8, limit)?,
++        })
++    }
++    pub fn annex_b(&self, sample: &[u8], limit: usize) -> Result<Vec<u8>, AvcError> {
++        convert(sample, self.length_bytes, limit)
++    }
++}
++fn convert(sample: &[u8], length_bytes: usize, limit: usize) -> Result<Vec<u8>, AvcError> {
++    if ![1, 2, 4].contains(&length_bytes) {
++        return Err(AvcError::Invalid);
++    }
++    let mut pos = 0usize;
++    let mut out = vec![];
++    while pos < sample.len() {
++        let h = sample
++            .get(pos..pos.checked_add(length_bytes).ok_or(AvcError::Invalid)?)
++            .ok_or(AvcError::Invalid)?;
++        let mut n = 0usize;
++        for &b in h {
++            n = (n << 8) | usize::from(b);
++        }
++        pos += length_bytes;
++        if n == 0 {
++            return Err(AvcError::Invalid);
++        }
++        let end = pos.checked_add(n).ok_or(AvcError::Invalid)?;
++        let nal = sample.get(pos..end).ok_or(AvcError::Invalid)?;
++        if out.len().checked_add(n + 4).ok_or(AvcError::Quota)? > limit {
++            return Err(AvcError::Quota);
++        }
++        out.extend_from_slice(&[0, 0, 0, 1]);
++        out.extend(nal);
++        pos = end;
++    }
++    if out.is_empty() {
++        return Err(AvcError::Invalid);
++    }
++    Ok(out)
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn multiple_nals_and_length_fields() {
++        for width in [1, 2, 4] {
++            let mut bytes = vec![0; width];
++            bytes[width - 1] = 2;
++            bytes.extend([0x65, 0xaa]);
++            bytes.extend(vec![0; width]);
++            let p = bytes.len() - 1;
++            bytes[p] = 1;
++            bytes.push(0x61);
++            assert_eq!(
++                convert(&bytes, width, 64),
++                Ok(vec![0, 0, 0, 1, 0x65, 0xaa, 0, 0, 0, 1, 0x61])
++            );
++        }
++    }
++    #[test]
++    fn malformed_nal_lengths_and_quota() {
++        assert_eq!(convert(&[0, 0, 0, 9, 1], 4, 64), Err(AvcError::Invalid));
++        assert_eq!(convert(&[0], 4, 64), Err(AvcError::Invalid));
++        assert_eq!(convert(&[0, 0, 0, 0], 4, 64), Err(AvcError::Invalid));
++        assert_eq!(convert(&[1, 0x65], 1, 4), Err(AvcError::Quota));
++    }
++    #[test]
++    fn csd_validates_parameter_type() {
++        assert_eq!(
++            parameters(&[vec![0x67, 1]], 7, 16),
++            Ok(vec![0, 0, 0, 1, 0x67, 1])
++        );
++        assert_eq!(parameters(&[vec![0x68]], 7, 16), Err(AvcError::Invalid));
++        assert_eq!(parameters(&[], 7, 16), Err(AvcError::Invalid));
++    }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+new file mode 100644
+index 000000000..de5688537
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -0,0 +1,379 @@
++//! Private, unintegrated fMP4 adapter prototype. Not advertised as MSE support.
++use shiguredo_mp4::{boxes::SampleEntry, demux::Fmp4SegmentDemuxer};
++use std::ops::Range;
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum Error {
++    Quota,
++    InvalidBox,
++    Truncated,
++    UnsupportedLayout,
++    Demux,
++    InvalidSample,
++    Timestamp,
++}
++pub struct BoxFramer {
++    pending: Vec<u8>,
++    limit: usize,
++}
++impl BoxFramer {
++    pub fn new(limit: usize) -> Self {
++        Self {
++            pending: vec![],
++            limit,
++        }
++    }
++    pub fn append(&mut self, data: &[u8]) -> Result<(), Error> {
++        if self
++            .pending
++            .len()
++            .checked_add(data.len())
++            .ok_or(Error::Quota)?
++            > self.limit
++        {
++            return Err(Error::Quota);
++        }
++        self.pending.extend_from_slice(data);
++        Ok(())
++    }
++    pub fn pop_box(&mut self) -> Result<Option<Vec<u8>>, Error> {
++        let Some(size) = box_len(&self.pending)? else {
++            return Ok(None);
++        };
++        if size > self.limit {
++            return Err(Error::Quota);
++        }
++        if size > self.pending.len() {
++            return Ok(None);
++        }
++        Ok(Some(self.pending.drain(..size).collect()))
++    }
++    pub fn finish(&self) -> Result<(), Error> {
++        if self.pending.is_empty() {
++            Ok(())
++        } else {
++            Err(Error::Truncated)
++        }
++    }
++    pub fn reset(&mut self) {
++        self.pending.clear();
++    }
++}
++fn box_len(data: &[u8]) -> Result<Option<usize>, Error> {
++    if data.len() < 8 {
++        return Ok(None);
++    }
++    let small = u32::from_be_bytes(data[..4].try_into().unwrap());
++    let size = match small {
++        0 => return Err(Error::UnsupportedLayout), // EOF-sized box needs a different live-stream contract.
++        1 => {
++            if data.len() < 16 {
++                return Ok(None);
++            }
++            u64::from_be_bytes(data[8..16].try_into().unwrap())
++        },
++        n => n as u64,
++    };
++    let min = if small == 1 { 16 } else { 8 };
++    if size < min {
++        return Err(Error::InvalidBox);
++    }
++    Ok(Some(usize::try_from(size).map_err(|_| Error::Quota)?))
++}
++fn top_boxes(data: &[u8]) -> Result<Vec<([u8; 4], Range<usize>, Range<usize>)>, Error> {
++    let mut out = vec![];
++    let mut pos = 0usize;
++    while pos < data.len() {
++        let len = box_len(&data[pos..])?.ok_or(Error::Truncated)?;
++        let end = pos.checked_add(len).ok_or(Error::Quota)?;
++        if end > data.len() {
++            return Err(Error::Truncated);
++        }
++        let header = if data[pos..pos + 4] == [0, 0, 0, 1] {
++            16
++        } else {
++            8
++        };
++        out.push((
++            data[pos + 4..pos + 8].try_into().unwrap(),
++            pos..end,
++            pos + header..end,
++        ));
++        pos = end;
++    }
++    Ok(out)
++}
++fn validate_init(data: &[u8]) -> Result<(), Error> {
++    if data.len() > 2 * 1024 * 1024 {
++        return Err(Error::Quota);
++    }
++    let boxes = top_boxes(data)?;
++    if boxes.iter().filter(|x| x.0 == *b"ftyp").count() != 1
++        || boxes.iter().filter(|x| x.0 == *b"moov").count() != 1
++    {
++        return Err(Error::InvalidBox);
++    }
++    let f = boxes.iter().find(|x| x.0 == *b"ftyp").unwrap();
++    let m = boxes.iter().find(|x| x.0 == *b"moov").unwrap();
++    if f.1.start > m.1.start {
++        return Err(Error::InvalidBox);
++    }
++    let mut budget = 4096usize;
++    let mut tracks = 0usize;
++    validate_init_children(&data[m.2.clone()], 0, &mut budget, &mut tracks)?;
++    if tracks == 0 || tracks > 16 {
++        return Err(Error::Quota);
++    }
++    if !top_boxes(&data[m.2.clone()])?
++        .iter()
++        .any(|x| x.0 == *b"mvex")
++    {
++        return Err(Error::InvalidBox);
++    }
++    Ok(())
++}
++fn validate_init_children(
++    data: &[u8],
++    depth: usize,
++    budget: &mut usize,
++    tracks: &mut usize,
++) -> Result<(), Error> {
++    if depth > 8 {
++        return Err(Error::Quota);
++    }
++    for (kind, _, payload) in top_boxes(data)? {
++        *budget = budget.checked_sub(1).ok_or(Error::Quota)?;
++        if kind == *b"trak" {
++            *tracks += 1;
++            if *tracks > 16 {
++                return Err(Error::Quota);
++            }
++        }
++        if [*b"stts", *b"stsc", *b"stco", *b"co64"].contains(&kind) {
++            let bytes = &data[payload.clone()];
++            if bytes.len() < 8 {
++                return Err(Error::Truncated);
++            }
++            if bytes[4..8] != [0, 0, 0, 0] {
++                return Err(Error::InvalidBox);
++            }
++        }
++        // Edits/encryption need explicit timestamp/decryption handling, not
++        // silent ignore. DRM and nontrivial edit support are not implemented.
++        if [*b"edts", *b"pssh", *b"senc"].contains(&kind) {
++            return Err(Error::UnsupportedLayout);
++        }
++        if [*b"trak", *b"mdia", *b"minf", *b"stbl", *b"mvex"].contains(&kind) {
++            validate_init_children(&data[payload], depth + 1, budget, tracks)?;
++        }
++    }
++    Ok(())
++}
++// Inspect untrusted counts BEFORE the library materializes trun sample vectors.
++// Its16M zero-width sample cap is too large for the app memory budget.
++fn preflight_moof(data: &[u8], sample_limit: usize) -> Result<(), Error> {
++    let top = top_boxes(data)?;
++    let moof = top
++        .iter()
++        .find(|x| x.0 == *b"moof")
++        .ok_or(Error::InvalidBox)?;
++    let children = top_boxes(&data[moof.2.clone()])?;
++    let trafs: Vec<_> = children.iter().filter(|x| x.0 == *b"traf").collect();
++    if trafs.is_empty() || trafs.len() > 16 {
++        return Err(Error::InvalidBox);
++    }
++    let mut count = 0usize;
++    for traf in &trafs {
++        let body = &data[moof.2.start + traf.2.start..moof.2.start + traf.2.end];
++        let fields = top_boxes(body)?;
++        if fields.iter().filter(|x| x.0 == *b"tfdt").count() != 1 {
++            return Err(Error::InvalidBox);
++        }
++        let tfhd = fields
++            .iter()
++            .find(|x| x.0 == *b"tfhd")
++            .ok_or(Error::InvalidBox)?;
++        let h = body.get(tfhd.2.clone()).ok_or(Error::InvalidBox)?;
++        if h.len() < 8 {
++            return Err(Error::Truncated);
++        }
++        let flags = u32::from_be_bytes(h[..4].try_into().unwrap()) & 0x00ff_ffff;
++        if flags & 1 != 0 || (trafs.len() > 1 && flags & 0x020000 == 0) {
++            return Err(Error::UnsupportedLayout);
++        }
++        let mut first = true;
++        for trun in fields.iter().filter(|x| x.0 == *b"trun") {
++            let p = &body[trun.2.clone()];
++            if p.len() < 8 {
++                return Err(Error::Truncated);
++            }
++            let flags = u32::from_be_bytes(p[..4].try_into().unwrap()) & 0x00ff_ffff;
++            if first && flags & 1 == 0 {
++                return Err(Error::UnsupportedLayout);
++            }
++            first = false;
++            let samples = u32::from_be_bytes(p[4..8].try_into().unwrap()) as usize;
++            count = count.checked_add(samples).ok_or(Error::Quota)?;
++            if count > sample_limit {
++                return Err(Error::Quota);
++            }
++        }
++        if first {
++            return Err(Error::InvalidBox);
++        }
++    }
++    Ok(())
++}
++#[derive(Debug)]
++pub struct AccessUnit {
++    pub track_id: u32,
++    pub dts_us: i64,
++    pub pts_us: i64,
++    pub duration_us: i64,
++    pub keyframe: bool,
++    pub codec_config: Option<SampleEntry>,
++    pub data: Vec<u8>,
++}
++pub struct Demux {
++    inner: Fmp4SegmentDemuxer,
++    max_bytes: usize,
++    max_samples: usize,
++}
++impl Demux {
++    pub fn new(max_bytes: usize, max_samples: usize) -> Self {
++        Self {
++            inner: Fmp4SegmentDemuxer::new(),
++            max_bytes,
++            max_samples,
++        }
++    }
++    pub fn init(&mut self, data: &[u8]) -> Result<(), Error> {
++        if data.len() > self.max_bytes {
++            return Err(Error::Quota);
++        }
++        validate_init(data)?;
++        // New init can update codec configuration. Swap only after successful parse.
++        let mut next = Fmp4SegmentDemuxer::new();
++        next.handle_init_segment(data).map_err(|_| Error::Demux)?;
++        self.inner = next;
++        Ok(())
++    }
++    pub fn media(&mut self, data: &[u8]) -> Result<Vec<AccessUnit>, Error> {
++        if data.len() > self.max_bytes {
++            return Err(Error::Quota);
++        }
++        let boxes = top_boxes(data)?;
++        let mdats: Vec<_> = boxes.iter().filter(|x| x.0 == *b"mdat").collect();
++        if mdats.is_empty() || boxes.iter().filter(|x| x.0 == *b"moof").count() != 1 {
++            return Err(Error::UnsupportedLayout);
++        }
++        preflight_moof(data, self.max_samples)?;
++        let moof = boxes.iter().find(|x| x.0 == *b"moof").unwrap();
++        if mdats.iter().any(|x| x.1.start < moof.1.end) {
++            return Err(Error::InvalidBox);
++        }
++        // Dependency2026.5.0 expects one mdat directly after moof. Create a
++        // byte-position-preserving parser envelope over the original tail.
++        // Every real mdat payload remains at EXACTLY its original offset.
++        // Validate each returned sample against ORIGINAL payload ranges below,
++        // never the widened envelope that includes headers and ignored boxes.
++        let envelope_start = moof.1.end;
++        let envelope_len = data
++            .len()
++            .checked_sub(envelope_start)
++            .ok_or(Error::InvalidBox)?;
++        if envelope_len < 8 || envelope_len > u32::MAX as usize {
++            return Err(Error::UnsupportedLayout);
++        }
++        let mut envelope = data.to_vec();
++        envelope[envelope_start..envelope_start + 4]
++            .copy_from_slice(&(envelope_len as u32).to_be_bytes());
++        envelope[envelope_start + 4..envelope_start + 8].copy_from_slice(b"mdat");
++        // Transactional: invalid samples must not mutate sample-entry state.
++        let mut next = self.inner.clone();
++        let samples = next
++            .handle_media_segment(&envelope)
++            .map_err(|_| Error::Demux)?;
++        if samples.len() > self.max_samples {
++            return Err(Error::Quota);
++        }
++        let mut output = Vec::with_capacity(samples.len());
++        for s in samples {
++            let start = usize::try_from(s.data_offset).map_err(|_| Error::InvalidSample)?;
++            let end = start.checked_add(s.data_size).ok_or(Error::InvalidSample)?;
++            // Library's upper-bound check alone is insufficient: never copy box
++            // headers/metadata or data from outside mdat as compressed samples.
++            if !mdats.iter().any(|m| start >= m.2.start && end <= m.2.end) {
++                return Err(Error::InvalidSample);
++            }
++            let scale = s.track.timescale.get();
++            let dts = i128::from(s.timestamp);
++            let pts = dts + i128::from(s.composition_time_offset.unwrap_or(0));
++            output.push(AccessUnit {
++                track_id: s.track.track_id,
++                dts_us: micros(dts, scale)?,
++                pts_us: micros(pts, scale)?,
++                duration_us: micros(i128::from(s.duration), scale)?,
++                keyframe: s.keyframe,
++                codec_config: s.sample_entry.cloned(),
++                data: data[start..end].to_vec(),
++            });
++        }
++        self.inner = next;
++        Ok(output)
++    }
++}
++fn micros(value: i128, scale: u32) -> Result<i64, Error> {
++    i64::try_from(value.checked_mul(1_000_000).ok_or(Error::Timestamp)? / i128::from(scale))
++        .map_err(|_| Error::Timestamp)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn framing_partial_headers_and_payload() {
++        let mut f = BoxFramer::new(64);
++        for b in [0, 0, 0, 12, b'm', b'd', b'a', b't', 1, 2, 3, 4] {
++            f.append(&[b]).unwrap();
++            if f.pending.len() < 12 {
++                assert_eq!(f.pop_box().unwrap(), None);
++            }
++        }
++        assert_eq!(f.pop_box().unwrap().unwrap().len(), 12);
++        assert_eq!(f.finish(), Ok(()));
++    }
++    #[test]
++    fn malformed_sizes_and_quota() {
++        for d in [
++            [0, 0, 0, 7, b'm', b'd', b'a', b't'],
++            [0, 0, 0, 0, b'm', b'd', b'a', b't'],
++        ] {
++            let mut f = BoxFramer::new(64);
++            f.append(&d).unwrap();
++            assert!(f.pop_box().is_err());
++        }
++        let mut f = BoxFramer::new(8);
++        assert_eq!(f.append(&[0; 9]), Err(Error::Quota));
++        assert_eq!(f.finish(), Ok(()));
++    }
++    #[test]
++    fn extended_size_and_truncation() {
++        let mut f = BoxFramer::new(32);
++        f.append(&[0, 0, 0, 1, b'f', b'r', b'e', b'e', 0, 0, 0, 0, 0, 0, 0, 17])
++            .unwrap();
++        assert_eq!(f.pop_box(), Ok(None));
++        assert_eq!(f.finish(), Err(Error::Truncated));
++        f.append(&[1]).unwrap();
++        assert_eq!(f.pop_box().unwrap().unwrap().len(), 17);
++    }
++    #[test]
++    fn signed_composition_and_overflow() {
++        assert_eq!(micros(-4500, 90000), Ok(-50000));
++        assert_eq!(micros(i128::MAX, 1), Err(Error::Timestamp));
++    }
++}
++
++pub mod timeline;
++
++pub mod avc;
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+new file mode 100644
+index 000000000..16d656b17
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -0,0 +1,235 @@
++//! Bounded coded-frame storage foundation. Not a complete MSE SourceBuffer.
++use super::AccessUnit;
++use std::collections::{BTreeMap, BTreeSet};
++#[derive(Debug, PartialEq, Eq)]
++pub enum StoreError {
++    Quota,
++    Timestamp,
++    Window,
++}
++pub struct FrameStore {
++    tracks: BTreeMap<u32, Vec<AccessUnit>>,
++    need_random_access: BTreeSet<u32>,
++    bytes: usize,
++    limit: usize,
++}
++impl FrameStore {
++    pub fn new(limit: usize) -> Self {
++        Self {
++            tracks: BTreeMap::new(),
++            need_random_access: BTreeSet::new(),
++            bytes: 0,
++            limit,
++        }
++    }
++    pub fn bytes(&self) -> usize {
++        self.bytes
++    }
++    pub fn frames(&self, track: u32) -> &[AccessUnit] {
++        self.tracks.get(&track).map(Vec::as_slice).unwrap_or(&[])
++    }
++    pub fn discontinuity(&mut self) {
++        self.need_random_access.extend(self.tracks.keys().copied());
++    }
++    pub fn append(
++        &mut self,
++        mut input: Vec<AccessUnit>,
++        offset_us: i64,
++        window: std::ops::Range<i64>,
++    ) -> Result<(), StoreError> {
++        if window.start < 0 || window.end <= window.start {
++            return Err(StoreError::Window);
++        }
++        let mut bytes = 0usize;
++        // Validate transaction before changing existing buffered frames.
++        for f in &mut input {
++            if f.duration_us <= 0 {
++                return Err(StoreError::Timestamp);
++            }
++            f.pts_us = f
++                .pts_us
++                .checked_add(offset_us)
++                .ok_or(StoreError::Timestamp)?;
++            f.dts_us = f
++                .dts_us
++                .checked_add(offset_us)
++                .ok_or(StoreError::Timestamp)?;
++            f.pts_us
++                .checked_add(f.duration_us)
++                .ok_or(StoreError::Timestamp)?;
++            bytes = bytes.checked_add(f.data.len()).ok_or(StoreError::Quota)?;
++        }
++        if self.bytes.checked_add(bytes).ok_or(StoreError::Quota)? > self.limit {
++            return Err(StoreError::Quota);
++        }
++        for frame in input {
++            let track = frame.track_id;
++            let end = frame.pts_us + frame.duration_us;
++            if !self.tracks.contains_key(&track) {
++                self.need_random_access.insert(track);
++            }
++            if frame.pts_us < window.start || end > window.end {
++                self.need_random_access.insert(track);
++                continue;
++            }
++            if self.need_random_access.contains(&track) && !frame.keyframe {
++                continue;
++            }
++            self.need_random_access.remove(&track);
++            let frames = self.tracks.entry(track).or_default();
++            // Overlapping coded frames and dependent successors up to the next
++            // random-access frame are removed together; never keep a decoder
++            // dependency chain whose predecessor was replaced.
++            let first = frames
++                .iter()
++                .position(|f| f.pts_us < end && f.pts_us + f.duration_us > frame.pts_us);
++            if let Some(first) = first {
++                let last_overlap = frames
++                    .iter()
++                    .rposition(|f| f.pts_us < end && f.pts_us + f.duration_us > frame.pts_us)
++                    .unwrap();
++                let stop = (last_overlap + 1..frames.len())
++                    .find(|&i| frames[i].keyframe)
++                    .unwrap_or(frames.len());
++                for old in frames.drain(first..stop) {
++                    self.bytes -= old.data.len();
++                }
++            }
++            self.bytes += frame.data.len();
++            frames.push(frame);
++            frames.sort_by_key(|f| f.dts_us);
++        }
++        Ok(())
++    }
++    pub fn remove(&mut self, start: i64, end: i64) -> Result<(), StoreError> {
++        if start < 0 || end <= start {
++            return Err(StoreError::Window);
++        }
++        for (&id, frames) in &mut self.tracks {
++            let first = frames
++                .iter()
++                .position(|f| f.pts_us >= start && f.pts_us < end);
++            if let Some(first) = first {
++                let last = frames
++                    .iter()
++                    .rposition(|f| f.pts_us >= start && f.pts_us < end)
++                    .unwrap();
++                let stop = (last + 1..frames.len())
++                    .find(|&i| frames[i].keyframe)
++                    .unwrap_or(frames.len());
++                for old in frames.drain(first..stop) {
++                    self.bytes -= old.data.len();
++                }
++                self.need_random_access.insert(id);
++            }
++        }
++        Ok(())
++    }
++    pub fn ranges(&self, track: u32) -> Vec<std::ops::Range<i64>> {
++        let mut spans: Vec<_> = self
++            .frames(track)
++            .iter()
++            .map(|f| f.pts_us..f.pts_us + f.duration_us)
++            .collect();
++        spans.sort_by_key(|x| x.start);
++        let mut output: Vec<std::ops::Range<i64>> = vec![];
++        for span in spans {
++            if let Some(last) = output.last_mut() {
++                if span.start <= last.end {
++                    last.end = last.end.max(span.end);
++                    continue;
++                }
++            }
++            output.push(span);
++        }
++        output
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn f(t: i64, key: bool) -> AccessUnit {
++        AccessUnit {
++            track_id: 1,
++            dts_us: t,
++            pts_us: t,
++            duration_us: 10,
++            keyframe: key,
++            codec_config: None,
++            data: vec![1; 4],
++        }
++    }
++    #[test]
++    fn append_window_and_random_access_filtering() {
++        let mut s = FrameStore::new(128);
++        s.append(
++            vec![f(0, true), f(10, false), f(20, true), f(30, false)],
++            0,
++            10..40,
++        )
++        .unwrap();
++        assert_eq!(
++            s.frames(1).iter().map(|f| f.pts_us).collect::<Vec<_>>(),
++            vec![20, 30]
++        );
++        assert_eq!(s.ranges(1), vec![20..40]);
++    }
++    #[test]
++    fn quota_failure_is_atomic() {
++        let mut s = FrameStore::new(4);
++        s.append(vec![f(0, true)], 0, 0..100).unwrap();
++        assert_eq!(
++            s.append(vec![f(10, true)], 0, 0..100),
++            Err(StoreError::Quota)
++        );
++        assert_eq!(s.ranges(1), vec![0..10]);
++        assert_eq!(s.bytes(), 4);
++    }
++    #[test]
++    fn replacement_removes_dependent_frames() {
++        let mut s = FrameStore::new(128);
++        s.append(
++            vec![f(0, true), f(10, false), f(20, false), f(30, true)],
++            0,
++            0..100,
++        )
++        .unwrap();
++        s.append(vec![f(10, true)], 0, 0..100).unwrap();
++        assert_eq!(
++            s.frames(1).iter().map(|f| f.pts_us).collect::<Vec<_>>(),
++            vec![0, 10, 30]
++        );
++        assert_eq!(s.ranges(1), vec![0..20, 30..40]);
++    }
++    #[test]
++    fn remove_preserves_next_random_access_and_releases_bytes() {
++        let mut s = FrameStore::new(128);
++        s.append(
++            vec![f(0, true), f(10, false), f(20, false), f(30, true)],
++            0,
++            0..100,
++        )
++        .unwrap();
++        s.remove(10, 11).unwrap();
++        assert_eq!(s.ranges(1), vec![0..10, 30..40]);
++        assert_eq!(s.bytes(), 8);
++    }
++    #[test]
++    fn timestamp_overflow_does_not_change_store() {
++        let mut s = FrameStore::new(128);
++        assert_eq!(
++            s.append(vec![f(i64::MAX, true)], 1, 0..i64::MAX),
++            Err(StoreError::Timestamp)
++        );
++        assert_eq!(s.bytes(), 0);
++    }
++    #[test]
++    fn discontinuity_requires_a_new_random_access_point() {
++        let mut s = FrameStore::new(128);
++        s.append(vec![f(0, true)], 0, 0..100).unwrap();
++        s.discontinuity();
++        s.append(vec![f(10, false), f(20, true)], 0, 0..100)
++            .unwrap();
++        assert_eq!(s.ranges(1), vec![0..10, 20..30]);
++    }
++}
+-- 
+2.34.1
+
