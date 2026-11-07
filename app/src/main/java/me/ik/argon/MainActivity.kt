@@ -89,6 +89,7 @@ import org.servo.servoview.ServoHolder
 enum class Screen {
     Browser,
     History,
+    Bookmarks,
     Settings,
 }
 
@@ -339,6 +340,22 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 onBack = { screen = Screen.Browser },
                             )
                             BackHandler { screen = Screen.Browser }
+                        Screen.Bookmarks ->
+                            BookmarksPage(
+                                bookmarks = bookmarks,
+                                onOpen = {
+                                    navigate(it)
+                                    screen = Screen.Browser
+                                },
+                                onBack = {
+                                    StartPage.write(this@MainActivity, bookmarks.entries, searchEngine)
+                                    screen = Screen.Browser
+                                },
+                            )
+                            BackHandler {
+                                StartPage.write(this@MainActivity, bookmarks.entries, searchEngine)
+                                screen = Screen.Browser
+                            }
                         Screen.Settings -> SettingsPage()
                         Screen.Browser -> {}
                     }
@@ -366,6 +383,18 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     if (showMenu) {
                         MenuSheet(
                             canGoForward = navigator.canGoForward,
+                            shareEnabled = currentUrl.isNotEmpty() && !currentUrl.startsWith("file://"),
+                            onShare = {
+                                showMenu = false
+                                val send = Intent(Intent.ACTION_SEND)
+                                    .setType("text/plain")
+                                    .putExtra(Intent.EXTRA_TEXT, currentUrl)
+                                startActivity(Intent.createChooser(send, null))
+                            },
+                            onBookmarks = {
+                                showMenu = false
+                                screen = Screen.Bookmarks
+                            },
                             readerEnabled = ReaderMode.bridgeAvailable.value,
                             currentHost = hostOf(displayableUrl(currentUrl)),
                             onDismiss = { showMenu = false },

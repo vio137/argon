@@ -69,6 +69,12 @@ private fun PageTopBar(
 @Composable
 fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> Unit) {
     var confirmClear by remember { mutableStateOf(false) }
+    var filter by remember { mutableStateOf("") }
+    val shown =
+        if (filter.isBlank()) history.entries
+        else history.entries.filter {
+            it.title.contains(filter, ignoreCase = true) || hostOf(it.url).contains(filter, ignoreCase = true)
+        }
     Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
         Column(Modifier.fillMaxSize()) {
             PageTopBar(
@@ -82,13 +88,43 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                     }
                 },
             )
+            if (history.entries.isNotEmpty()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(ArgonRadii.Control))
+                            .background(ArgonColors.Surface)
+                            .padding(horizontal = 14.dp),
+                ) {
+                    Icon(painterResource(R.drawable.ic_search), contentDescription = null, tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(10.dp))
+                    androidx.compose.foundation.text.BasicTextField(
+                        value = filter,
+                        onValueChange = { filter = it },
+                        singleLine = true,
+                        textStyle = ArgonType.BodySmall.copy(color = ArgonColors.Text),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                    ) { inner ->
+                        Box {
+                            if (filter.isEmpty()) Text("Filter history", color = ArgonColors.Text3, style = ArgonType.BodySmall)
+                            inner()
+                        }
+                    }
+                }
+            }
             if (history.entries.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("Pages you visit will appear here.", color = ArgonColors.Text3, style = ArgonType.BodySmall)
                 }
+            } else if (shown.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Nothing matches.", color = ArgonColors.Text3, style = ArgonType.BodySmall)
+                }
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
-                    items(history.entries, key = { it.url + it.time }) { entry ->
+                    items(shown, key = { it.url + it.time }) { entry ->
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier =
@@ -134,6 +170,48 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
             },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
         )
+    }
+}
+
+@Composable
+fun BookmarksPage(bookmarks: BookmarkStore, onOpen: (String) -> Unit, onBack: () -> Unit) {
+    Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
+        Column(Modifier.fillMaxSize()) {
+            PageTopBar("Bookmarks", onBack)
+            if (bookmarks.entries.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Star a page from the menu and it lands here.", color = ArgonColors.Text3, style = ArgonType.BodySmall)
+                }
+            } else {
+                LazyColumn(Modifier.fillMaxSize()) {
+                    items(bookmarks.entries, key = { it.url }) { entry ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .clickable { onOpen(entry.url) }
+                                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                        ) {
+                            HostGlyph(hostOf(entry.url))
+                            Spacer(Modifier.width(14.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    hostOf(entry.url),
+                                    color = ArgonColors.Text3,
+                                    style = ArgonType.Caption,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            IconButton(onClick = { bookmarks.remove(entry) }) {
+                                Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -316,6 +394,9 @@ private fun SettingClick(title: String, subtitle: String?, danger: Boolean = fal
 @OptIn(ExperimentalMaterial3Api::class)
 fun MenuSheet(
     canGoForward: Boolean,
+    shareEnabled: Boolean,
+    onShare: () -> Unit,
+    onBookmarks: () -> Unit,
     currentHost: String,
     onDismiss: () -> Unit,
     readerEnabled: Boolean,
@@ -349,11 +430,13 @@ fun MenuSheet(
                 }
             }
             SheetLabel("This page")
+            SheetRow(R.drawable.ic_share, "Share page", shareEnabled, onShare)
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
             SheetRow(R.drawable.ic_reader, "Reader view", readerEnabled, onReader)
             SheetRow(R.drawable.ic_code, "View DOM (current page)", readerEnabled, onViewDom)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetLabel("App")
+            SheetRow(R.drawable.ic_star, "Bookmarks", true, onBookmarks)
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
             SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
