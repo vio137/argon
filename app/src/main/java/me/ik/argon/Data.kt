@@ -29,6 +29,49 @@ object StoreHealth {
  * so the original is never overwritten). */
 private class LoadedStore<T>(val entries: List<T>, val quarantineFailed: Boolean)
 
+/** Shared background-save machinery for the JSON stores. save() callers hold
+ * immutable List snapshots, so queueing is latest-wins: a superseded snapshot
+ * is dropped unwritten, and flushSaves() drains the newest snapshot
+ * synchronously (called on onPause) so backgrounding never loses queued
+ * writes. The write lock also makes flush wait out an in-flight background
+ * write. (Perf audit 1.0.17: history.add runs on the main thread from
+ * onLoadEnded; JSON-encoding up to 500 entries + file IO mid-navigation
+ * janked the page-transition frame.) */
+private class SaveQueue {
+    private val executor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "argon-store-save").apply { isDaemon = true }
+        }
+    private val writeLock = java.util.concurrent.locks.ReentrantLock()
+    private val pending = java.util.concurrent.atomic.AtomicReference<(() -> Unit)?>(null)
+
+    fun enqueue(write: () -> Unit) {
+        pending.set(write)
+        executor.execute {
+            val task = pending.get()
+            if (task !== write) return@execute // superseded by a newer snapshot
+            pending.compareAndSet(write, null)
+            writeLock.lock()
+            try {
+                write()
+            } finally {
+                writeLock.unlock()
+            }
+        }
+    }
+
+    fun flush() {
+        val task = pending.getAndSet(null)
+        writeLock.lock()
+        try {
+            task?.invoke()
+        } finally {
+            writeLock.unlock()
+        }
+    }
+}
+
+
 /** Durable store write via AtomicFile: the previous good bytes are kept in
  * AtomicFile's own backup until finishWrite syncs the replacement, so a
  * crash or failure mid-write leaves the last good store recoverable. The
@@ -124,6 +167,8 @@ class HistoryStore(context: Context) {
         save()
     }
 
+    private val saveQueue = SaveQueue()
+
     private fun save() {
         if (savesBlocked) {
             // Honest failure semantics: the in-memory change STAYS (the app
@@ -133,8 +178,12 @@ class HistoryStore(context: Context) {
             StoreHealth.corruptPreserveError.value = true
             return
         }
-        writeStore(file, storeJson.encodeToString(entries))
+        val snapshot = entries
+        saveQueue.enqueue { writeStore(file, storeJson.encodeToString(snapshot)) }
     }
+
+    /** Drains any queued save synchronously (onPause durability point). */
+    fun flushSaves() = saveQueue.flush()
 }
 
 class BookmarkStore(context: Context) {
@@ -175,6 +224,8 @@ class BookmarkStore(context: Context) {
         save()
     }
 
+    private val saveQueue = SaveQueue()
+
     private fun save() {
         if (savesBlocked) {
             // Honest failure semantics: the in-memory change STAYS (the app
@@ -184,6 +235,10 @@ class BookmarkStore(context: Context) {
             StoreHealth.corruptPreserveError.value = true
             return
         }
-        writeStore(file, storeJson.encodeToString(entries))
+        val snapshot = entries
+        saveQueue.enqueue { writeStore(file, storeJson.encodeToString(snapshot)) }
     }
+
+    /** Drains any queued save synchronously (onPause durability point). */
+    fun flushSaves() = saveQueue.flush()
 }
