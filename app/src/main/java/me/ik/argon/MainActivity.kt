@@ -248,6 +248,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
         setContent {
             ArgonTheme {
+                val focusManager = LocalFocusManager.current
                 Box(Modifier.fillMaxSize().background(ArgonColors.Bg)) {
                     Servo(
                         experimentalModeEnabled = experimental,
@@ -301,8 +302,32 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         onStopOrReload = { if (isLoading) navigator.stop() else navigator.reload() },
                         onMenu = { showMenu = true },
                         loadingArc = { LoadingArc() },
+                        onEscape = { focusManager.clearFocus() },
                         modifier = Modifier.align(Alignment.BottomCenter),
                     )
+                    val omniboxQuery = urlState.text.toString()
+                    if (omniboxFocused && omniboxQuery.isNotBlank()) {
+                        OmniboxSuggestions(
+                            query = omniboxQuery,
+                            engine = searchEngine,
+                            history = history.entries,
+                            bookmarks = bookmarks.entries,
+                            onSearch = {
+                                submitOmnibox()
+                                servoFocusRequester.requestFocus()
+                            },
+                            onPick = { url ->
+                                navigate(url)
+                                servoFocusRequester.requestFocus()
+                            },
+                            modifier =
+                                Modifier.align(Alignment.BottomCenter)
+                                    .padding(start = 12.dp, end = 12.dp, bottom = 84.dp),
+                        )
+                        // Back closes the suggestions first; the focus-loss
+                        // handler restores the current host in the field.
+                        BackHandler { focusManager.clearFocus() }
+                    }
                     when (screen) {
                         Screen.History ->
                             HistoryPage(
@@ -313,6 +338,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 },
                                 onBack = { screen = Screen.Browser },
                             )
+                            BackHandler { screen = Screen.Browser }
                         Screen.Settings -> SettingsPage()
                         Screen.Browser -> {}
                     }
@@ -420,6 +446,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     }
                     readerArticle?.let { article ->
                         ReaderOverlay(article = article, onClose = { readerArticle = null })
+                        BackHandler { readerArticle = null }
                     }
                     readerError?.let { message ->
                         AlertDialog(
@@ -492,145 +519,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         startActivity(launch)
         Runtime.getRuntime().exit(0)
-    }
-
-    @Composable
-    private fun BrowserChrome(modifier: Modifier) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            modifier =
-                modifier
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .imePadding()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-        ) {
-            if (!omniboxFocused) {
-                IconButton(onClick = { navigator.back() }, enabled = navigator.canGoBack) {
-                    Icon(
-                        painterResource(R.drawable.ic_arrow_back),
-                        contentDescription = "Back",
-                        tint = if (navigator.canGoBack) ArgonColors.Text else ArgonColors.Text3,
-                    )
-                }
-            }
-            OmniboxPill(Modifier.weight(1f))
-            if (omniboxFocused) {
-                IconButton(onClick = { submitOmnibox() }) {
-                    Icon(
-                        painterResource(R.drawable.ic_arrow_forward),
-                        contentDescription = "Go",
-                        tint = ArgonColors.Accent,
-                    )
-                }
-            } else {
-                IconButton(onClick = { if (isLoading) navigator.stop() else navigator.reload() }) {
-                    Icon(
-                        painterResource(if (isLoading) R.drawable.ic_close else R.drawable.ic_refresh),
-                        contentDescription = if (isLoading) "Stop" else "Reload",
-                        tint = ArgonColors.Text,
-                    )
-                }
-                IconButton(onClick = { showMenu = true }) {
-                    Icon(
-                        painterResource(R.drawable.ic_menu),
-                        contentDescription = "Menu",
-                        tint = ArgonColors.Text,
-                    )
-                }
-            }
-        }
-    }
-
-    @Composable
-    private fun OmniboxPill(modifier: Modifier) {
-        val focusManager = LocalFocusManager.current
-        val shape = RoundedCornerShape(26.dp)
-        Box(modifier = modifier.height(52.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier =
-                    Modifier.fillMaxSize()
-                        .clip(shape)
-                        .background(ArgonColors.Surface)
-                        .padding(horizontal = 16.dp),
-            ) {
-                Icon(
-                    painterResource(
-                        if (currentUrl.startsWith("https://")) R.drawable.ic_lock
-                        else R.drawable.ic_search
-                    ),
-                    contentDescription = null,
-                    tint = ArgonColors.Text3,
-                    modifier = Modifier.size(18.dp),
-                )
-                Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                    if (urlState.text.isEmpty()) {
-                        Text(
-                            "Search or enter address",
-                            color = ArgonColors.Text3,
-                            style = ArgonType.Body,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    BasicTextField(
-                        state = urlState,
-                        lineLimits = TextFieldLineLimits.SingleLine,
-                        textStyle =
-                            ArgonType.Body.copy(color = ArgonColors.Text),
-                        keyboardOptions =
-                            KeyboardOptions(
-                                keyboardType = KeyboardType.Uri,
-                                imeAction = ImeAction.Go,
-                            ),
-                        onKeyboardAction = { submitOmnibox() },
-                        modifier =
-                            Modifier.fillMaxWidth().onPreviewKeyEvent { event ->
-                                if (event.type == KeyEventType.KeyDown &&
-                                    (event.key == Key.Enter || event.key == Key.NumPadEnter)
-                                ) {
-                                    submitOmnibox()
-                                    true
-                                } else {
-                                    false
-                                }
-                            }.onFocusChanged { focusState ->
-                                if (focusState.isFocused && !omniboxFocused) {
-                                    omniboxFocused = true
-                                    urlState.edit {
-                                        val shown = displayableUrl(currentUrl)
-                                        if (shown.isNotEmpty()) {
-                                            replace(0, length, shown)
-                                            selectAll()
-                                        }
-                                    }
-                                } else if (!focusState.isFocused && omniboxFocused) {
-                                    omniboxFocused = false
-                                    urlState.edit { replace(0, length, hostOf(displayableUrl(currentUrl))) }
-                                }
-                            },
-                    )
-                }
-                if (urlState.text.isNotEmpty() && omniboxFocused) {
-                    Icon(
-                        painterResource(R.drawable.ic_close),
-                        contentDescription = "Clear",
-                        tint = ArgonColors.Text3,
-                        modifier =
-                            Modifier.size(18.dp).clickable { urlState.edit { replace(0, length, "") } },
-                    )
-                }
-            }
-            AnimatedVisibility(
-                visible = isLoading,
-                enter = fadeIn(),
-                exit = fadeOut(),
-            ) {
-                LoadingArc()
-            }
-        }
     }
 
     @Composable

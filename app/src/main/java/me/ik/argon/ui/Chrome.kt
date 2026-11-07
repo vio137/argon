@@ -78,6 +78,7 @@ fun ArgonCommandBar(
     onBack: () -> Unit,
     onStopOrReload: () -> Unit,
     onMenu: () -> Unit,
+    onEscape: () -> Unit = {},
     loadingArc: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -147,6 +148,9 @@ fun ArgonCommandBar(
                                         (event.key == Key.Enter || event.key == Key.NumPadEnter)
                                     ) {
                                         onSubmit()
+                                        true
+                                    } else if (event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
+                                        onEscape()
                                         true
                                     } else false
                                 }
