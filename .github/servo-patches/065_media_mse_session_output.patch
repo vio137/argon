@@ -1,0 +1,493 @@
+From 110d242fff9fd49340a7ded50e96ba69a91f5819 Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sun, 8 Nov 2026 00:16:40 +0530
+Subject: [PATCH] 065 media: coordinate append input and poll native codec
+ output with buffer leases
+
+---
+ .../android/android_impl/mse_codec.rs         | 151 ++++++++++++++++++
+ .../android/hosttest/tests/mse_fixture.rs     | 104 ++++++++++--
+ .../backends/android/mse_demux/README.md      |   2 +
+ .../backends/android/mse_demux/bridge.rs      |  15 +-
+ .../media/backends/android/mse_demux/mod.rs   |   2 +
+ .../backends/android/mse_demux/session.rs     |  89 +++++++++++
+ 6 files changed, 349 insertions(+), 14 deletions(-)
+ create mode 100644 components/media/backends/android/mse_demux/session.rs
+
+diff --git a/components/media/backends/android/android_impl/mse_codec.rs b/components/media/backends/android/android_impl/mse_codec.rs
+index 15781babe..f5c48e6dd 100644
+--- a/components/media/backends/android/android_impl/mse_codec.rs
++++ b/components/media/backends/android/android_impl/mse_codec.rs
+@@ -13,6 +13,9 @@ pub struct MseCodecInput<'a> {
+     codec: *mut sys::AMediaCodec,
+     surface: Option<&'a sys::ANativeWindow>,
+     track: Option<u32>,
++    video: bool,
++    output_channels: i32,
++    output_pcm_encoding: i32,
+ }
+ impl<'a> MseCodecInput<'a> {
+     pub fn new(surface: Option<&'a sys::ANativeWindow>) -> Self {
+@@ -20,6 +23,9 @@ impl<'a> MseCodecInput<'a> {
+             codec: ptr::null_mut(),
+             surface,
+             track: None,
++            video: false,
++            output_channels: 0,
++            output_pcm_encoding: 2,
+         }
+     }
+     /// A borrowed handle, never transfer ownership. The output-pump integration
+@@ -105,6 +111,8 @@ impl CodecInput for MseCodecInput<'_> {
+             }
+             self.codec = codec;
+             self.track = Some(c.track_id);
++            self.video = video;
++            self.output_channels = i32::from(c.channels);
+         }
+         Ok(())
+     }
+@@ -156,3 +164,146 @@ impl Drop for MseCodecInput<'_> {
+         }
+     }
+ }
++
++#[derive(Debug)]
++pub enum MseOutput {
++    Retry,
++    FormatChanged {
++        sample_rate: i32,
++        channels: i32,
++        pcm_encoding: i32,
++        width: i32,
++        height: i32,
++    },
++    SurfaceReleased {
++        pts_us: i64,
++        eos: bool,
++    },
++    Pcm {
++        samples: Vec<i16>,
++        pts_us: i64,
++        eos: bool,
++    },
++    EndOfStream,
++    CodecConfig,
++}
++struct OutputLease {
++    codec: *mut sys::AMediaCodec,
++    index: usize,
++    released: bool,
++}
++impl OutputLease {
++    fn release(&mut self, render: bool) -> Result<(), ()> {
++        let result =
++            unsafe { sys::AMediaCodec_releaseOutputBuffer(self.codec, self.index, render) };
++        // Do not retry a failed release on Drop: ownership after an error is
++        // unspecified. Caller must poison/drop the codec.
++        self.released = true;
++        if result == sys::AMEDIA_OK {
++            Ok(())
++        } else {
++            Err(())
++        }
++    }
++}
++impl Drop for OutputLease {
++    fn drop(&mut self) {
++        if !self.released {
++            unsafe {
++                sys::AMediaCodec_releaseOutputBuffer(self.codec, self.index, false);
++            }
++        }
++    }
++}
++impl MseCodecInput<'_> {
++    pub fn poll_output(&mut self) -> Result<MseOutput, ()> {
++        if self.codec.is_null() {
++            return Err(());
++        }
++        let mut info = sys::AMediaCodecBufferInfo::default();
++        let idx = unsafe { sys::AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0) };
++        if idx == sys::AMEDIACODEC_INFO_TRY_AGAIN_LATER
++            || idx == sys::AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED
++        {
++            return Ok(MseOutput::Retry);
++        }
++        if idx == sys::AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED {
++            let format = unsafe { sys::AMediaCodec_getOutputFormat(self.codec) };
++            if format.is_null() {
++                return Err(());
++            }
++            let get = |name: &std::ffi::CStr, default: i32| {
++                let mut value = default;
++                unsafe { sys::AMediaFormat_getInt32(format, name.as_ptr(), &mut value) };
++                value
++            };
++            let rate = get(c"sample-rate", 0);
++            let channels = get(c"channel-count", 0);
++            let encoding = get(c"pcm-encoding", 2);
++            let width = get(c"width", 0);
++            let height = get(c"height", 0);
++            unsafe { sys::AMediaFormat_delete(format) };
++            self.output_channels = channels;
++            self.output_pcm_encoding = encoding;
++            return Ok(MseOutput::FormatChanged {
++                sample_rate: rate,
++                channels,
++                pcm_encoding: encoding,
++                width,
++                height,
++            });
++        }
++        if idx < 0 {
++            return Err(());
++        }
++        let mut lease = OutputLease {
++            codec: self.codec,
++            index: idx as usize,
++            released: false,
++        };
++        let eos = info.flags & sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM != 0;
++        if info.flags & 2 != 0 {
++            lease.release(false)?;
++            return Ok(MseOutput::CodecConfig);
++        }
++        if eos && info.size == 0 {
++            lease.release(false)?;
++            return Ok(MseOutput::EndOfStream);
++        }
++        if self.video {
++            // Surface release only queues rendering. This is not a displayed
++            // frame acknowledgment. Caller must acquire/render AImage separately.
++            lease.release(true)?;
++            return Ok(MseOutput::SurfaceReleased {
++                pts_us: info.presentation_time_us,
++                eos,
++            });
++        }
++        if info.size < 0
++            || info.size > 8 * 1024 * 1024
++            || self.output_channels <= 0
++            || self.output_channels > 8
++        {
++            return Err(());
++        }
++        if self.output_pcm_encoding != 2 {
++            return Err(());
++        }
++        let mut capacity = 0usize;
++        let src =
++            unsafe { sys::AMediaCodec_getOutputBuffer(self.codec, idx as usize, &mut capacity) };
++        if src.is_null() {
++            return Err(());
++        }
++        let range = crate::pcm::pcm16_range(capacity, info.offset, info.size, self.output_channels)
++            .ok_or(())?;
++        let bytes = unsafe { std::slice::from_raw_parts(src.add(range.start), range.len()) };
++        let samples = crate::pcm::copy_native_pcm16(bytes).ok_or(())?;
++        lease.release(false)?;
++        Ok(MseOutput::Pcm {
++            samples,
++            pts_us: info.presentation_time_us,
++            eos,
++        })
++    }
++}
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index e0c12d149..0a95a333a 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -23,20 +23,20 @@ fn extract_real_muxed_avc_fragments_in_seven_byte_appends() {
+         match &b[4..8] {
+             b"ftyp" | b"moov" => {
+                 init.extend(b);
+-            }
++            },
+             b"moof" => {
+                 if !initialized {
+                     demux.init(&init).unwrap();
+                     initialized = true;
+                 }
+                 pending = b;
+-            }
++            },
+             b"mdat" => {
+                 pending.extend(b);
+                 units.extend(demux.media(&pending).unwrap());
+                 pending.clear();
+-            }
+-            _ => {}
++            },
++            _ => {},
+         }
+     }
+     assert_eq!(units.len(), 2);
+@@ -195,7 +195,7 @@ fn missing_configuration_and_reset_fail_closed() {
+     ));
+ }
+ #[test]
+-fn extended_aac_configuration_is_explicitly_rejected_not_misdecoded() {
++fn extended_aac_configuration_is_forwarded_unchanged_for_native_validation() {
+     use servo_media_android_hosttest::mse_demux::bridge::DecoderBridge;
+     let mut framer = BoxFramer::new(1 << 20);
+     framer
+@@ -220,16 +220,34 @@ fn extended_aac_configuration_is_explicitly_rejected_not_misdecoded() {
+             let mut media = pair[0].clone();
+             media.extend_from_slice(&pair[1]);
+             for unit in d.media(&media).unwrap() {
+-                packets.push(bridge.prepare(unit));
++                let expected = match unit.codec_config.as_ref() {
++                    Some(shiguredo_mp4::boxes::SampleEntry::Mp4a(e)) => Some(
++                        e.esds_box
++                            .es
++                            .dec_config_descr
++                            .dec_specific_info
++                            .as_ref()
++                            .unwrap()
++                            .payload
++                            .clone(),
++                    ),
++                    _ => None,
++                };
++                let packet = bridge.prepare(unit).unwrap();
++                if let Some(expected) = expected {
++                    assert_eq!(packet.config.as_ref().unwrap().csd0, expected);
++                }
++                packets.push(packet);
+             }
+         }
+     }
+     assert!(!packets.is_empty());
+-    assert!(matches!(
+-        packets[0],
+-        Err(servo_media_android_hosttest::mse_demux::bridge::BridgeError::UnsupportedConfiguration)
+-    ));
++    let c = packets[0].config.as_ref().unwrap();
++    assert_eq!(c.mime, "audio/mp4a-latm");
++    assert_eq!((c.sample_rate, c.channels), (48000, 2));
++    assert!(c.csd0.len() > 2);
+ }
++
+ #[test]
+ fn append_stream_retains_segments_across_arbitrary_js_append_boundaries() {
+     use servo_media_android_hosttest::mse_demux::append::AppendStream;
+@@ -269,3 +287,69 @@ fn eos_rejects_partial_box_instead_of_marking_complete() {
+     stream.append(&[0, 0, 0]).unwrap();
+     assert!(stream.end_of_stream().is_err());
+ }
++#[test]
++fn append_session_drives_codec_boundary_without_claiming_output_completion() {
++    use servo_media_android_hosttest::mse_demux::{
++        bridge::DecoderConfig, delivery::CodecInput, session::AppendSession,
++    };
++    struct Sink {
++        configured: usize,
++        packets: usize,
++        ready: bool,
++    }
++    impl CodecInput for Sink {
++        fn configure(&mut self, c: &DecoderConfig) -> Result<(), ()> {
++            assert_eq!(c.mime, "video/avc");
++            assert_eq!((c.width, c.height), (32, 32));
++            self.configured += 1;
++            Ok(())
++        }
++        fn submit(&mut self, id: u32, bytes: &[u8], pts: i64) -> Result<bool, ()> {
++            assert!(id > 0);
++            assert!(bytes.starts_with(&[0, 0, 0, 1]));
++            assert_eq!(pts, self.packets as i64 * 500000);
++            if self.ready {
++                self.packets += 1;
++            }
++            Ok(self.ready)
++        }
++    }
++    let mut session = AppendSession::new(1 << 20, 128);
++    let bytes = include_bytes!("fixtures/synthetic-fmp4.mp4");
++    for chunk in bytes.chunks(7) {
++        session.append(chunk).unwrap();
++    }
++    session.end_of_stream().unwrap();
++    assert!(!session.input_exhausted());
++    let mut sink = Sink {
++        configured: 0,
++        packets: 0,
++        ready: false,
++    };
++    assert!(!session.pump_input(&mut sink).unwrap());
++    assert!(!session.input_exhausted());
++    sink.ready = true;
++    while session.pump_input(&mut sink).unwrap() {}
++    assert!(session.input_exhausted());
++    assert_eq!((sink.configured, sink.packets), (1, 2));
++    assert!(session.append(&[]).is_err());
++}
++#[test]
++fn append_session_does_not_deliver_queued_packets_after_append_failure() {
++    use servo_media_android_hosttest::mse_demux::{
++        bridge::DecoderConfig, delivery::CodecInput, session::AppendSession,
++    };
++    struct Sink;
++    impl CodecInput for Sink {
++        fn configure(&mut self, _: &DecoderConfig) -> Result<(), ()> {
++            panic!("must not configure failed session")
++        }
++        fn submit(&mut self, _: u32, _: &[u8], _: i64) -> Result<bool, ()> {
++            panic!("must not submit failed session")
++        }
++    }
++    let mut s = AppendSession::new(1024, 32);
++    assert!(s.append(&[0, 0, 0, 7, b'f', b'r', b'e', b'e']).is_err());
++    assert!(s.pump_input(&mut Sink).is_err());
++    assert!(!s.input_exhausted());
++}
+diff --git a/components/media/backends/android/mse_demux/README.md b/components/media/backends/android/mse_demux/README.md
+index c0fb4bb2a..99c73ac54 100644
+--- a/components/media/backends/android/mse_demux/README.md
++++ b/components/media/backends/android/mse_demux/README.md
+@@ -11,3 +11,5 @@ Not complete MSE: missing DOM event/state/object identity integration, native de
+ Host evidence: existing57 tests plus18 new checks (13 unit +5 fixture integration) pass. Fixture is a locally generated32x32 blue AVC fMP4 with2 frames, no user media. It demonstrates parsing, not codec playback. Generated using ffmpeg lavfi color blue/2fps/1s, libx264 ultrafast/g1, empty_moov+frag_keyframe+default_base_moof. Primary requirements: https://www.w3.org/TR/mse-byte-stream-format-isobmff/ and https://developer.android.com/reference/android/media/MediaCodec (CSD section).
+ 
+ 064 adds append-stream buffering/EOS/abort, codec-input bridge, bounded retained packet delivery and dormant NDK configure/start/queue adapter. Native adapter is compiled but has NO production call site or output-pump integration. It requires a borrowed video surface, rejects unsupported formats/config changes rather than resetting live decoders, and checks track identity/input capacity. Negative PTS currently rejected at delivery, pending spec-correct preroll/time mapping. AAC extensions remain unsupported by the narrow dependency helper.84 host tests pass (73unit+11fixture), NOT native runtime evidence.
++
++065 adds internal AppendSession coordinator (append->demux->packet bridge->retained codec-input delivery), and native output polling with output-buffer ownership leases. SurfaceReleased is queue submission, NOT displayed pixels. PCM output is bounded and copied after metadata validation. Output is still not delivered to the browser's renderer/AAudio; no DOM/HTMLMediaElement call site exists. AAC decoder-specific bytes now pass unchanged, including extension bytes, to native validation instead of being rejected by a narrow AAC-LC parser; host fixture confirms byte identity, not decoding.86host checks(73unit+13fixture) pass including full append-to-mock-codec-boundary and error-poison behavior. NegativePTS/preroll, adaptive format changes, live fragment-boundary latency, brand/edit and full coded-frame semantics remain incomplete.
+diff --git a/components/media/backends/android/mse_demux/bridge.rs b/components/media/backends/android/mse_demux/bridge.rs
+index bc0c36660..02ea3335e 100644
+--- a/components/media/backends/android/mse_demux/bridge.rs
++++ b/components/media/backends/android/mse_demux/bridge.rs
+@@ -118,15 +118,22 @@ impl DecoderBridge {
+             if asc.len() > self.limit {
+                 return Err(BridgeError::Quota);
+             }
+-            let parsed = parse_audio_specific_config(asc)
+-                .map_err(|_| BridgeError::UnsupportedConfiguration)?;
++            // Decoder-specific information is opaque codec initialization data.
++            // Preserve ALL extension bytes and let MediaCodec validate them at
++            // configure/start; do not use the library's AAC-LC-only ASC parser
++            // as an assertion of general native codec capability.
++            let rate = u32::from(entry.audio.samplerate.integer);
++            let channels = entry.audio.channelcount;
++            if asc.len() < 2 || rate == 0 || channels == 0 || channels > 8 {
++                return Err(BridgeError::UnsupportedConfiguration);
++            }
+             Some(DecoderConfig {
+                 track_id: unit.track_id,
+                 mime: "audio/mp4a-latm",
+                 width: 0,
+                 height: 0,
+-                sample_rate: parsed.sampling_frequency.hz(),
+-                channels: parsed.channel_configuration.channel_count(),
++                sample_rate: rate,
++                channels,
+                 csd0: asc.clone(),
+                 csd1: vec![],
+             })
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+index d18532dcf..61e77cdf2 100644
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -381,3 +381,5 @@ pub mod avc;
+ pub mod bridge;
+ pub mod append;
+ pub mod delivery;
++
++pub mod session;
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+new file mode 100644
+index 000000000..0bfb1dd98
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -0,0 +1,89 @@
++//! Internal append-to-codec coordinator, not a DOM MediaSource. All methods
++//! belong to one worker thread. Failure poisons until explicit reset/recreate.
++use super::{
++    append::AppendStream,
++    bridge::DecoderBridge,
++    delivery::{CodecInput, Delivery},
++};
++#[derive(Debug, PartialEq, Eq)]
++pub enum SessionError {
++    Append,
++    Configuration,
++    Delivery,
++    Failed,
++}
++pub struct AppendSession {
++    stream: AppendStream,
++    bridge: DecoderBridge,
++    delivery: Delivery,
++    failed: bool,
++    ended: bool,
++}
++impl AppendSession {
++    pub fn new(limit: usize, max_samples: usize) -> Self {
++        Self {
++            stream: AppendStream::new(limit, max_samples),
++            bridge: DecoderBridge::new(limit),
++            delivery: Delivery::new(limit),
++            failed: false,
++            ended: false,
++        }
++    }
++    pub fn append(&mut self, data: &[u8]) -> Result<(), SessionError> {
++        if self.failed || self.ended {
++            return Err(SessionError::Failed);
++        }
++        let units = match self.stream.append(data) {
++            Ok(u) => u,
++            Err(_) => {
++                self.failed = true;
++                return Err(SessionError::Append);
++            },
++        };
++        self.queue(units)
++    }
++    pub fn end_of_stream(&mut self) -> Result<(), SessionError> {
++        if self.failed || self.ended {
++            return Err(SessionError::Failed);
++        }
++        let units = match self.stream.end_of_stream() {
++            Ok(u) => u,
++            Err(_) => {
++                self.failed = true;
++                return Err(SessionError::Append);
++            },
++        };
++        self.queue(units)?;
++        self.ended = true;
++        Ok(())
++    }
++    fn queue(&mut self, units: Vec<super::AccessUnit>) -> Result<(), SessionError> {
++        for unit in units {
++            let packet = match self.bridge.prepare(unit) {
++                Ok(p) => p,
++                Err(_) => {
++                    self.failed = true;
++                    return Err(SessionError::Configuration);
++                },
++            };
++            if self.delivery.push(packet).is_err() {
++                self.failed = true;
++                return Err(SessionError::Delivery);
++            }
++        }
++        Ok(())
++    }
++    pub fn pump_input(&mut self, sink: &mut impl CodecInput) -> Result<bool, SessionError> {
++        if self.failed {
++            return Err(SessionError::Failed);
++        }
++        self.delivery.pump(sink).map_err(|_| {
++            self.failed = true;
++            SessionError::Delivery
++        })
++    }
++    /// Input is exhausted, not decoder-output or audible/displayed completion.
++    pub fn input_exhausted(&self) -> bool {
++        !self.failed && self.ended && self.delivery.is_empty()
++    }
++}
+-- 
+2.34.1
+
