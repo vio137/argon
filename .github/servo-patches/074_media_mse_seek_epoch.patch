@@ -1,0 +1,153 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 5c6cdbfc5..5a19341f1 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -230,6 +230,19 @@ struct Decoders {
+     audio: Option<(u32, MseCodecInput)>,
+     first_pts: Option<i64>,
+ }
++impl Decoders {
++    fn reset_epoch(&mut self) {
++        // Stop codecs before destroying their shared native surface owner.
++        self.video.take();
++        self.audio.take();
++        self.surface.take();
++        self.track_ids.clear();
++        self.configs.clear();
++        self.next_track = 1;
++        self.video_size = None;
++        self.first_pts = None;
++    }
++}
+ impl CodecInput for Decoders {
+     fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()> {
+         if let Some(old) = self.configs.get(&config.track_id) {
+@@ -499,6 +512,38 @@ impl AppendPlayback {
+             .abort_append()
+             .map_err(|_| ())
+     }
++    /// Native seek reset primitive. All sessions are staged first so an
++    /// unbuffered target cannot disturb the current decoder/output epoch.
++    /// Player/DOM completion and preroll presentation are not wired here yet.
++    pub fn reset_seek_epoch(&mut self, target_us: i64) -> Result<(), ()> {
++        if self.failed || self.sessions.is_empty() {
++            return Err(());
++        }
++        let plans = self
++            .sessions
++            .iter()
++            .map(|(id, s)| Ok((*id, s.stage_seek(target_us).map_err(|_| ())?)))
++            .collect::<Result<Vec<_>, ()>>()?;
++        self.audio.close();
++        self.audio.pending = None;
++        self.decoders.reset_epoch();
++        self.video_pending = None;
++        self.video_color = (None, None);
++        self.drain_wait = None;
++        self.video_done = false;
++        self.audio_done = false;
++        self.rendered_frames = 0;
++        self.clock = MasterClock::new();
++        self.clock.rebase(target_us);
++        self.clock.pause();
++        self.clock_started = true;
++        self.playing = false;
++        focus::set_counted(&mut self.focus_counted, false);
++        for (id, plan) in plans {
++            self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
++        }
++        Ok(())
++    }
+     pub fn end_input(&mut self) -> Result<(), ()> {
+         if self.failed {
+             return Err(());
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index 020899893..b43638ba3 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -436,3 +436,85 @@ fn parser_abort_keeps_playback_usable_but_cannot_reopen_ended_input() {
+     playback.end_input().unwrap();
+     assert!(playback.abort_append(1).is_err());
+ }
++
++#[test]
++fn seek_epoch_resets_outputs_and_replays_scoped_codec_configuration() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut playback = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    playback.add_buffer(1).unwrap();
++    playback
++        .append(
++            1,
++            include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++        )
++        .unwrap();
++    // Feed accepted coded data without claiming decoded/displayed output.
++    loop {
++        let mut sink = ScopedDecoder {
++            buffer_id: 1,
++            decoders: &mut playback.decoders,
++        };
++        if !playback
++            .sessions
++            .get_mut(&1)
++            .unwrap()
++            .pump_input(&mut sink)
++            .unwrap()
++        {
++            break;
++        }
++    }
++    assert!(playback.decoders.video.is_some());
++    playback.rendered_frames = 9;
++    playback.video_pending = Some(Instant::now());
++    playback.video_done = true;
++    playback.reset_seek_epoch(750_000).unwrap();
++    assert!(playback.decoders.video.is_none());
++    assert!(playback.decoders.surface.is_none());
++    assert!(playback.decoders.track_ids.is_empty());
++    assert!(playback.video_pending.is_none());
++    assert!(!playback.video_done);
++    assert_eq!(playback.rendered_frames, 0);
++    assert_eq!(playback.clock.now_us(), 750_000);
++    loop {
++        let mut sink = ScopedDecoder {
++            buffer_id: 1,
++            decoders: &mut playback.decoders,
++        };
++        if !playback
++            .sessions
++            .get_mut(&1)
++            .unwrap()
++            .pump_input(&mut sink)
++            .unwrap()
++        {
++            break;
++        }
++    }
++    assert!(playback.decoders.video.is_some());
++    assert!(playback.decoders.track_ids.contains_key(&(1, 1)));
++    assert_eq!(playback.decoders.first_pts, Some(500_000));
++    assert_eq!(playback.buffered(), [0..1_000_000]);
++}
++#[test]
++fn a_seek_missing_any_source_buffer_preserves_the_existing_epoch() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut playback = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    playback.add_buffer(1).unwrap();
++    playback
++        .append(
++            1,
++            include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++        )
++        .unwrap();
++    playback.add_buffer(2).unwrap();
++    playback.rendered_frames = 11;
++    playback.video_pending = Some(Instant::now());
++    assert!(playback.reset_seek_epoch(500_000).is_err());
++    assert_eq!(playback.rendered_frames, 11);
++    assert!(playback.video_pending.is_some());
++    assert_eq!(
++        playback.sessions.get(&1).unwrap().buffered(),
++        [0..1_000_000]
++    );
++}
