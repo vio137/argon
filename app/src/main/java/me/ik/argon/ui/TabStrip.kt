@@ -102,7 +102,9 @@ fun ArgonTabStrip(
                     // Compact density: favicon when the engine has pushed one
                     // (patch 055), else the per-site tinted monogram; close
                     // only on the active chip so background chips stay tap
-                    // targets.
+                    // targets. Row keeps the active chip's close target beside
+                    // the icon; stacked Boxes would overlay x onto the glyph.
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(contentAlignment = Alignment.Center, modifier = Modifier.height(48.dp)) {
                         if (favicon != null) {
                             Image(
@@ -136,6 +138,7 @@ fun ArgonTabStrip(
                         ) {
                             Text("×", color = ArgonColors.Text3, fontSize = 15.sp)
                         }
+                    }
                     }
                 } else {
                 Row(
