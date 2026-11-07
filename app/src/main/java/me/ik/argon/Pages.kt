@@ -344,9 +344,6 @@ fun SettingsScreen(
     onHttpsOnly: (Boolean) -> Unit,
     clearOnExit: Boolean,
     onClearOnExit: (Boolean) -> Unit,
-    toolbarTop: Boolean,
-    toolbarTopVisible: Boolean,
-    onToolbarTop: (Boolean) -> Unit,
     onExportBookmarks: () -> Unit,
     onImportBookmarks: () -> Unit,
     onClearHistory: (Long?) -> Unit,
@@ -377,14 +374,6 @@ fun SettingsScreen(
                     checked = httpsOnly,
                     onCheckedChange = onHttpsOnly,
                 )
-                if (toolbarTopVisible) {
-                    SettingSwitch(
-                        title = "Toolbar on top (experimental)",
-                        subtitle = "Move the address bar to the top. Layout not yet visually verified; default bottom is unaffected",
-                        checked = toolbarTop,
-                        onCheckedChange = onToolbarTop,
-                    )
-                }
                 SettingSwitch(
                     title = "Clear history on exit",
                     subtitle = "Clears Argon's history list when the app is closed. Engine cookies and cache are not cleared",

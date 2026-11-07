@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -80,7 +79,6 @@ fun ArgonCommandBar(
     onStopOrReload: () -> Unit,
     onMenu: () -> Unit,
     onEscape: () -> Unit = {},
-    topBar: Boolean = false,
     loadingArc: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -91,9 +89,7 @@ fun ArgonCommandBar(
         modifier =
             modifier
                 .fillMaxWidth()
-                // Bottom bar clears the gesture/nav area; top bar clears the
-                // status bar instead.
-                .then(if (topBar) Modifier.statusBarsPadding() else Modifier.navigationBarsPadding())
+                .navigationBarsPadding()
                 .imePadding()
                 .padding(horizontal = 12.dp, vertical = 10.dp)
                 .height(56.dp)

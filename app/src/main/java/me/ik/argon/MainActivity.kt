@@ -120,7 +120,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var lastShareAt: Long = 0L
     private var httpsOnly by mutableStateOf(false)
     private var clearOnExit by mutableStateOf(false)
-    private var toolbarTop by mutableStateOf(false)
 
     private val exportBookmarksLauncher =
         registerForActivityResult(ActivityResultContracts.CreateDocument("text/html")) { uri ->
@@ -241,9 +240,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
         prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         adblock = prefs.getBoolean("adblock", true)
         showOnboarding = !prefs.getBoolean("onboarded", false)
-        // Experimental-only until the flipped layout has spatial evidence;
-        // stays bottom otherwise even if the pref was once set.
-        toolbarTop = prefs.getBoolean("toolbar_top", false) && prefs.getBoolean("experimental", false)
         httpsOnly = prefs.getBoolean("https_only", false)
         clearOnExit = prefs.getBoolean("clear_on_exit", false)
         experimental = prefs.getBoolean("experimental", false)
@@ -325,9 +321,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 // the system bar stays visible and readable and
                                 // web content never draws under it.
                                 .statusBarsPadding()
-                                // Reserve the chrome zone on the bar's side so
-                                // page content never renders under the bar.
-                                .padding(top = if (toolbarTop) 76.dp else 0.dp, bottom = if (toolbarTop) 0.dp else 76.dp)
+                                // Reserve the bottom chrome zone so page content
+                                // never renders under the floating bar.
+                                .padding(bottom = 76.dp)
                                 .imePadding()
                                 .focusRequester(servoFocusRequester),
                     )
@@ -361,8 +357,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         onMenu = { showMenu = true },
                         loadingArc = { LoadingArc() },
                         onEscape = { focusManager.clearFocus() },
-                        topBar = toolbarTop,
-                        modifier = Modifier.align(if (toolbarTop) Alignment.TopCenter else Alignment.BottomCenter),
+                        modifier = Modifier.align(Alignment.BottomCenter),
                     )
                     val omniboxQuery = urlState.text.toString()
                     if (omniboxFocused && omniboxQuery.isBlank()) {
@@ -385,13 +380,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 servoFocusRequester.requestFocus()
                             },
                             modifier =
-                                Modifier.align(if (toolbarTop) Alignment.TopCenter else Alignment.BottomCenter)
-                                    .padding(
-                                        start = 12.dp,
-                                        end = 12.dp,
-                                        top = if (toolbarTop) 84.dp else 0.dp,
-                                        bottom = if (toolbarTop) 0.dp else 84.dp,
-                                    ),
+                                Modifier.align(Alignment.BottomCenter)
+                                    .padding(start = 12.dp, end = 12.dp, bottom = 84.dp),
                         )
                         // Back closes the suggestions first; the focus-loss
                         // handler restores the current host in the field.
@@ -703,10 +693,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
             onExperimental = {
                 experimental = it
                 prefs.edit().putBoolean("experimental", it).apply()
-                if (!it && toolbarTop) {
-                    toolbarTop = false
-                    prefs.edit().putBoolean("toolbar_top", false).apply()
-                }
             },
             httpsOnly = httpsOnly,
             onHttpsOnly = {
@@ -717,12 +703,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
             onClearOnExit = {
                 clearOnExit = it
                 prefs.edit().putBoolean("clear_on_exit", it).apply()
-            },
-            toolbarTop = toolbarTop,
-            toolbarTopVisible = experimental,
-            onToolbarTop = {
-                toolbarTop = it
-                prefs.edit().putBoolean("toolbar_top", it).apply()
             },
             onExportBookmarks = { exportBookmarksLauncher.launch("argon-bookmarks.html") },
             onImportBookmarks = { importBookmarksLauncher.launch(arrayOf("text/html", "text/*", "application/octet-stream")) },

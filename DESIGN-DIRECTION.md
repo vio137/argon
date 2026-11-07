@@ -100,10 +100,14 @@ clear, find in page (EXPERIMENTAL: bridge runtime-unverified), motion layer +
 reduced-motion compliance, 48dp touch targets, state-aware star toggle,
 onboarding skip + back steps, system-back chain with press-again exit,
 About version from BuildConfig, no shipped sample bookmarks, no Reader/ViewDOM
-(user-directed, permanent).
+(user-directed, effective until the user changes their intent).
 
 Excluded from the next build: Reader view and View DOM (user's own words,
-2026-11-07). Toolbar-on-top ships as experimental-only (settings row visible
-only under "Experimental web features", inert otherwise) until the flipped
-layout has spatial evidence gathered under allowed methods. Tabs and the
-network-error page are open gaps under investigation, not in this build.
+2026-11-07; exclusion holds until the user changes their intent, it is not
+irrevocable). Toolbar-on-top is excluded from the delivered build entirely -
+no UI, no activation path - until the flipped layout has spatial evidence
+gathered under allowed methods; the source is preserved on branch
+exp-toolbar-top for later. Interface copy never carries test badges or
+verification disclaimers; caveats live in handoffs and this file, not in the
+shipped UI. Tabs and the network-error page are open gaps under
+investigation, not in this build.
