@@ -121,6 +121,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     private var pendingContextMenu by mutableStateOf<PendingContextMenu?>(null)
 
+    /** Tab strip long-press menu target (webview id). */
+    private var tabStripMenuId by mutableStateOf<String?>(null)
+
     // Top-level load failure reported by the engine (patch 020 v3); shown
     // only when its (webviewId, pipelineId, generation) triple matches the
     // current request identity held by loadErrorGate. URL is display payload
@@ -707,6 +710,48 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             },
                         )
                     }
+                    tabStripMenuId?.let { menuId ->
+                        AlertDialog(
+                            onDismissRequest = { tabStripMenuId = null },
+                            title = {
+                                Text(
+                                    tabManager.states[menuId]?.title?.ifBlank { null }
+                                        ?: hostOf(displayableUrl(tabManager.states[menuId]?.url ?: ""))
+                                )
+                            },
+                            text = {
+                                Column {
+                                    TextButton(
+                                        onClick = {
+                                            tabStripMenuId = null
+                                            closeTab(menuId)
+                                        },
+                                        modifier = Modifier.fillMaxWidth(),
+                                    ) { Text("Close tab") }
+                                    if (tabManager.order.size > 1) {
+                                        TextButton(
+                                            onClick = {
+                                                tabStripMenuId = null
+                                                tabManager.order.filter { it != menuId }.forEach { closeTab(it) }
+                                            },
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) { Text("Close other tabs") }
+                                    }
+                                    TextButton(
+                                        onClick = {
+                                            tabStripMenuId = null
+                                            val url = tabManager.states[menuId]?.url ?: ""
+                                            openNewTab(url.ifBlank { startPageUrl })
+                                        },
+                                        modifier = Modifier.fillMaxWidth(),
+                                    ) { Text("Duplicate tab") }
+                                }
+                            },
+                            confirmButton = {
+                                TextButton(onClick = { tabStripMenuId = null }) { Text("Cancel") }
+                            },
+                        )
+                    }
                     alertMessage?.let { message ->
                         AlertDialog(
                             onDismissRequest = { alertMessage = null },
@@ -800,6 +845,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 onSelect = { switchToTab(it) },
                 onClose = { closeTab(it) },
                 onNew = { openNewTab(startPageUrl) },
+                onLongPress = { tabStripMenuId = it },
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),
             )
         }

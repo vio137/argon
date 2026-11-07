@@ -1,6 +1,8 @@
 package me.ik.argon.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
@@ -31,12 +33,14 @@ data class TabStripData(val chips: List<Pair<String, String>>, val activeId: Str
  * close affordance per chip, and a trailing new-tab button. Selection state
  * and per-tab data are owned by MainActivity's TabManager; this composable is
  * pure presentation. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ArgonTabStrip(
     data: TabStripData,
     onSelect: (String) -> Unit,
     onClose: (String) -> Unit,
     onNew: () -> Unit,
+    onLongPress: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -49,7 +53,11 @@ fun ArgonTabStrip(
             Surface(
                 color = if (selected) ArgonColors.SurfaceHigh else ArgonColors.Surface,
                 shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.clickable { onSelect(id) },
+                modifier =
+                    Modifier.combinedClickable(
+                        onClick = { onSelect(id) },
+                        onLongClick = { onLongPress(id) },
+                    ),
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
