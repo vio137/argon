@@ -85,6 +85,7 @@ fun ArgonCommandBar(
     onBack: () -> Unit,
     onStopOrReload: () -> Unit,
     onMenu: () -> Unit,
+    onLeadingShortcut: (() -> Unit)? = null,
     onEscape: () -> Unit = {},
     recentHistory: List<Pair<String, String>> = emptyList(),
     onPickHistory: (String) -> Unit = {},
@@ -159,11 +160,25 @@ fun ArgonCommandBar(
                         }
                     }
                 }
+                if (onLeadingShortcut != null) {
+                    ChromeIconButton(
+                        onClick = onLeadingShortcut,
+                        description = "Shortcut",
+                        enabled = true,
+                    ) {
+                        ChromeGlyph(
+                            if (secure) R.drawable.ic_lock else R.drawable.ic_search,
+                            "Shortcut",
+                            if (secure) ArgonColors.Accent else ArgonColors.Text3,
+                        )
+                    }
+                } else {
                 ChromeGlyph(
                     if (secure) R.drawable.ic_lock else R.drawable.ic_search,
                     null,
                     if (secure) ArgonColors.Accent else ArgonColors.Text3,
                 )
+                }
                 Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                     if (urlState.text.isEmpty()) {
                         androidx.compose.material3.Text(

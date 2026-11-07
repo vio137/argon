@@ -289,6 +289,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private lateinit var history: HistoryStore
     private lateinit var recentlyClosed: RecentlyClosedStore
     private var libraryInitialTab = 0
+    private var omniboxShortcut by mutableStateOf(OmniboxShortcut.NONE)
     private lateinit var bookmarks: BookmarkStore
     private val navigator get() = ServoHolder.navigator
 
@@ -340,6 +341,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
         clearOnExit = prefs.getBoolean("clear_on_exit", false)
         compactTabs = prefs.getBoolean("compact_tabs", false)
         tabCloseButtons = prefs.getBoolean("tab_close_buttons", true)
+        omniboxShortcut =
+            runCatching {
+                    OmniboxShortcut.valueOf(
+                        prefs.getString("omnibox_shortcut", "NONE") ?: "NONE"
+                    )
+                }
+                .getOrDefault(OmniboxShortcut.NONE)
         experimental = prefs.getBoolean("experimental", false)
         searchEngine = SearchEngine.fromPref(prefs.getString("engine", null))
         Blocklist.apply(this, adblock)
@@ -480,6 +488,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         isLoading = isLoading,
                         focused = omniboxFocused,
                         secure = currentUrl.startsWith("https://"),
+                        onLeadingShortcut =
+                            if (omniboxShortcut == OmniboxShortcut.NONE) null
+                            else ({ runOmniboxShortcut() }),
                         onFocusChange = { nowFocused ->
                             if (nowFocused && !omniboxFocused) {
                                 omniboxFocused = true
@@ -945,6 +956,39 @@ class MainActivity : ComponentActivity(), Servo.Client {
         )
     }
 
+    private fun runOmniboxShortcut() {
+        when (omniboxShortcut) {
+            OmniboxShortcut.NONE -> {}
+            OmniboxShortcut.ADBLOCK -> {
+                adblock = !adblock
+                prefs.edit().putBoolean("adblock", adblock).apply()
+                Blocklist.apply(this, adblock)
+                restartDialog = true
+            }
+            OmniboxShortcut.BOOKMARK -> {
+                val existing = bookmarks.entries.firstOrNull { it.url == currentUrl }
+                if (existing != null) bookmarks.remove(existing)
+                else if (currentUrl.startsWith("https://") || currentUrl.startsWith("http://")) {
+                    bookmarks.add(currentTitle, currentUrl)
+                }
+                refreshStartPage()
+            }
+            OmniboxShortcut.SHARE -> {
+                if (currentUrl.isNotEmpty() && !currentUrl.startsWith("file://")) {
+                    val send =
+                        Intent(Intent.ACTION_SEND)
+                            .setType("text/plain")
+                            .putExtra(
+                                Intent.EXTRA_TEXT,
+                                if (currentTitle.isBlank()) currentUrl else "$currentTitle\n$currentUrl",
+                            )
+                    startActivity(Intent.createChooser(send, null))
+                }
+            }
+            OmniboxShortcut.LIBRARY -> screen = Screen.Library
+        }
+    }
+
     private fun showWaxManager() {
         FreshWaxManagementDialog.show(this, refreshWaxState()) { action ->
             handleWaxEffect(WaxManagement.effect(refreshWaxState(), action))
@@ -1148,6 +1192,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
             onClearOnExit = {
                 clearOnExit = it
                 prefs.edit().putBoolean("clear_on_exit", it).apply()
+            },
+            omniboxShortcut = omniboxShortcut,
+            onOmniboxShortcut = {
+                omniboxShortcut = it
+                prefs.edit().putString("omnibox_shortcut", it.name).apply()
             },
             compactTabs = compactTabs,
             onCompactTabs = {

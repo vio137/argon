@@ -261,6 +261,15 @@ private fun startOfTodayMs(): Long {
  * at or after it are deleted, or null for "delete everything".
  */
 @Composable
+/** User-configurable action for the omnibox leading icon (Vivaldi F). */
+enum class OmniboxShortcut(val label: String) {
+    NONE("None - icon only"),
+    ADBLOCK("Toggle ad blocking"),
+    BOOKMARK("Bookmark this page"),
+    SHARE("Share this page"),
+    LIBRARY("Open library"),
+}
+
 /** Unified library panel (Vivaldi C): Bookmarks and History under one top
  * bar with a segmented switcher, reusing the existing page bodies embedded. */
 @Composable
@@ -439,6 +448,8 @@ fun SettingsScreen(
     onHttpsOnly: (Boolean) -> Unit,
     clearOnExit: Boolean,
     onClearOnExit: (Boolean) -> Unit,
+    omniboxShortcut: OmniboxShortcut,
+    onOmniboxShortcut: (OmniboxShortcut) -> Unit,
     compactTabs: Boolean,
     onCompactTabs: (Boolean) -> Unit,
     closeButtonsBackgroundTabs: Boolean,
@@ -449,6 +460,7 @@ fun SettingsScreen(
     onBack: () -> Unit,
 ) {
     var engineDialog by remember { mutableStateOf(false) }
+    var shortcutDialog by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
         Column(Modifier.fillMaxSize()) {
@@ -466,6 +478,11 @@ fun SettingsScreen(
                     title = "Search engine",
                     subtitle = searchEngine.label,
                     onClick = { engineDialog = true },
+                )
+                SettingClick(
+                    title = "Address-bar shortcut",
+                    subtitle = omniboxShortcut.label,
+                    onClick = { shortcutDialog = true },
                 )
                 SettingSwitch(
                     title = "HTTPS-only",
@@ -518,6 +535,37 @@ fun SettingsScreen(
                 )
             }
         }
+    }
+    if (shortcutDialog) {
+        AlertDialog(
+            onDismissRequest = { shortcutDialog = false },
+            title = { Text("Address-bar shortcut") },
+            text = {
+                Column {
+                    OmniboxShortcut.entries.forEach { option ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .clickable {
+                                        onOmniboxShortcut(option)
+                                        shortcutDialog = false
+                                    }
+                                    .padding(vertical = 4.dp),
+                        ) {
+                            RadioButton(
+                                selected = option == omniboxShortcut,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(selectedColor = ArgonColors.Accent),
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(option.label, color = ArgonColors.Text, style = ArgonType.BodySmall)
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+        )
     }
     if (engineDialog) {
         AlertDialog(
