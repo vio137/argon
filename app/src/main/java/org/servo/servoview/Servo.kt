@@ -11,7 +11,10 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Size
 import android.view.KeyEvent
+import android.os.Handler
+import android.os.Looper
 import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.Surface
 import android.view.inputmethod.BaseInputConnection
 import androidx.activity.compose.BackHandler
@@ -134,6 +137,12 @@ fun Servo(
     val resources = LocalResources.current
     val appContext = LocalContext.current
     val focusRequester = remember { FocusRequester() }
+    // Argon (engine patch 054): long-press fires the engine context menu.
+    // Handler-timed; canceled by a slop-exceeding move, up, cancel, or an
+    // additional pointer. After it fires, the gesture's UP is delivered as a
+    // cancel so the engine never sees a stray click on the long-pressed link.
+    val longPressHandler = remember { Handler(Looper.getMainLooper()) }
+    val longPressState = remember { LongPressState() }
     AndroidExternalSurface(
         modifier =
             modifier
@@ -167,6 +176,11 @@ fun Servo(
                     if (motionEvent.actionMasked == MotionEvent.ACTION_DOWN) {
                         focusRequester.requestFocus()
                     }
+                    longPressState.onEvent(
+                        motionEvent,
+                        longPressHandler,
+                        ViewConfiguration.get(appContext).scaledTouchSlop,
+                    ) { x, y -> servo.contextMenuAt(x, y) }
 
                     val action = motionEvent.actionMasked
                     // Engine patch 052: the event's own timestamp (uptime
@@ -198,7 +212,11 @@ fun Servo(
                         MotionEvent.ACTION_UP,
                         MotionEvent.ACTION_POINTER_UP -> {
                             val i = motionEvent.actionIndex
-                            servo.touchUp(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i), eventTs)
+                            if (action == MotionEvent.ACTION_UP && longPressState.consumeFired()) {
+                                servo.touchCancel(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i), eventTs)
+                            } else {
+                                servo.touchUp(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i), eventTs)
+                            }
                         }
                         MotionEvent.ACTION_CANCEL -> {
                             val i = motionEvent.actionIndex.coerceAtMost(motionEvent.pointerCount - 1)
@@ -567,6 +585,16 @@ internal constructor(
             jni.touchCancel(x, y, pointerId, eventTimeNanos)
         }
     }
+    /** Argon (engine patch 054): long-press context menu trigger. */
+    fun contextMenuAt(x: Float, y: Float) {
+        scope.launch(glDispatcher) { jni.contextMenuAt(x, y) }
+    }
+
+    /** Argon (engine patch 054): reply to a context menu. */
+    fun contextMenuResult(handle: Int, itemIndex: Int) {
+        scope.launch(glDispatcher) { jni.contextMenuResult(handle, itemIndex) }
+    }
+
 
     fun pausePainting() {
         scope.launch(glDispatcher) {
@@ -613,7 +641,82 @@ internal constructor(
     }
 
     interface Client {
-        /** All webview-state callbacks carry the source webview id (engine
+        /** Argon (engine patch 054): tracks one long-press gesture. [onEvent] arms a
+ * handler timer on DOWN and cancels it on slop-exceeding move, UP, CANCEL or
+ * an extra pointer; on timeout it invokes the callback with the down
+ * coordinates. [consumeFired] reports (once) that the current gesture already
+ * opened the menu, so its UP becomes a cancel rather than a click. */
+/** Argon (engine patch 054): one context-menu entry; null label = separator. */
+class ContextMenuEntry(val label: String?, val enabled: Boolean)
+
+private class LongPressState {
+    private var armed = false
+    private var fired = false
+    private var downX = 0f
+    private var downY = 0f
+    private var slopSq = 0f
+    private var pending: Runnable? = null
+
+    fun onEvent(
+        ev: MotionEvent,
+        handler: Handler,
+        slop: Int,
+        onLongPress: (Float, Float) -> Unit,
+    ) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                cancelPending(handler)
+                armed = true
+                fired = false
+                downX = ev.x
+                downY = ev.y
+                slopSq = (slop * slop).toFloat()
+                val r = Runnable {
+                    if (armed) {
+                        fired = true
+                        armed = false
+                        onLongPress(downX, downY)
+                    }
+                }
+                pending = r
+                handler.postDelayed(r, ViewConfiguration.getLongPressTimeout().toLong())
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (armed) {
+                    val dx = ev.x - downX
+                    val dy = ev.y - downY
+                    if (dx * dx + dy * dy > slopSq) {
+                        armed = false
+                        cancelPending(handler)
+                    }
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                armed = false
+                cancelPending(handler)
+            }
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL -> {
+                armed = false
+                cancelPending(handler)
+            }
+        }
+    }
+
+    private fun cancelPending(handler: Handler) {
+        pending?.let { handler.removeCallbacks(it) }
+        pending = null
+    }
+
+    /** True exactly once after the menu fired for the current gesture. */
+    fun consumeFired(): Boolean {
+        val f = fired
+        fired = false
+        return f
+    }
+}
+
+/** All webview-state callbacks carry the source webview id (engine
          * patch 030 v2); clients route by source, never by assumed-current. */
         fun onAlert(webviewId: String, message: String)
 
@@ -640,6 +743,17 @@ internal constructor(
         )
 
         fun onTopLevelLoad(webviewId: String, pipelineId: String, url: String, generation: Long)
+
+        /** Argon (engine patch 054): web-content context menu. items are
+         * (label, enabled); null label = separator. linkUrl/imageUrl null
+         * when absent. Reply with Servo.contextMenuResult(handle, index|-1). */
+        fun onContextMenu(
+            webviewId: String,
+            handle: Int,
+            linkUrl: String?,
+            imageUrl: String?,
+            items: List<ContextMenuEntry>,
+        )
     }
 
     private class Callbacks(
@@ -684,6 +798,37 @@ internal constructor(
 
         override fun onAlert(webviewId: String, message: String) {
             scope.launch { client.onAlert(webviewId, message) }
+        }
+
+        override fun onContextMenu(
+            webviewId: String,
+            handle: Int,
+            flags: Int,
+            linkUrl: String,
+            imageUrl: String,
+            x: Int,
+            y: Int,
+            width: Int,
+            height: Int,
+            labelsJoined: String,
+            enabledJoined: String,
+        ) {
+            val labels = labelsJoined.split('\n')
+            val items =
+                labels.mapIndexed { i, label ->
+                    val enabled = enabledJoined.getOrNull(i) == '1'
+                    if (label.isEmpty()) ContextMenuEntry(null, false)
+                    else ContextMenuEntry(label, enabled)
+                }
+            scope.launch {
+                client.onContextMenu(
+                    webviewId,
+                    handle,
+                    linkUrl.ifEmpty { null },
+                    imageUrl.ifEmpty { null },
+                    items,
+                )
+            }
         }
 
         override fun onImeShow() {

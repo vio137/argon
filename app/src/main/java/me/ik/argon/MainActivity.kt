@@ -25,6 +25,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -43,6 +44,7 @@ import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.foundation.text.input.selectAll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
@@ -104,6 +106,20 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var currentUrl by mutableStateOf("")
     private var currentTitle by mutableStateOf("")
     private var alertMessage by mutableStateOf<String?>(null)
+
+    /** Argon (engine patch 054): pending web-content context menu. Bound to
+     * its source webview id + engine handle; replied exactly once via
+     * Servo.contextMenuResult and cleared on selection, dismissal,
+     * navigation of the same webview, or tab close/switch. */
+    private class PendingContextMenu(
+        val webviewId: String,
+        val handle: Int,
+        val linkUrl: String?,
+        val imageUrl: String?,
+        val items: List<org.servo.servoview.ContextMenuEntry>,
+    )
+
+    private var pendingContextMenu by mutableStateOf<PendingContextMenu?>(null)
 
     // Top-level load failure reported by the engine (patch 020 v3); shown
     // only when its (webviewId, pipelineId, generation) triple matches the
@@ -659,6 +675,38 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             },
                         )
                     }
+                    pendingContextMenu?.let { menu ->
+                        AlertDialog(
+                            onDismissRequest = { dismissContextMenu(menu) },
+                            title = {
+                                Text(
+                                    menu.linkUrl?.let { hostOf(it) }
+                                        ?: menu.imageUrl?.let { hostOf(it) }
+                                        ?: ""
+                                )
+                            },
+                            text = {
+                                Column {
+                                    menu.items.forEachIndexed { index, entry ->
+                                        if (entry.label == null) {
+                                            HorizontalDivider()
+                                        } else {
+                                            TextButton(
+                                                enabled = entry.enabled,
+                                                onClick = { answerContextMenu(menu, index) },
+                                                modifier = Modifier.fillMaxWidth(),
+                                            ) {
+                                            Text(entry.label)
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            confirmButton = {
+                                TextButton(onClick = { dismissContextMenu(menu) }) { Text("Cancel") }
+                            },
+                        )
+                    }
                     alertMessage?.let { message ->
                         AlertDialog(
                             onDismissRequest = { alertMessage = null },
@@ -908,6 +956,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
     }
 
     override fun onUrlChanged(webviewId: String, url: String) {
+        // Argon (engine patch 054): a navigation invalidates the page's
+        // pending context menu; reply dismiss and drop the UI.
+        pendingContextMenu?.let { if (it.webviewId == webviewId) dismissContextMenu(it) }
         val tab = tabManager.route(webviewId) ?: return
         tab.url = url
         tabStripVersion++
@@ -928,6 +979,34 @@ class MainActivity : ComponentActivity(), Servo.Client {
             navigator.canGoBack = canGoBack
             navigator.canGoForward = canGoForward
         }
+    }
+
+    /** Argon (engine patch 054): reply -1 (dismiss) if not already answered. */
+    private fun dismissContextMenu(menu: PendingContextMenu) {
+        if (pendingContextMenu === menu) pendingContextMenu = null
+        ServoHolder.servo?.contextMenuResult(menu.handle, -1)
+    }
+
+    private fun answerContextMenu(menu: PendingContextMenu, index: Int) {
+        if (pendingContextMenu === menu) pendingContextMenu = null
+        ServoHolder.servo?.contextMenuResult(menu.handle, index)
+    }
+
+    override fun onContextMenu(
+        webviewId: String,
+        handle: Int,
+        linkUrl: String?,
+        imageUrl: String?,
+        items: List<org.servo.servoview.ContextMenuEntry>,
+    ) {
+        // Only the active tab's menu is shown; a stale/background request is
+        // dismissed immediately so the engine never waits on invisible UI.
+        if (!tabManager.isActive(webviewId)) {
+            ServoHolder.servo?.contextMenuResult(handle, -1)
+            return
+        }
+        pendingContextMenu?.let { ServoHolder.servo?.contextMenuResult(it.handle, -1) }
+        pendingContextMenu = PendingContextMenu(webviewId, handle, linkUrl, imageUrl, items)
     }
 
     // ---- tab operations (engine patch 030 JNI: newTab/activateTab/closeTab) ----
@@ -957,6 +1036,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         val scope = uiScope ?: return
         val servo = ServoHolder.servo ?: return
         scope.launch {
+            pendingContextMenu?.let { dismissContextMenu(it) }
             if (!servo.activateTab(id)) return@launch
             tabManager.markActive(id)
             loadError = null
@@ -988,6 +1068,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
      * never adopted are tombstoned too, closing the liveness gap for views
      * that lived and died entirely engine-side. */
     override fun onTabClosed(webviewId: String) {
+        pendingContextMenu?.let { if (it.webviewId == webviewId) dismissContextMenu(it) }
         val known = tabManager.states.containsKey(webviewId)
         val wasActive = tabManager.onClosed(webviewId)
         if (!known) return

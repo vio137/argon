@@ -87,6 +87,15 @@ internal class JNIServo {
      * 0 = unknown. Engine patch 052: drives refresh-rate-independent fling decay. */
     external fun doFrame(frameTimeNanos: Long)
 
+    /** Argon (engine patch 054): trigger the engine context-menu path at
+     * viewport coordinates (secondary-button down/up; page can cancel via the
+     * contextmenu event). */
+    external fun contextMenuAt(x: Float, y: Float)
+
+    /** Argon (engine patch 054): reply to onContextMenu. itemIndex >= 0
+     * selects that item; -1 dismisses. Unknown/stale handles are ignored. */
+    external fun contextMenuResult(handle: Int, itemIndex: Int)
+
     interface Callbacks {
         fun wakeup()
 
@@ -135,5 +144,24 @@ internal class JNIServo {
 
         /** Argon: result of evaluateScript; exactly one of json/error is non-null. */
         fun onJsResult(requestId: Int, json: String?, error: String?)
+
+        /** Argon (engine patch 054): web-content context menu requested.
+         * labelsJoined: items separated by a newline (empty label = separator;
+         * engine labels are fixed literals, never contain newlines).
+         * enabledJoined: parallel '1'/'0' per item. linkUrl/imageUrl empty
+         * when absent. x/y/width/height bound the hit element in viewport px. */
+        fun onContextMenu(
+            webviewId: String,
+            handle: Int,
+            flags: Int,
+            linkUrl: String,
+            imageUrl: String,
+            x: Int,
+            y: Int,
+            width: Int,
+            height: Int,
+            labelsJoined: String,
+            enabledJoined: String,
+        )
     }
 }
