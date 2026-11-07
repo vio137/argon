@@ -131,8 +131,7 @@ private fun OnboardingButton(label: String, primary: Boolean, onClick: () -> Uni
         Text(
             label,
             color = if (primary) ArgonColors.Bg else ArgonColors.Text,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.SemiBold,
+            style = ArgonType.BodySmall.copy(fontWeight = FontWeight.SemiBold),
         )
     }
 }
@@ -142,13 +141,11 @@ private fun PageHeader(title: String, body: String) {
     Text(
         title,
         color = ArgonColors.Text,
-        fontSize = 30.sp,
-        lineHeight = 36.sp,
-        fontWeight = FontWeight.Bold,
+        style = ArgonType.Hero,
         letterSpacing = (-0.5).sp,
     )
     Spacer(Modifier.height(14.dp))
-    Text(body, color = ArgonColors.Text2, fontSize = 16.sp, lineHeight = 24.sp)
+    Text(body, color = ArgonColors.Text2, style = ArgonType.BodySmall)
     Spacer(Modifier.height(32.dp))
 }
 
@@ -170,9 +167,9 @@ private fun WelcomePage() {
 @Composable
 private fun FeatureLine(title: String, subtitle: String) {
     Column {
-        Text(title, color = ArgonColors.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Text(title, color = ArgonColors.Text, style = ArgonType.Heading)
         Spacer(Modifier.height(2.dp))
-        Text(subtitle, color = ArgonColors.Text2, fontSize = 14.sp, lineHeight = 20.sp)
+        Text(subtitle, color = ArgonColors.Text2, style = ArgonType.Caption)
     }
 }
 
@@ -193,9 +190,9 @@ private fun PrivacyPage(adblock: Boolean, onAdblockChange: (Boolean) -> Unit) {
                     .padding(horizontal = 20.dp, vertical = 16.dp),
         ) {
             Column(Modifier.weight(1f)) {
-                Text("Ad and tracker blocking", color = ArgonColors.Text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                Text("Ad and tracker blocking", color = ArgonColors.Text, style = ArgonType.Heading)
                 Spacer(Modifier.height(2.dp))
-                Text("Recommended", color = ArgonColors.Text3, fontSize = 13.sp)
+                Text("Recommended", color = ArgonColors.Text3, style = ArgonType.Caption)
             }
             Switch(
                 checked = adblock,
@@ -247,7 +244,7 @@ private fun EnginePage(searchEngine: SearchEngine, onEngineChange: (SearchEngine
                             ),
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text(engine.label, color = ArgonColors.Text, fontSize = 15.sp)
+                    Text(engine.label, color = ArgonColors.Text, style = ArgonType.BodySmall)
                 }
                 if (i < SearchEngine.entries.size - 1) {
                     Box(Modifier.padding(start = 52.dp).fillMaxWidth().height(1.dp).background(ArgonColors.Hairline))
