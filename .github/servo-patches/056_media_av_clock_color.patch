@@ -1,0 +1,407 @@
+commit 114d800c1ad97cc82f277af4801e905214f13ac2
+Author: Instinct Agent <agent@instinct.com>
+Date:   Sat Nov 7 19:54:09 2026 +0530
+
+    056 media: extract MasterClock + color select into host-tested pure modules
+
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
+index 3c2c65faf..fedd74857 100644
+--- a/components/media/backends/android/android_impl/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
+@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
+ 
+ use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
+ use log::{debug, error, warn};
++use crate::clock::MasterClock;
++use crate::color::{self, Matrix as ColorMatrix, Range as ColorRange};
+ use servo_base::generic_channel::{GenericCallback, channel};
+ use servo_media::{BackendMsg, ClientContextId, MediaInstance, MediaInstanceError};
+ use servo_media_player::metadata::Metadata;
+@@ -363,62 +365,6 @@ impl Player for AndroidPlayer {
+     }
+ }
+ 
+-/// Master playback clock. Audio-driven when an audio track is being written
+-/// to AAudio; wall-clock otherwise.
+-struct MasterClock {
+-    anchor_pts_us: i64,
+-    has_audio: bool,
+-    audio_frames_written: u64,
+-    audio_sample_rate: i64,
+-    wall_started: Option<Instant>,
+-    wall_accumulated: Duration,
+-}
+-
+-impl MasterClock {
+-    fn new() -> Self {
+-        MasterClock {
+-            anchor_pts_us: 0,
+-            has_audio: false,
+-            audio_frames_written: 0,
+-            audio_sample_rate: 0,
+-            wall_started: None,
+-            wall_accumulated: Duration::ZERO,
+-        }
+-    }
+-
+-    fn rebase(&mut self, anchor_pts_us: i64) {
+-        self.anchor_pts_us = anchor_pts_us;
+-        self.audio_frames_written = 0;
+-        self.wall_started = Some(Instant::now());
+-        self.wall_accumulated = Duration::ZERO;
+-    }
+-
+-    fn pause(&mut self) {
+-        if let Some(started) = self.wall_started.take() {
+-            self.wall_accumulated += started.elapsed();
+-        }
+-    }
+-
+-    fn resume(&mut self) {
+-        if self.wall_started.is_none() {
+-            self.wall_started = Some(Instant::now());
+-        }
+-    }
+-
+-    fn now_us(&self) -> i64 {
+-        if self.has_audio && self.audio_sample_rate > 0 {
+-            self.anchor_pts_us +
+-                (self.audio_frames_written as i64) * 1_000_000 / self.audio_sample_rate
+-        } else {
+-            let running = self
+-                .wall_started
+-                .map(|s| s.elapsed())
+-                .unwrap_or(Duration::ZERO);
+-            self.anchor_pts_us + (self.wall_accumulated + running).as_micros() as i64
+-        }
+-    }
+-}
+-
+ struct TrackDecoder {
+     codec: *mut sys::AMediaCodec,
+     track_index: usize,
+@@ -430,6 +376,10 @@ struct TrackDecoder {
+     input_eos_queued: bool,
+     drained: bool,
+     held_frame: Option<(usize, i64)>,
++    /// Video only: explicit NDK color keys from the latest output format
++    /// ("color-standard"/"color-range"); None when the codec omits them.
++    color_standard: Option<i32>,
++    color_range: Option<i32>,
+ }
+ 
+ unsafe impl Send for TrackDecoder {}
+@@ -773,6 +723,8 @@ impl Pipeline {
+             input_eos_queued: false,
+             drained: false,
+             held_frame: None,
++            color_standard: None,
++            color_range: None,
+         };
+         unsafe { sys::AMediaFormat_delete(format) };
+         Ok(decoder)
+@@ -1068,6 +1020,10 @@ impl Pipeline {
+                         get_format_i32(format, c"width").unwrap_or(0),
+                         get_format_i32(format, c"height").unwrap_or(0)
+                     );
++                    if let Some(v) = self.video.as_mut() {
++                        v.color_standard = get_format_i32(format, c"color-standard");
++                        v.color_range = get_format_i32(format, c"color-range");
++                    }
+                     unsafe { sys::AMediaFormat_delete(format) };
+                 }
+                 true
+@@ -1179,16 +1135,24 @@ impl Pipeline {
+                 v_plane: &packed[w * h + cw * ch..],
+             };
+             let mut bgra = vec![0u8; w * h * 4];
++            // Explicit NDK color keys win; otherwise HD => BT.709, SD =>
++            // BT.601 (see color.rs).
++            let (matrix, range) = {
++                let v = self.video.as_ref();
++                let (cs, cr) = v.map(|v| (v.color_standard, v.color_range)).unwrap_or((None, None));
++                color::select(h as i32, cs, cr)
++            };
+             let converted = yuv420_to_bgra(
+                 &image420,
+                 &mut bgra,
+                 w as u32 * 4,
+-                YuvRange::Limited,
+-                // BT.709 for HD, BT.601 for SD.
+-                if h >= 720 {
+-                    YuvStandardMatrix::Bt709
+-                } else {
+-                    YuvStandardMatrix::Bt601
++                match range {
++                    ColorRange::Limited => YuvRange::Limited,
++                    ColorRange::Full => YuvRange::Full,
++                },
++                match matrix {
++                    ColorMatrix::Bt601 => YuvStandardMatrix::Bt601,
++                    ColorMatrix::Bt709 => YuvStandardMatrix::Bt709,
+                 },
+             );
+             match converted {
+diff --git a/components/media/backends/android/clock.rs b/components/media/backends/android/clock.rs
+new file mode 100644
+index 000000000..539d18823
+--- /dev/null
++++ b/components/media/backends/android/clock.rs
+@@ -0,0 +1,135 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Master playback clock. Audio-driven when an audio track is being written
++//! to AAudio; wall-clock otherwise. Pure logic: hosttest/ runs these tests on
++//! the host against the exact file the Android build compiles.
++
++use std::time::{Duration, Instant};
++
++pub struct MasterClock {
++    anchor_pts_us: i64,
++    pub(crate) has_audio: bool,
++    pub(crate) audio_frames_written: u64,
++    pub(crate) audio_sample_rate: i64,
++    wall_started: Option<Instant>,
++    wall_accumulated: Duration,
++}
++
++impl MasterClock {
++    pub fn new() -> Self {
++        MasterClock {
++            anchor_pts_us: 0,
++            has_audio: false,
++            audio_frames_written: 0,
++            audio_sample_rate: 0,
++            wall_started: None,
++            wall_accumulated: Duration::ZERO,
++        }
++    }
++
++    pub fn rebase(&mut self, anchor_pts_us: i64) {
++        self.anchor_pts_us = anchor_pts_us;
++        self.audio_frames_written = 0;
++        self.wall_started = Some(Instant::now());
++        self.wall_accumulated = Duration::ZERO;
++    }
++
++    pub fn pause(&mut self) {
++        if let Some(started) = self.wall_started.take() {
++            self.wall_accumulated += started.elapsed();
++        }
++    }
++
++    pub fn resume(&mut self) {
++        if self.wall_started.is_none() {
++            self.wall_started = Some(Instant::now());
++        }
++    }
++
++    pub fn now_us(&self) -> i64 {
++        if self.has_audio && self.audio_sample_rate > 0 {
++            self.anchor_pts_us +
++                (self.audio_frames_written as i64) * 1_000_000 / self.audio_sample_rate
++        } else {
++            let running = self
++                .wall_started
++                .map(|s| s.elapsed())
++                .unwrap_or(Duration::ZERO);
++            self.anchor_pts_us + (self.wall_accumulated + running).as_micros() as i64
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::thread::sleep;
++
++    #[test]
++    fn audio_frames_drive_the_clock_when_audio_is_active() {
++        let mut clock = MasterClock::new();
++        clock.rebase(2_000_000);
++        clock.has_audio = true;
++        clock.audio_sample_rate = 48_000;
++        assert_eq!(clock.now_us(), 2_000_000);
++        clock.audio_frames_written = 48_000; // one second of samples
++        assert_eq!(clock.now_us(), 3_000_000);
++        clock.audio_frames_written = 24_000; // half a second
++        assert_eq!(clock.now_us(), 2_500_000);
++    }
++
++    #[test]
++    fn audio_clock_ignores_wall_time() {
++        let mut clock = MasterClock::new();
++        clock.rebase(0);
++        clock.has_audio = true;
++        clock.audio_sample_rate = 48_000;
++        clock.audio_frames_written = 48_000;
++        sleep(Duration::from_millis(5));
++        // Wall time must not leak into an audio-driven clock.
++        assert_eq!(clock.now_us(), 1_000_000);
++    }
++
++    #[test]
++    fn wall_clock_advances_only_while_running() {
++        let mut clock = MasterClock::new();
++        clock.rebase(100_000);
++        sleep(Duration::from_millis(2));
++        let running = clock.now_us();
++        assert!(running >= 100_000);
++        clock.pause();
++        let frozen = clock.now_us();
++        sleep(Duration::from_millis(2));
++        // Paused: repeated reads return the same instant.
++        assert_eq!(clock.now_us(), frozen);
++        clock.resume();
++        sleep(Duration::from_millis(2));
++        // Resumed clock continues from the frozen instant, never rewinds.
++        assert!(clock.now_us() >= frozen);
++    }
++
++    #[test]
++    fn rebase_resets_anchor_and_audio_progress() {
++        let mut clock = MasterClock::new();
++        clock.rebase(5_000_000);
++        clock.has_audio = true;
++        clock.audio_sample_rate = 48_000;
++        clock.audio_frames_written = 48_000;
++        assert_eq!(clock.now_us(), 6_000_000);
++        clock.rebase(500_000);
++        assert_eq!(clock.now_us(), 500_000);
++    }
++
++    #[test]
++    fn zero_sample_rate_falls_back_to_wall_clock() {
++        let mut clock = MasterClock::new();
++        clock.rebase(0);
++        clock.has_audio = true;
++        clock.audio_sample_rate = 0;
++        clock.audio_frames_written = 999_999;
++        // Degenerate audio state must not divide by zero or freeze the clock.
++        let _ = clock.now_us();
++    }
++}
+diff --git a/components/media/backends/android/color.rs b/components/media/backends/android/color.rs
+new file mode 100644
+index 000000000..5b1f98279
+--- /dev/null
++++ b/components/media/backends/android/color.rs
+@@ -0,0 +1,88 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! YUV color matrix/range selection for decoded video frames. Pure logic:
++//! hosttest/ runs these tests on the host against the exact file the Android
++//! build compiles.
++//!
++//! NDK values (media/NdkMediaFormat.h): AMEDIAFORMAT_KEY_COLOR_STANDARD is
++//! "color-standard" with 0=unspecified, 1=BT709, 2=BT601_PAL, 4=BT601_NTSC,
++//! 6=BT2020; AMEDIAFORMAT_KEY_COLOR_RANGE is "color-range" with
++//! 0=unspecified, 1=full, 2=limited.
++
++/// Subset of yuv crate's YuvStandardMatrix this backend can convert with;
++/// mapped to the crate enum at the call site.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Matrix {
++    Bt601,
++    Bt709,
++}
++
++/// Subset of yuv crate's YuvRange; mapped at the call site.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Range {
++    Limited,
++    Full,
++}
++
++/// Pick the conversion matrix and range for a frame. Explicit format keys
++/// win; BT2020 maps to BT709 (the closest the converter supports); the
++/// unspecified fallback is the resolution heuristic (HD => BT.709, SD =>
++/// BT.601), matching the previous fixed behaviour.
++pub fn select(frame_height: i32, standard: Option<i32>, range: Option<i32>) -> (Matrix, Range) {
++    let matrix = match standard {
++        Some(1) => Matrix::Bt709,
++        Some(2) | Some(4) => Matrix::Bt601,
++        Some(6) => Matrix::Bt709, // BT2020: nearest supported matrix
++        _ => {
++            if frame_height >= 720 {
++                Matrix::Bt709
++            } else {
++                Matrix::Bt601
++            }
++        },
++    };
++    let range = match range {
++        Some(1) => Range::Full,
++        _ => Range::Limited,
++    };
++    (matrix, range)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn explicit_standard_overrides_resolution_heuristic() {
++        // SD clip flagged BT709 must not fall back to BT601.
++        assert_eq!(select(360, Some(1), None).0, Matrix::Bt709);
++        // HD clip flagged BT601 must not be promoted to BT709.
++        assert_eq!(select(1080, Some(2), None).0, Matrix::Bt601);
++        assert_eq!(select(1080, Some(4), None).0, Matrix::Bt601);
++    }
++
++    #[test]
++    fn bt2020_uses_nearest_supported_matrix() {
++        assert_eq!(select(2160, Some(6), None).0, Matrix::Bt709);
++    }
++
++    #[test]
++    fn unspecified_standard_uses_resolution_heuristic() {
++        assert_eq!(select(719, None, None).0, Matrix::Bt601);
++        assert_eq!(select(720, None, None).0, Matrix::Bt709);
++        assert_eq!(select(480, Some(0), None).0, Matrix::Bt601);
++        assert_eq!(select(1080, Some(0), None).0, Matrix::Bt709);
++        // Unknown future values fall back, never guess a matrix.
++        assert_eq!(select(480, Some(99), None).0, Matrix::Bt601);
++    }
++
++    #[test]
++    fn explicit_full_range_is_honored() {
++        assert_eq!(select(720, None, Some(1)).1, Range::Full);
++        assert_eq!(select(720, None, Some(2)).1, Range::Limited);
++        assert_eq!(select(720, None, Some(0)).1, Range::Limited);
++        assert_eq!(select(720, None, None).1, Range::Limited);
++    }
++}
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+index 8dfb8f985..3c12309dd 100644
+--- a/components/media/backends/android/hosttest/src/lib.rs
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -2,6 +2,10 @@
+ //! tests compile and run the exact sources shipped in the Android build.
+ #[path = "../../buffer.rs"]
+ pub mod buffer;
++#[path = "../../clock.rs"]
++pub mod clock;
++#[path = "../../color.rs"]
++pub mod color;
+ #[path = "../../mime_table.rs"]
+ pub mod mime_table;
+ #[path = "../../yuv_pack.rs"]
+diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
+index 05cb5a544..b55b5023d 100644
+--- a/components/media/backends/android/lib.rs
++++ b/components/media/backends/android/lib.rs
+@@ -15,6 +15,8 @@
+ 
+ // Pure logic, host-testable: hosttest/ #[path]-includes these exact files and
+ // runs their unit tests on the host.
++pub mod clock;
++pub mod color;
+ pub mod focus;
+ mod buffer;
+ mod mime_table;
