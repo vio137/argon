@@ -5,14 +5,19 @@ import java.io.File
 
 object StartPage {
     fun write(context: Context, bookmarks: List<Bookmark>, history: List<HistoryEntry>, engine: SearchEngine): String {
+        // Only web pages become start-page links: this HTML renders as a
+        // local file page, so other schemes (javascript:, intent:, ...) are
+        // never emitted as hrefs. esc() still guards every interpolated value.
+        val webBookmarks = bookmarks.filter { it.url.startsWith("https://") || it.url.startsWith("http://") }
+        val webHistory = history.filter { it.url.startsWith("https://") || it.url.startsWith("http://") }
         val tiles =
-            bookmarks.joinToString("") {
+            webBookmarks.joinToString("") {
                 val host = it.url.substringAfter("://").substringBefore('/').removePrefix("www.")
                 val letter = it.title.firstOrNull()?.uppercaseChar() ?: '•'
                 """<a class="tile" href="${esc(it.url)}"><span class="glyph" style="--h:${hostHue(host)}">${esc(letter.toString())}</span><span class="label">${esc(it.title)}</span></a>"""
             }
         val recent =
-            history.take(6).joinToString("") {
+            webHistory.take(6).joinToString("") {
                 val host = hostOf(it.url)
                 """<a class="row" href="${esc(it.url)}"><span class="rglyph" style="--h:${hostHue(host)}">${esc(host.firstOrNull()?.uppercaseChar()?.toString() ?: "?")}</span><span class="rtext"><span class="rtitle">${esc(it.title)}</span><span class="rhost">${esc(host)}</span></span></a>"""
             }
@@ -50,7 +55,7 @@ input::placeholder{color:var(--text3)}
 <div class="wrap">
 <div class="brand"><svg class="mark" viewBox="0 0 108 108" fill="none"><circle cx="54" cy="54" r="24" stroke="#7AA7FF" stroke-width="4.5" stroke-linecap="round"/><circle cx="79.5" cy="44" r="3.4" fill="#7AA7FF"/></svg><span class="word">Argon</span></div>
 <form action="${esc(engine.searchUrlPrefix)}" method="get"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.8-3.8"/></svg><input type="search" name="${esc(engine.queryParam)}" placeholder="Search the web" autocomplete="off"></form>
-<div class="stitle">Start</div><div class="grid">$tiles</div>${if (bookmarks.isEmpty()) """<div class="empty">Pages you star from the menu land here.</div>""" else ""}${if (recent.isNotEmpty()) """<div class="recent"><div class="stitle">Recent</div><div class="rows">$recent</div></div>""" else ""}
+<div class="stitle">Start</div><div class="grid">$tiles</div>${if (webBookmarks.isEmpty()) """<div class="empty">Pages you star from the menu land here.</div>""" else ""}${if (recent.isNotEmpty()) """<div class="recent"><div class="stitle">Recent</div><div class="rows">$recent</div></div>""" else ""}
 </div>
 </body></html>"""
         val file = File(context.filesDir, "startpage.html")

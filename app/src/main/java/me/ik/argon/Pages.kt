@@ -67,7 +67,7 @@ private fun PageTopBar(
 }
 
 @Composable
-fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> Unit) {
+fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> Unit, onCleared: () -> Unit = {}) {
     var confirmClear by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf("") }
     val shown =
@@ -163,6 +163,7 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                     onClick = {
                         history.clear()
                         confirmClear = false
+                        onCleared()
                     }
                 ) {
                     Text("Clear", color = ArgonColors.Danger)

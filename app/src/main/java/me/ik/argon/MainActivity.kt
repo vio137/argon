@@ -192,6 +192,14 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private lateinit var bookmarks: BookmarkStore
     private val navigator get() = ServoHolder.navigator
 
+    /** Rewrite the local start page and, when it is the page on screen,
+     * reload so cleared/removed entries never linger in the visible page or
+     * reappear through the back stack's current entry. */
+    private fun refreshStartPage() {
+        StartPage.write(this, bookmarks.entries, history.entries, searchEngine)
+        if (currentUrl.startsWith("file://") && currentUrl.endsWith("startpage.html")) navigator.reload()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         MediaFocus.start(this)
@@ -338,6 +346,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                     screen = Screen.Browser
                                 },
                                 onBack = { screen = Screen.Browser },
+                                onCleared = { refreshStartPage() },
                             )
                             BackHandler { screen = Screen.Browser }
                         }
@@ -349,12 +358,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                     screen = Screen.Browser
                                 },
                                 onBack = {
-                                    StartPage.write(this@MainActivity, bookmarks.entries, history.entries, searchEngine)
+                                    refreshStartPage()
                                     screen = Screen.Browser
                                 },
                             )
                             BackHandler {
-                                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, searchEngine)
+                                refreshStartPage()
                                 screen = Screen.Browser
                             }
                         }
@@ -373,7 +382,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onEngineChange = {
                                 searchEngine = it
                                 prefs.edit().putString("engine", it.name.lowercase()).apply()
-                                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, it)
+                                refreshStartPage()
                             },
                             onDone = {
                                 prefs.edit().putBoolean("onboarded", true).apply()
@@ -421,7 +430,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onAddToStart = {
                                 showMenu = false
                                 bookmarks.add(currentTitle, currentUrl)
-                                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, searchEngine)
+                                refreshStartPage()
                             },
                             onHistory = {
                                 showMenu = false
@@ -592,7 +601,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
             onSearchEngine = {
                 searchEngine = it
                 prefs.edit().putString("engine", it.name.lowercase()).apply()
-                StartPage.write(this@MainActivity, bookmarks.entries, history.entries, it)
+                refreshStartPage()
             },
             experimental = experimental,
             onExperimental = {
