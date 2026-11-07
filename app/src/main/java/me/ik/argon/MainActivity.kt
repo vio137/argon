@@ -475,9 +475,14 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 navigator.forward()
                             },
+                            startPaged = bookmarks.entries.any { it.url == currentUrl },
+                            startToggleEnabled =
+                                currentUrl.startsWith("https://") || currentUrl.startsWith("http://"),
                             onAddToStart = {
                                 showMenu = false
-                                bookmarks.add(currentTitle, currentUrl)
+                                val existing = bookmarks.entries.firstOrNull { it.url == currentUrl }
+                                if (existing != null) bookmarks.remove(existing)
+                                else bookmarks.add(currentTitle, currentUrl)
                                 refreshStartPage()
                             },
                             onHistory = {

@@ -511,6 +511,8 @@ fun MenuSheet(
     currentHost: String,
     onDismiss: () -> Unit,
     onForward: () -> Unit,
+    startPaged: Boolean,
+    startToggleEnabled: Boolean,
     onAddToStart: () -> Unit,
     onHistory: () -> Unit,
     onSettings: () -> Unit,
@@ -543,7 +545,12 @@ fun MenuSheet(
             SheetRow(R.drawable.ic_copy, "Copy link", shareEnabled, onCopyLink)
             SheetRow(R.drawable.ic_open_in, "Open in another app", shareEnabled, onOpenIn)
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
-            SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
+            SheetRow(
+                R.drawable.ic_star,
+                if (startPaged) "Remove from start page" else "Add to start page",
+                startToggleEnabled,
+                onAddToStart,
+            )
             SheetLabel("App")
             SheetRow(R.drawable.ic_star, "Bookmarks", true, onBookmarks)
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
