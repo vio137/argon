@@ -1,0 +1,395 @@
+From c0dd21de1db0a23d80339cf7e6c457f0769adc3a Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sat, 7 Nov 2026 21:48:06 +0530
+Subject: [PATCH] 060 media: confirm bounded AAudio pause and flush transitions
+ before seek restart
+
+---
+ .../backends/android/android_impl/player.rs   |  92 ++++++---
+ .../backends/android/android_impl/sys.rs      |   5 +-
+ .../media/backends/android/audio_state.rs     | 182 ++++++++++++++++++
+ .../backends/android/hosttest/src/lib.rs      |   3 +
+ components/media/backends/android/lib.rs      |   1 +
+ 5 files changed, 257 insertions(+), 26 deletions(-)
+ create mode 100644 components/media/backends/android/audio_state.rs
+
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
+index 81ab145a5..908ef0b4c 100644
+--- a/components/media/backends/android/android_impl/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
+@@ -388,6 +388,40 @@ struct TrackDecoder {
+ 
+ unsafe impl Send for TrackDecoder {}
+ 
++/// Used only on the pipeline thread. One 300ms deadline covers all state waits;
++/// a timeout or unexpected state closes the stream rather than playing stale data.
++struct AudioTransition {
++    stream: *mut sys::AAudioStream,
++    deadline: Instant,
++}
++impl AudioTransition {
++    fn new(stream: *mut sys::AAudioStream) -> Self {
++        Self { stream, deadline: Instant::now() + Duration::from_millis(300) }
++    }
++}
++impl crate::audio_state::Stream for AudioTransition {
++    fn state(&mut self) -> Result<i32, ()> {
++        // UNKNOWN + zero timeout refreshes the client state from the server.
++        let mut state = 1;
++        let result = unsafe { sys::AAudioStream_waitForStateChange(self.stream, 1, &mut state, 0) };
++        if result == sys::AAUDIO_OK { Ok(state) } else { Err(()) }
++    }
++    fn request(&mut self, request: crate::audio_state::Request) -> Result<(), ()> {
++        let result = unsafe { match request {
++            crate::audio_state::Request::Pause => sys::AAudioStream_requestPause(self.stream),
++            crate::audio_state::Request::Flush => sys::AAudioStream_requestFlush(self.stream),
++            crate::audio_state::Request::Start => sys::AAudioStream_requestStart(self.stream),
++        } };
++        if result == sys::AAUDIO_OK { Ok(()) } else { Err(()) }
++    }
++    fn wait(&mut self, transient: i32) -> Result<i32, ()> {
++        let remaining = self.deadline.checked_duration_since(Instant::now()).ok_or(())?;
++        let mut state = transient;
++        let result = unsafe { sys::AAudioStream_waitForStateChange(self.stream, transient, &mut state, remaining.as_nanos() as i64) };
++        if result == sys::AAUDIO_OK { Ok(state) } else { Err(()) }
++    }
++}
++
+ struct RawFrameBuffer(Vec<u8>);
+ 
+ impl FrameBuffer for RawFrameBuffer {
+@@ -810,16 +844,12 @@ impl Pipeline {
+         {
+             FocusAction::Pause => {
+                 self.clock.pause();
+-                if !self.aaudio.is_null() {
+-                    unsafe { sys::AAudioStream_requestStop(self.aaudio) };
+-                }
++                if !self.set_audio_running(false) { return; }
+                 send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Paused));
+             },
+             FocusAction::Resume => {
++                if !self.set_audio_running(true) { return; }
+                 self.clock.resume();
+-                if !self.aaudio.is_null() {
+-                    unsafe { sys::AAudioStream_requestStart(self.aaudio) };
+-                }
+                 send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Playing));
+             },
+             FocusAction::None => {},
+@@ -837,18 +867,14 @@ impl Pipeline {
+             PipelineCmd::Shutdown => return false,
+             PipelineCmd::Play => {
+                 self.focus.page_command();
++                if !self.set_audio_running(true) { return true; }
+                 self.clock.resume();
+-                if !self.aaudio.is_null() {
+-                    unsafe { sys::AAudioStream_requestStart(self.aaudio) };
+-                }
+                 send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Playing));
+             },
+             PipelineCmd::Pause => {
+                 self.focus.page_command();
+                 self.clock.pause();
+-                if !self.aaudio.is_null() {
+-                    unsafe { sys::AAudioStream_requestStop(self.aaudio) };
+-                }
++                if !self.set_audio_running(false) { return true; }
+                 send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Paused));
+             },
+             PipelineCmd::Seek(time) => {
+@@ -858,8 +884,33 @@ impl Pipeline {
+         true
+     }
+ 
++    fn audio_transition_failed(&mut self) {
++        if !self.aaudio.is_null() {
++            unsafe { sys::AAudioStream_close(self.aaudio) };
++            self.aaudio = std::ptr::null_mut();
++        }
++        self.shared.update(|st| st.paused = true);
++        self.clock.pause();
++        send_event(&self.sender, PlayerEvent::Error("Audio state transition failed or timed out".to_owned()));
++    }
++
++    fn set_audio_running(&mut self, running: bool) -> bool {
++        if self.aaudio.is_null() { return true; }
++        let mut stream = AudioTransition::new(self.aaudio);
++        let result = if running { crate::audio_state::start(&mut stream) } else { crate::audio_state::pause(&mut stream) };
++        if result.is_err() { self.audio_transition_failed(); return false; }
++        true
++    }
++
+     fn do_seek(&mut self, time: f64) {
+         let target_us = (time * 1e6) as i64;
++        if !self.aaudio.is_null() {
++            let mut stream = AudioTransition::new(self.aaudio);
++            if crate::audio_state::flush_for_seek(&mut stream).is_err() {
++                self.audio_transition_failed();
++                return; // No SeekDone and no automatic restart after a failed flush.
++            }
++        }
+         // Flush codecs (this releases any held output buffer indices).
+         if let Some(video) = self.video.as_mut() {
+             video.held_frame = None;
+@@ -901,17 +952,8 @@ impl Pipeline {
+             // rebase restarts the wall clock; freeze it again while paused.
+             self.clock.pause();
+         }
+-        if !self.aaudio.is_null() {
+-            unsafe {
+-                // Discard pre-seek audio still queued in the stream; without
+-                // this it audibly tails after the seek while the clock has
+-                // already rebased to the target.
+-                sys::AAudioStream_requestStop(self.aaudio);
+-                sys::AAudioStream_requestFlush(self.aaudio);
+-                if !self.shared.get().paused && !held {
+-                    sys::AAudioStream_requestStart(self.aaudio);
+-                }
+-            }
++        if !self.shared.get().paused && !held && !self.set_audio_running(true) {
++            return;
+         }
+         send_event(&self.sender, PlayerEvent::SeekDone(time));
+     }
+@@ -1341,8 +1383,8 @@ impl Pipeline {
+                 self.clock.has_audio = true;
+                 self.clock.audio_sample_rate = rate as i64;
+                 self.clock.audio_frames_written = 0;
+-                if !self.shared.get().paused {
+-                    sys::AAudioStream_requestStart(stream);
++                if !self.shared.get().paused && self.focus.hold == Hold::None {
++                    self.set_audio_running(true);
+                 }
+             } else {
+                 warn!("android media backend: AAudio openStream failed: {result}");
+diff --git a/components/media/backends/android/android_impl/sys.rs b/components/media/backends/android/android_impl/sys.rs
+index 81953cad8..ea1ce4dde 100644
+--- a/components/media/backends/android/android_impl/sys.rs
++++ b/components/media/backends/android/android_impl/sys.rs
+@@ -226,7 +226,10 @@ unsafe extern "C" {
+     pub fn AAudioStream_close(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_requestStart(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_requestStop(stream: *mut AAudioStream) -> aaudio_result_t;
+-    /// API 28+ (minSdk is 29): discard queued-but-unplayed audio.
++    pub fn AAudioStream_requestPause(stream: *mut AAudioStream) -> aaudio_result_t;
++    pub fn AAudioStream_getState(stream: *mut AAudioStream) -> i32;
++    pub fn AAudioStream_waitForStateChange(stream: *mut AAudioStream, input_state: i32, next_state: *mut i32, timeout_nanoseconds: i64) -> aaudio_result_t;
++    /// API 26: discard queued-but-unplayed audio in a stable quiescent state.
+     pub fn AAudioStream_requestFlush(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_write(
+         stream: *mut AAudioStream,
+diff --git a/components/media/backends/android/audio_state.rs b/components/media/backends/android/audio_state.rs
+new file mode 100644
+index 000000000..4611c8bfd
+--- /dev/null
++++ b/components/media/backends/android/audio_state.rs
+@@ -0,0 +1,182 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! AAudio lifecycle sequencing. Each adapter must enforce ONE bounded deadline
++//! across all waits. State values are the stable API26 AAudio.h enum values.
++pub const OPEN: i32 = 2;
++pub const STARTING: i32 = 3;
++pub const STARTED: i32 = 4;
++pub const PAUSING: i32 = 5;
++pub const PAUSED: i32 = 6;
++pub const FLUSHING: i32 = 7;
++pub const FLUSHED: i32 = 8;
++pub const STOPPING: i32 = 9;
++pub const STOPPED: i32 = 10;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Request {
++    Pause,
++    Flush,
++    Start,
++}
++pub trait Stream {
++    fn state(&mut self) -> Result<i32, ()>;
++    fn request(&mut self, request: Request) -> Result<(), ()>;
++    fn wait(&mut self, transient: i32) -> Result<i32, ()>;
++}
++fn stable(stream: &mut impl Stream) -> Result<i32, ()> {
++    let state = stream.state()?;
++    let state = match state {
++        STARTING | PAUSING | FLUSHING | STOPPING => stream.wait(state)?,
++        s => s,
++    };
++    match state {
++        OPEN | STARTED | PAUSED | FLUSHED | STOPPED => Ok(state),
++        _ => Err(()),
++    }
++}
++fn transition(
++    stream: &mut impl Stream,
++    request: Request,
++    transient: i32,
++    target: i32,
++) -> Result<(), ()> {
++    stream.request(request)?;
++    // waitForStateChange returns immediately if already at target. A different
++    // stable state is NOT success, and no error/timeout permits the next request.
++    if stream.wait(transient)? == target {
++        Ok(())
++    } else {
++        Err(())
++    }
++}
++pub fn pause(stream: &mut impl Stream) -> Result<(), ()> {
++    if stable(stream)? == STARTED {
++        transition(stream, Request::Pause, PAUSING, PAUSED)?;
++    }
++    Ok(())
++}
++pub fn flush_for_seek(stream: &mut impl Stream) -> Result<(), ()> {
++    pause(stream)?;
++    transition(stream, Request::Flush, FLUSHING, FLUSHED)
++}
++pub fn start(stream: &mut impl Stream) -> Result<(), ()> {
++    if stable(stream)? != STARTED {
++        transition(stream, Request::Start, STARTING, STARTED)?;
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::VecDeque;
++    struct Fake {
++        state: i32,
++        waits: VecDeque<Result<i32, ()>>,
++        calls: Vec<Request>,
++        fail: Option<Request>,
++    }
++    impl Fake {
++        fn new(state: i32, waits: &[Result<i32, ()>]) -> Self {
++            Self {
++                state,
++                waits: waits.iter().copied().collect(),
++                calls: vec![],
++                fail: None,
++            }
++        }
++    }
++    impl Stream for Fake {
++        fn state(&mut self) -> Result<i32, ()> {
++            Ok(self.state)
++        }
++        fn request(&mut self, r: Request) -> Result<(), ()> {
++            self.calls.push(r);
++            if self.fail == Some(r) {
++                Err(())
++            } else {
++                Ok(())
++            }
++        }
++        fn wait(&mut self, _: i32) -> Result<i32, ()> {
++            let s = self.waits.pop_front().expect("unexpected wait")?;
++            self.state = s;
++            Ok(s)
++        }
++    }
++    #[test]
++    fn seek_waits_for_pause_then_flush_without_starting() {
++        let mut s = Fake::new(STARTED, &[Ok(PAUSED), Ok(FLUSHED)]);
++        assert_eq!(flush_for_seek(&mut s), Ok(()));
++        assert_eq!(s.calls, vec![Request::Pause, Request::Flush]);
++    }
++    #[test]
++    fn stable_quiescent_states_need_only_flush() {
++        for state in [OPEN, PAUSED, STOPPED, FLUSHED] {
++            let mut s = Fake::new(state, &[Ok(FLUSHED)]);
++            assert_eq!(flush_for_seek(&mut s), Ok(()));
++            assert_eq!(s.calls, vec![Request::Flush]);
++        }
++    }
++    #[test]
++    fn timeout_and_wrong_state_prevent_flush() {
++        for result in [Err(()), Ok(STOPPING), Ok(STOPPED)] {
++            let mut s = Fake::new(STARTED, &[result]);
++            assert_eq!(flush_for_seek(&mut s), Err(()));
++            assert_eq!(s.calls, vec![Request::Pause]);
++        }
++    }
++    #[test]
++    fn pause_request_failure_prevents_wait_and_flush() {
++        let mut s = Fake::new(STARTED, &[]);
++        s.fail = Some(Request::Pause);
++        assert_eq!(flush_for_seek(&mut s), Err(()));
++        assert_eq!(s.calls, vec![Request::Pause]);
++    }
++    #[test]
++    fn flush_failure_never_requests_restart() {
++        let mut s = Fake::new(PAUSED, &[Err(())]);
++        assert_eq!(flush_for_seek(&mut s), Err(()));
++        assert_eq!(s.calls, vec![Request::Flush]);
++    }
++    #[test]
++    fn disconnected_and_unknown_states_rejected() {
++        for state in [0, 1, 11, 12, 13, 99] {
++            let mut s = Fake::new(state, &[]);
++            assert_eq!(flush_for_seek(&mut s), Err(()));
++            assert!(s.calls.is_empty());
++        }
++    }
++    #[test]
++    fn outstanding_start_is_settled_before_pause() {
++        let mut s = Fake::new(STARTING, &[Ok(STARTED), Ok(PAUSED), Ok(FLUSHED)]);
++        assert_eq!(flush_for_seek(&mut s), Ok(()));
++        assert_eq!(s.calls, vec![Request::Pause, Request::Flush]);
++    }
++    #[test]
++    fn normal_pause_preserves_queue_and_restart_waits() {
++        let mut s = Fake::new(STARTED, &[Ok(PAUSED), Ok(STARTED)]);
++        assert_eq!(pause(&mut s), Ok(()));
++        assert_eq!(start(&mut s), Ok(()));
++        assert_eq!(s.calls, vec![Request::Pause, Request::Start]);
++    }
++    #[test]
++    fn flush_request_error_and_start_error_stop_the_sequence() {
++        let mut s = Fake::new(PAUSED, &[]);
++        s.fail = Some(Request::Flush);
++        assert_eq!(flush_for_seek(&mut s), Err(()));
++        assert_eq!(s.calls, vec![Request::Flush]);
++        let mut s = Fake::new(FLUSHED, &[]);
++        s.fail = Some(Request::Start);
++        assert_eq!(start(&mut s), Err(()));
++        assert_eq!(s.calls, vec![Request::Start]);
++    }
++    #[test]
++    fn failed_pending_transition_does_not_issue_a_request() {
++        let mut s = Fake::new(STOPPING, &[Err(())]);
++        assert_eq!(flush_for_seek(&mut s), Err(()));
++        assert!(s.calls.is_empty());
++    }
++}
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+index 32f65fb47..3963e9d29 100644
+--- a/components/media/backends/android/hosttest/src/lib.rs
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -18,3 +18,6 @@ pub mod focus;
+ 
+ #[path = "../../pcm.rs"]
+ pub mod pcm;
++
++#[path = "../../audio_state.rs"]
++pub mod audio_state;
+diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
+index 3c828b0d6..af848587a 100644
+--- a/components/media/backends/android/lib.rs
++++ b/components/media/backends/android/lib.rs
+@@ -20,6 +20,7 @@ pub mod color;
+ pub mod focus;
+ pub mod rotate;
+ mod pcm;
++mod audio_state;
+ mod buffer;
+ mod mime_table;
+ mod yuv_pack;
+-- 
+2.34.1
+
