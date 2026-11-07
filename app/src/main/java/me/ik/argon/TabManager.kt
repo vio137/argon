@@ -16,7 +16,13 @@ class TabManager(private val maxTabs: Int = DEFAULT_MAX_TABS) {
         var canGoBack: Boolean = false,
         var canGoForward: Boolean = false,
         var loading: Boolean = false,
-    )
+    ) {
+        /** App-side per-tab navigation trail (oldest first, capped) for the
+         * back-button long-press sheet. Recorded from onUrlChanged; picking an
+         * entry navigates by URL (a fresh load, not a session-history jump -
+         * the engine exposes only single-step back/forward over JNI). */
+        val trail = ArrayDeque<String>()
+    }
 
     /** Open-tab order, oldest first. */
     val order = mutableListOf<String>()

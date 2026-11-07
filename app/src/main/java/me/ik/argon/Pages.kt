@@ -101,6 +101,7 @@ fun HistoryPage(
     onCleared: () -> Unit = {},
     recentlyClosed: RecentlyClosedStore? = null,
     onReopenClosed: (HistoryEntry) -> Unit = {},
+    embedded: Boolean = false,
 ) {
     var confirmClear by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf("") }
@@ -111,6 +112,7 @@ fun HistoryPage(
         }
     Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
         Column(Modifier.fillMaxSize()) {
+            if (!embedded)
             PageTopBar(
                 "History",
                 onBack,
@@ -259,6 +261,60 @@ private fun startOfTodayMs(): Long {
  * at or after it are deleted, or null for "delete everything".
  */
 @Composable
+/** Unified library panel (Vivaldi C): Bookmarks and History under one top
+ * bar with a segmented switcher, reusing the existing page bodies embedded. */
+@Composable
+fun LibraryPage(
+    bookmarks: BookmarkStore,
+    history: HistoryStore,
+    recentlyClosed: RecentlyClosedStore? = null,
+    initialTab: Int = 0,
+    onOpen: (String) -> Unit,
+    onReopenClosed: (HistoryEntry) -> Unit = {},
+    onBack: () -> Unit,
+    onCleared: () -> Unit = {},
+) {
+    var tab by remember { mutableStateOf(initialTab) }
+    Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
+        Column(Modifier.fillMaxSize()) {
+            PageTopBar("Library", onBack)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+            ) {
+                listOf("Bookmarks", "History").forEachIndexed { index, label ->
+                    val active = tab == index
+                    Surface(
+                        color = if (active) ArgonColors.Accent else ArgonColors.Surface,
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.clickable { tab = index },
+                    ) {
+                        Text(
+                            label,
+                            color = if (active) ArgonColors.OnAccent else ArgonColors.Text2,
+                            style = ArgonType.BodySmall,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+            }
+            when (tab) {
+                0 -> BookmarksPage(bookmarks, onOpen, onBack, embedded = true)
+                else ->
+                    HistoryPage(
+                        history,
+                        onOpen,
+                        onBack,
+                        onCleared,
+                        recentlyClosed,
+                        onReopenClosed,
+                        embedded = true,
+                    )
+            }
+        }
+    }
+}
+
 private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -287,12 +343,12 @@ private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) 
 }
 
 @Composable
-fun BookmarksPage(bookmarks: BookmarkStore, onOpen: (String) -> Unit, onBack: () -> Unit) {
+fun BookmarksPage(bookmarks: BookmarkStore, onOpen: (String) -> Unit, onBack: () -> Unit, embedded: Boolean = false) {
     var renaming by remember { mutableStateOf<Bookmark?>(null) }
     var renameText by remember { mutableStateOf("") }
     Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
         Column(Modifier.fillMaxSize()) {
-            PageTopBar("Bookmarks", onBack)
+            if (!embedded) PageTopBar("Bookmarks", onBack)
             if (bookmarks.entries.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("Star a page from the menu and it lands here.", color = ArgonColors.Text3, style = ArgonType.BodySmall)

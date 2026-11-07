@@ -109,6 +109,7 @@ enum class Screen {
     Browser,
     History,
     Bookmarks,
+    Library,
     Settings,
 }
 
@@ -287,6 +288,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private lateinit var prefs: SharedPreferences
     private lateinit var history: HistoryStore
     private lateinit var recentlyClosed: RecentlyClosedStore
+    private var libraryInitialTab = 0
     private lateinit var bookmarks: BookmarkStore
     private val navigator get() = ServoHolder.navigator
 
@@ -502,12 +504,18 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         // Computed only when the URL or the store snapshot
                         // changes - not on every keystroke/parent recompose
                         // (perf audit 1.0.17).
+                        // Per-tab trail for the back-button long-press sheet
+                        // (Vivaldi B); label is the host since per-entry titles
+                        // are not tracked. Recomputed on navigation only.
                         recentHistory =
-                            remember(currentUrl, history.entries) {
-                                history.entries
-                                    .filter { it.url != currentUrl }
-                                    .take(8)
-                                    .map { it.title to it.url }
+                            remember(currentUrl, tabStripVersion) {
+                                tabManager.states[tabManager.activeId]
+                                    ?.trail
+                                    ?.asReversed()
+                                    ?.filter { it != currentUrl }
+                                    ?.take(8)
+                                    ?.map { hostOf(displayableUrl(it)) to it }
+                                    ?: emptyList()
                             },
                         onPickHistory = { url ->
                             navigate(url)
@@ -533,6 +541,31 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                     navigate(entry.url)
                                     screen = Screen.Browser
                                 },
+                            )
+                            }
+                            BackHandler { screen = Screen.Browser }
+                        }
+                        Screen.Library -> {
+                            PageEntrance {
+                            LibraryPage(
+                                bookmarks = bookmarks,
+                                history = history,
+                                recentlyClosed = recentlyClosed,
+                                initialTab = libraryInitialTab,
+                                onOpen = {
+                                    navigate(it)
+                                    screen = Screen.Browser
+                                },
+                                onReopenClosed = { entry ->
+                                    recentlyClosed.remove(entry)
+                                    navigate(entry.url)
+                                    screen = Screen.Browser
+                                },
+                                onBack = {
+                                    refreshStartPage()
+                                    screen = Screen.Browser
+                                },
+                                onCleared = { refreshStartPage() },
                             )
                             }
                             BackHandler { screen = Screen.Browser }
@@ -617,7 +650,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             },
                             onBookmarks = {
                                 showMenu = false
-                                screen = Screen.Bookmarks
+                                libraryInitialTab = 0
+                                screen = Screen.Library
                             },
                             currentHost = hostOf(displayableUrl(currentUrl)),
                             onDismiss = { showMenu = false },
@@ -637,7 +671,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             },
                             onHistory = {
                                 showMenu = false
-                                screen = Screen.History
+                                libraryInitialTab = 1
+                                screen = Screen.Library
                             },
                             onSettings = {
                                 showMenu = false
@@ -1186,6 +1221,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
         pendingContextMenu?.let { if (it.webviewId == webviewId) dismissContextMenu(it) }
         val tab = tabManager.route(webviewId) ?: return
         tab.url = url
+        if (url.isNotBlank() && url != "about:blank" && tab.trail.lastOrNull() != url) {
+            tab.trail.addLast(url)
+            while (tab.trail.size > 50) tab.trail.removeFirst()
+        }
         tabStripVersion++
         if (!tabManager.isActive(webviewId)) return
         currentUrl = url
