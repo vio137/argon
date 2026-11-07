@@ -79,6 +79,23 @@ site-loading and browsing performance before drawing conclusions.
   submit, back/forward/reload/stop) invalidates the identity immediately,
   before the engine's start callback arrives.
 
+## Tabs multiview build (exp-tabs)
+- servo_ref: b6c9df76bf2d79d479e4b0162f7ecb383d32d2fd (unchanged from v15)
+- patch set: everything in exp-load-error plus 030_tabs_multiview (applies
+  after 020 in glob order; chain apply-checked 020 then 030 on pristine base).
+- 030 adds tab management to the Android host: App::new_tab/activate_tab/
+  close_tab/active_tab_id over the existing ServoShellWindow webview
+  collection (create_and_activate_toplevel_webview, activate_webview,
+  close_webview - the desktop servoshell tabs model), exposed over JNI as
+  newTab(url): String, activateTab(id): Boolean, closeTab(id): Boolean,
+  activeTabId(): String. Tab ids cross JNI as opaque WebViewId Display
+  strings, matched by exact string equality engine-side. Navigation commands
+  (loadUri/back/forward/reload/stop) and title/url/history/load-status
+  callbacks already act on the ACTIVE webview (update_user_interface_state),
+  so switching tabs re-reports the new active tab's state without callback
+  multiplexing. Closing the active tab activates the next-newest; the app
+  keeps at least one tab open by UI rule.
+
 ### 020 revision history
 - v1 (2ad46c0): initial signal; raw bounded reason string (RETRACTED:
   String::truncate could split a UTF-8 boundary, and raw provider detail was

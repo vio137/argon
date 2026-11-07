@@ -51,6 +51,7 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
@@ -447,6 +448,16 @@ internal constructor(
     fun loadUri(uri: String) {
         scope.launch(glDispatcher) { jni.loadUri(uri) }
     }
+
+    /** Argon (patch 030): tab management; suspend on the GL executor so tab
+     * ops stay ordered with navigation commands. */
+    suspend fun newTab(url: String): String = withContext(glDispatcher) { jni.newTab(url) }
+
+    suspend fun activateTab(id: String): Boolean = withContext(glDispatcher) { jni.activateTab(id) }
+
+    suspend fun closeTab(id: String): Boolean = withContext(glDispatcher) { jni.closeTab(id) }
+
+    suspend fun activeTabId(): String = withContext(glDispatcher) { jni.activeTabId() }
 
     fun onKeyDown(keyCode: Int, event: KeyEvent) {
         scope.launch(glDispatcher) { jni.keydown(keyCode, event.unicodeChar) }

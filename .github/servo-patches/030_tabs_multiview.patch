@@ -1,0 +1,147 @@
+diff --git a/ports/servoshell/egl/android/mod.rs b/ports/servoshell/egl/android/mod.rs
+index 20d4df6..a9b7917 100644
+--- a/ports/servoshell/egl/android/mod.rs
++++ b/ports/servoshell/egl/android/mod.rs
+@@ -305,6 +305,79 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_loadUri<'local>(
+     .resolve::<ThrowRuntimeExAndDefault>()
+ }
+ 
++/// Argon (tabs, patch 030): open a new tab on `url`, make it active, and
++/// return its opaque tab id (empty string on failure).
++#[unsafe(no_mangle)]
++pub extern "C" fn Java_org_servo_servoview_JNIServo_newTab<'local>(
++    mut env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    url: JString<'local>,
++) -> jobject {
++    env.with_env(|env| -> jni::errors::Result<jobject> {
++        let url_string = url.to_string();
++        let mut id = String::new();
++        call(env, |s| {
++            id = s
++                .new_tab(&url_string)
++                .map(|webview_id| webview_id.to_string())
++                .unwrap_or_default();
++        });
++        let out = env.new_string(id)?;
++        Ok(out.into_raw() as jobject)
++    })
++    .resolve::<ThrowRuntimeExAndDefault>()
++}
++
++/// Argon (tabs, patch 030): activate the tab with the given opaque id.
++/// Returns true when a live tab matched.
++#[unsafe(no_mangle)]
++pub extern "C" fn Java_org_servo_servoview_JNIServo_activateTab<'local>(
++    mut env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    id: JString<'local>,
++) -> jboolean {
++    env.with_env(|env| -> jni::errors::Result<jboolean> {
++        let id_string = id.to_string();
++        let mut found = false;
++        call(env, |s| found = s.activate_tab(&id_string));
++        Ok(found as jboolean)
++    })
++    .resolve::<ThrowRuntimeExAndDefault>()
++}
++
++/// Argon (tabs, patch 030): close the tab with the given opaque id; the
++/// next-newest tab becomes active. Returns true when a live tab matched.
++#[unsafe(no_mangle)]
++pub extern "C" fn Java_org_servo_servoview_JNIServo_closeTab<'local>(
++    mut env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++    id: JString<'local>,
++) -> jboolean {
++    env.with_env(|env| -> jni::errors::Result<jboolean> {
++        let id_string = id.to_string();
++        let mut found = false;
++        call(env, |s| found = s.close_tab(&id_string));
++        Ok(found as jboolean)
++    })
++    .resolve::<ThrowRuntimeExAndDefault>()
++}
++
++/// Argon (tabs, patch 030): the active tab's opaque id (empty string when no
++/// tab exists).
++#[unsafe(no_mangle)]
++pub extern "C" fn Java_org_servo_servoview_JNIServo_activeTabId<'local>(
++    mut env: EnvUnowned<'local>,
++    _class: JClass<'local>,
++) -> jobject {
++    env.with_env(|env| -> jni::errors::Result<jobject> {
++        let mut id = String::new();
++        call(env, |s| id = s.active_tab_id().unwrap_or_default());
++        let out = env.new_string(id)?;
++        Ok(out.into_raw() as jobject)
++    })
++    .resolve::<ThrowRuntimeExAndDefault>()
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn Java_org_servo_servoview_JNIServo_reload<'local>(
+     mut env: EnvUnowned<'local>,
+diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
+index 2446e75..765dcbf 100644
+--- a/ports/servoshell/egl/app.rs
++++ b/ports/servoshell/egl/app.rs
+@@ -428,6 +428,58 @@ impl App {
+         self.state.window_for_webview(&webview).activate_webview(id);
+     }
+ 
++    /// Argon (tabs, patch 030): open a new top-level webview on `url` and
++    /// activate it. Returns None when the URL fails to parse.
++    pub(crate) fn new_tab(&self, url: &str) -> Option<WebViewId> {
++        let url = Url::parse(url).ok()?;
++        Some(
++            self.window()
++                .create_and_activate_toplevel_webview(
++                    self.state.clone(),
++                    TopLevelWebViewCreationRequest::WithUrl(url),
++                )
++                .id(),
++        )
++    }
++
++    /// Argon (tabs, patch 030): activate the webview whose Display-form id
++    /// equals `id`. Returns false when no live webview matches.
++    pub(crate) fn activate_tab(&self, id: &str) -> bool {
++        let Some(webview_id) = self.find_webview_id(id) else {
++            return false;
++        };
++        self.activate_webview(webview_id);
++        true
++    }
++
++    /// Argon (tabs, patch 030): close the webview whose Display-form id
++    /// equals `id`. Closing the active tab activates the next-newest
++    /// (WebViewCollection::remove). Returns false when no live webview
++    /// matches.
++    pub(crate) fn close_tab(&self, id: &str) -> bool {
++        let Some(webview_id) = self.find_webview_id(id) else {
++            return false;
++        };
++        self.window().close_webview(webview_id);
++        true
++    }
++
++    /// Argon (tabs, patch 030): the active (or newest) webview's Display-form
++    /// id, so the app can learn the current tab after any tab operation.
++    pub(crate) fn active_tab_id(&self) -> Option<String> {
++        self.active_or_newest_webview()
++            .map(|webview| webview.id().to_string())
++    }
++
++    /// Argon (tabs, patch 030): match a Display-form id against the live
++    /// webviews (ids cross JNI as opaque strings; exact string equality).
++    fn find_webview_id(&self, id: &str) -> Option<WebViewId> {
++        self.window()
++            .webview_ids()
++            .into_iter()
++            .find(|webview_id| webview_id.to_string() == id)
++    }
++
+     /// This is the Servo heartbeat. This needs to be called
+     /// everytime wakeup is called or when embedder wants Servo
+     /// to act on its pending events.

@@ -45,6 +45,19 @@ internal class JNIServo {
 
     external fun loadUri(uri: String)
 
+    /** Argon (patch 030): open a new tab on [url], activate it, return its
+     * opaque id (empty on failure). */
+    external fun newTab(url: String): String
+
+    /** Argon (patch 030): activate the tab with opaque [id]; true if found. */
+    external fun activateTab(id: String): Boolean
+
+    /** Argon (patch 030): close the tab with opaque [id]; true if found. */
+    external fun closeTab(id: String): Boolean
+
+    /** Argon (patch 030): active tab's opaque id (empty when none). */
+    external fun activeTabId(): String
+
     external fun keydown(keycode: Int, unicode: Int)
 
     external fun keyup(keycode: Int, unicode: Int)
