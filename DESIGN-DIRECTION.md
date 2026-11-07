@@ -15,3 +15,10 @@
   sentence case, tabular figures for counts.
 - Motion: one spring spec family, short fades; no loops, no bounce, no animate-everything.
 - Depth: surface steps + hairlines only; no heavy black shadows, no hue gradients, no washes.
+
+## Skill pins (installed to agent workspace; read-only /skills not writable, recoverable recipe)
+- unslop @ a6f121e https://github.com/heydamir/unslop CC-BY-4.0 (credit: Damir Sokolovsky)
+- apple-design-skill @ ff4ebdd https://github.com/dickwu/apple-design-skill (HIG reference set)
+- mobile-app-ui-design @ 0ad61f0 https://github.com/ceorkm/mobile-app-ui-design
+- ponytail @ 96608e0 https://github.com/dietrichgebert/ponytail MIT
+Reinstall: git clone --depth 1 <url> for each into the agent workspace.

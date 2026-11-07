@@ -44,6 +44,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.painterResource
 
 /**
  * First-run onboarding (chrome v3). Three calm pages - welcome, privacy
@@ -123,14 +124,14 @@ private fun OnboardingButton(label: String, primary: Boolean, onClick: () -> Uni
             Modifier
                 .height(48.dp)
                 .clip(RoundedCornerShape(24.dp))
-                .background(if (primary) ArgonColors.Accent else ArgonColors.SurfaceHigh)
+                .background(if (primary) ArgonColors.Text else ArgonColors.SurfaceHigh)
                 .padding(horizontal = 24.dp)
                 .selectable(selected = false, enabled = true, role = Role.Button, onClick = onClick)
                 .semantics { contentDescription = label },
     ) {
         Text(
             label,
-            color = if (primary) ArgonColors.Bg else ArgonColors.Text,
+            color = if (primary) ArgonColors.OnAccent else ArgonColors.Text,
             style = ArgonType.BodySmall.copy(fontWeight = FontWeight.SemiBold),
         )
     }
@@ -152,6 +153,12 @@ private fun PageHeader(title: String, body: String) {
 @Composable
 private fun WelcomePage() {
     Column {
+        androidx.compose.foundation.Image(
+            painterResource(R.drawable.ic_launcher_foreground),
+            contentDescription = null,
+            modifier = Modifier.size(64.dp),
+        )
+        Spacer(Modifier.height(24.dp))
         PageHeader(
             "A quieter,\nfaster browser.",
             "Argon runs on the Servo engine, blocks ads and trackers by default, and keeps the controls out of your way. Three quick choices and you're in.",
