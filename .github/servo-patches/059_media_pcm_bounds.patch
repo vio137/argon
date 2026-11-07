@@ -1,0 +1,204 @@
+From 5cfa1e777918d76e3621bb7328983f74d3c49db8 Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sat, 7 Nov 2026 21:09:33 +0530
+Subject: [PATCH] 059 media: validate PCM output ranges and copy without
+ alignment assumptions
+
+---
+ .../backends/android/android_impl/player.rs   | 42 ++++++++---
+ .../backends/android/hosttest/src/lib.rs      |  3 +
+ components/media/backends/android/lib.rs      |  1 +
+ components/media/backends/android/pcm.rs      | 70 +++++++++++++++++++
+ 4 files changed, 106 insertions(+), 10 deletions(-)
+ create mode 100644 components/media/backends/android/pcm.rs
+
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
+index cf16528e8..81ab145a5 100644
+--- a/components/media/backends/android/android_impl/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
+@@ -373,6 +373,7 @@ struct TrackDecoder {
+     image_reader: *mut sys::AImageReader,
+     sample_rate: i32,
+     channels: i32,
++    pcm_encoding: i32,
+     input_eos_queued: bool,
+     drained: bool,
+     held_frame: Option<(usize, i64)>,
+@@ -723,6 +724,7 @@ impl Pipeline {
+             } else {
+                 get_format_i32(format, c"channel-count").unwrap_or(0)
+             },
++            pcm_encoding: get_format_i32(format, c"pcm-encoding").unwrap_or(2),
+             input_eos_queued: false,
+             drained: false,
+             held_frame: None,
+@@ -1226,6 +1228,7 @@ impl Pipeline {
+                     if let Some(audio) = self.audio.as_mut() {
+                         audio.sample_rate = sample_rate;
+                         audio.channels = channels;
++                        audio.pcm_encoding = get_format_i32(format, c"pcm-encoding").unwrap_or(2);
+                     }
+                     unsafe { sys::AMediaFormat_delete(format) };
+                     self.reopen_audio_stream();
+@@ -1234,23 +1237,38 @@ impl Pipeline {
+             },
+             x if x >= 0 => {
+                 let idx = x as usize;
+-                if info.flags & sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM != 0 {
++                let eos = info.flags & sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM != 0;
++                // EOS may accompany a final nonempty PCM buffer. Consume those
++                // samples before marking the track drained, never discard them.
++                if info.size == 0 {
+                     unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, idx, false) };
+-                    self.audio.as_mut().unwrap().drained = true;
+-                    self.maybe_finish();
++                    if eos {
++                        self.audio.as_mut().unwrap().drained = true;
++                        self.maybe_finish();
++                    }
+                     return true;
+                 }
+                 let mut out_size: usize = 0;
+                 let buf = unsafe { sys::AMediaCodec_getOutputBuffer(codec, idx, &mut out_size) };
+-                if buf.is_null() || info.size <= 0 {
++                let audio = self.audio.as_ref().unwrap();
++                let range = crate::pcm::pcm16_range(out_size, info.offset, info.size, audio.channels);
++                let pcm = if !buf.is_null() && audio.pcm_encoding == 2 {
++                    range.and_then(|range| {
++                        // Checked nonnegative offset/size, capacity, isize and
++                        // whole-frame bounds. Byte reads need no i16 alignment.
++                        let bytes = unsafe { std::slice::from_raw_parts(buf.add(range.start), range.len()) };
++                        crate::pcm::copy_native_pcm16(bytes)
++                    })
++                } else { None };
++                let Some(pcm) = pcm else {
+                     unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, idx, false) };
++                    self.shared.update(|st| st.paused = true);
++                    self.clock.pause();
++                    if !self.aaudio.is_null() {
++                        unsafe { sys::AAudioStream_requestStop(self.aaudio) };
++                    }
++                    send_event(&self.sender, PlayerEvent::Error("Invalid or unsupported decoded PCM output".to_owned()));
+                     return true;
+-                }
+-                let pcm = unsafe {
+-                    std::slice::from_raw_parts(
+-                        buf.add(info.offset as usize) as *const i16,
+-                        info.size as usize / 2,
+-                    )
+                 };
+                 let st = self.shared.get();
+                 let samples: Vec<i16> = if st.muted || st.volume <= 0.0 {
+@@ -1269,6 +1287,10 @@ impl Pipeline {
+                 };
+                 unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, idx, false) };
+                 self.write_audio(&samples, info.presentation_time_us);
++                if eos {
++                    self.audio.as_mut().unwrap().drained = true;
++                    self.maybe_finish();
++                }
+                 true
+             },
+             _ => false,
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+index 439b924b0..32f65fb47 100644
+--- a/components/media/backends/android/hosttest/src/lib.rs
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -15,3 +15,6 @@ pub mod yuv_pack;
+ 
+ #[path = "../../focus.rs"]
+ pub mod focus;
++
++#[path = "../../pcm.rs"]
++pub mod pcm;
+diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
+index 32110fe99..3c828b0d6 100644
+--- a/components/media/backends/android/lib.rs
++++ b/components/media/backends/android/lib.rs
+@@ -19,6 +19,7 @@ pub mod clock;
+ pub mod color;
+ pub mod focus;
+ pub mod rotate;
++mod pcm;
+ mod buffer;
+ mod mime_table;
+ mod yuv_pack;
+diff --git a/components/media/backends/android/pcm.rs b/components/media/backends/android/pcm.rs
+new file mode 100644
+index 000000000..453c869a8
+--- /dev/null
++++ b/components/media/backends/android/pcm.rs
+@@ -0,0 +1,70 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Validate signed MediaCodec metadata before pointer arithmetic. PCM samples
++//! use native byte order, copied from bytes without assuming i16 alignment.
++use std::ops::Range;
++
++pub fn pcm16_range(capacity: usize, offset: i32, size: i32, channels: i32) -> Option<Range<usize>> {
++    if capacity > isize::MAX as usize || channels <= 0 {
++        return None;
++    }
++    let start = usize::try_from(offset).ok()?;
++    let len = usize::try_from(size).ok()?;
++    let frame_bytes = usize::try_from(channels).ok()?.checked_mul(2)?;
++    let end = start.checked_add(len)?;
++    if end > capacity || len % frame_bytes != 0 {
++        return None;
++    }
++    Some(start..end)
++}
++
++pub fn copy_native_pcm16(bytes: &[u8]) -> Option<Vec<i16>> {
++    if bytes.len() % 2 != 0 {
++        return None;
++    }
++    Some(
++        bytes
++            .chunks_exact(2)
++            .map(|s| i16::from_ne_bytes([s[0], s[1]]))
++            .collect(),
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn signed_and_out_of_bounds_metadata_is_rejected() {
++        for (capacity, offset, size, channels) in [
++            (8, -1, 4, 1),
++            (8, 0, -1, 1),
++            (8, 7, 2, 1),
++            (8, 9, 0, 1),
++            (8, 0, 4, 0),
++            (8, 0, 4, -1),
++            (8, 0, 3, 1),
++            (8, 0, 6, 2),
++            (usize::MAX, 0, 4, 1),
++        ] {
++            assert_eq!(pcm16_range(capacity, offset, size, channels), None);
++        }
++    }
++    #[test]
++    fn whole_frames_and_empty_eos_payloads_are_valid() {
++        assert_eq!(pcm16_range(16, 4, 8, 2), Some(4..12));
++        assert_eq!(pcm16_range(16, 16, 0, 2), Some(16..16));
++        assert_eq!(pcm16_range(0, 0, 0, 1), Some(0..0));
++    }
++    #[test]
++    fn unaligned_data_is_copied_in_native_order() {
++        let samples = [i16::MIN, -1, 0, 1, i16::MAX];
++        let mut storage = vec![123u8];
++        for s in samples {
++            storage.extend_from_slice(&s.to_ne_bytes());
++        }
++        assert_eq!(copy_native_pcm16(&storage[1..]), Some(samples.to_vec()));
++        assert_eq!(copy_native_pcm16(&[1]), None);
++    }
++}
+-- 
+2.34.1
+
