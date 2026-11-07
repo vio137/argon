@@ -29,57 +29,70 @@ object StoreHealth {
  * so the original is never overwritten). */
 private class LoadedStore<T>(val entries: List<T>, val quarantineFailed: Boolean)
 
-/** Shared background-save machinery for the JSON stores. save() callers hold
- * immutable List snapshots, so queueing is latest-wins: a superseded snapshot
- * is dropped unwritten. flushSaves() is a best-effort BOUNDED drain at
- * onPause (waits out one in-flight write up to 750ms, then writes the newest
- * snapshot): it narrows, but does not eliminate, loss on process kill -
- * unflushed tail changes are lost if the process dies first. The write lock
- * serializes flush against the background writer. (Perf audit 1.0.17:
- * history.add runs on the main thread from onLoadEnded; JSON-encoding up to
- * 500 entries + file IO mid-navigation janked the page-transition frame.) */
+/** Shared background-save machinery for the JSON stores. All physical I/O is
+ * worker-owned: no save bytes are ever serialized or written on the caller's
+ * thread. Queueing is latest-wins over immutable List snapshots - a
+ * superseded snapshot is dropped unwritten (SAFE only because each snapshot
+ * is the full current state, so a newer snapshot always covers an older
+ * one's changes).
+ *
+ * flush() never writes. It awaits completion of the newest generation
+ * enqueued before the call, bounded by [maxWaitMs], and reports:
+ *  - WRITTEN: that generation's write finished AND the store write reported
+ *    success (AtomicFile completed without error; this is completion of a
+ *    successful write call, not proof of physical media sync).
+ *  - FAILED: the write completed but reported failure (store health flag
+ *    already raised by the store's write path).
+ *  - SUPERSEDED: a newer save enqueued after the flush started covers the
+ *    target generation's state; the covering write may still be queued.
+ *  - TIMEOUT: the target generation did not complete within the bound; it
+ *    remains queued or in flight and a later flush can await it again.
+ * Loss window, honestly: anything not yet WRITTEN when the process dies is
+ * lost. flush at onPause narrows that window; it cannot close it.
+ * (Perf audit 1.0.17: history.add runs on the main thread from onLoadEnded;
+ * JSON-encoding up to 500 entries + file IO mid-navigation janked the
+ * page-transition frame.) */
 internal class SaveQueue {
+    internal enum class FlushResult { WRITTEN, FAILED, SUPERSEDED, TIMEOUT, IDLE }
+
+    internal class Save(val write: () -> Boolean) {
+        val done = java.util.concurrent.CountDownLatch(1)
+        @Volatile var result: FlushResult = FlushResult.IDLE
+    }
+
     private val executor =
         java.util.concurrent.Executors.newSingleThreadExecutor { r ->
             Thread(r, "argon-store-save").apply { isDaemon = true }
         }
-    private val writeLock = java.util.concurrent.locks.ReentrantLock()
-    private val pending = java.util.concurrent.atomic.AtomicReference<(() -> Unit)?>(null)
+    private val pending = java.util.concurrent.atomic.AtomicReference<Save?>(null)
+    private val newest = java.util.concurrent.atomic.AtomicReference<Save?>(null)
 
-    fun enqueue(write: () -> Unit) {
-        pending.set(write)
+    fun enqueue(write: () -> Boolean) {
+        val save = Save(write)
+        pending.set(save)
+        newest.set(save)
         executor.execute {
-            // Claim and write under the same lock acquisition: flush() can
-            // then guarantee that when it returns true, every save enqueued
-            // before the flush call is on disk (an un-lucked claim can never
-            // leave a claimed-but-unwritten task behind a returning flush).
-            writeLock.lock()
-            try {
-                val task = pending.get()
-                if (task !== write) return@execute // superseded by a newer snapshot
-                pending.compareAndSet(write, null)
-                write()
-            } finally {
-                writeLock.unlock()
+            // Single-thread executor serializes claims and writes; no lock
+            // needed because flush() only ever awaits latches, never touches
+            // the pending slot or the file.
+            if (pending.get() !== save) {
+                save.result = FlushResult.SUPERSEDED
+                save.done.countDown()
+                return@execute
             }
+            pending.compareAndSet(save, null)
+            val ok = runCatching { save.write() }.getOrDefault(false)
+            save.result = if (ok) FlushResult.WRITTEN else FlushResult.FAILED
+            save.done.countDown()
         }
     }
 
-    /** Best-effort bounded drain: waits at most [maxWaitMs] for an in-flight
-     * write, then drains the newest pending snapshot under the write lock.
-     * Returns false when the bound was hit (an in-flight write overran); the
-     * pending snapshot is kept and a later flush retries. NOT a durability
-     * guarantee - a process kill before a successful flush still loses
-     * unflushed saves. */
-    fun flush(maxWaitMs: Long = 750): Boolean {
-        val acquired = writeLock.tryLock(maxWaitMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        if (!acquired) return false
-        try {
-            pending.getAndSet(null)?.invoke()
-            return true
-        } finally {
-            writeLock.unlock()
-        }
+    /** Awaits the newest generation enqueued before this call, bounded.
+     * Never performs I/O on the calling thread. */
+    fun flush(maxWaitMs: Long = 750): FlushResult {
+        val target = newest.get() ?: return FlushResult.IDLE
+        val finished = target.done.await(maxWaitMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return if (finished) target.result else FlushResult.TIMEOUT
     }
 }
 
@@ -202,11 +215,16 @@ class HistoryStore(context: Context) {
             return
         }
         val snapshot = entries
-        saveQueue.enqueue { writeStore(file, storeJson.encodeToString(snapshot)) }
+        saveQueue.enqueue {
+            // The serialization also runs on the worker: the snapshot is
+            // captured here on the caller thread, everything after is I/O.
+            writeStore(file, storeJson.encodeToString(snapshot))
+        }
     }
 
-    /** Drains any queued save synchronously (onPause durability point). */
-    fun flushSaves() = saveQueue.flush()
+    /** Best-effort bounded wait for the newest queued save; never writes on
+     * the caller thread. See SaveQueue.flush for result semantics. */
+    internal fun flushSaves(): SaveQueue.FlushResult = saveQueue.flush()
 }
 
 class BookmarkStore(context: Context) {
@@ -259,9 +277,14 @@ class BookmarkStore(context: Context) {
             return
         }
         val snapshot = entries
-        saveQueue.enqueue { writeStore(file, storeJson.encodeToString(snapshot)) }
+        saveQueue.enqueue {
+            // The serialization also runs on the worker: the snapshot is
+            // captured here on the caller thread, everything after is I/O.
+            writeStore(file, storeJson.encodeToString(snapshot))
+        }
     }
 
-    /** Drains any queued save synchronously (onPause durability point). */
-    fun flushSaves() = saveQueue.flush()
+    /** Best-effort bounded wait for the newest queued save; never writes on
+     * the caller thread. See SaveQueue.flush for result semantics. */
+    internal fun flushSaves(): SaveQueue.FlushResult = saveQueue.flush()
 }
