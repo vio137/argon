@@ -289,10 +289,10 @@ index 0000000..03ccb97
 \ No newline at end of file
 diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
 new file mode 100644
-index 0000000..09e49d6
+index 0000000..4e3e540
 --- /dev/null
 +++ b/components/script/dom/mse/mediasource.rs
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,267 @@
 +use std::str::FromStr;
 +use dom_struct::dom_struct;
 +use js::context::JSContext;
@@ -506,22 +506,12 @@ index 0000000..09e49d6
 +        false
 +    }
 +
-+    fn AddSourceBuffer(
-+        &self,
-+        cx: &mut JSContext,
-+        type_: DOMString,
-+    ) -> Fallible<DomRoot<SourceBuffer>> {
-+        let buffer = self
-+            .inner
-+            .add_source_buffer(&type_.to_string())
-+            .ok_or(Error::NotSupported(Some(
-+                "MSE backend refused source buffer".to_owned(),
-+            )))?;
-+        Ok(SourceBuffer::new(
++    fn AddSourceBuffer(&self, cx: &mut JSContext, type_: DOMString) -> DomRoot<SourceBuffer> {
++        SourceBuffer::new(
 +            cx,
 +            &*self.global(),
-+            DomRefCell::new(buffer),
-+        ))
++            DomRefCell::new(self.inner.add_source_buffer(&type_.to_string())),
++        )
 +    }
 +
 +    fn RemoveSourceBuffer(&self, source_buffer: &SourceBuffer) {
@@ -638,16 +628,17 @@ index 0000000..155dbf3
 \ No newline at end of file
 diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
 new file mode 100644
-index 0000000..d6bdc35
+index 0000000..e7873a0
 --- /dev/null
 +++ b/components/script/dom/mse/sourcebuffer.rs
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,144 @@
 +use dom_struct::dom_struct;
 +use script_bindings::codegen::GenericBindings::SourceBufferBinding::{
 +    AppendMode, SourceBufferMethods,
 +};
 +use script_bindings::codegen::GenericUnionTypes::ArrayBufferViewOrArrayBuffer;
 +use script_bindings::domstring::DOMString;
++use script_bindings::error::{Error, Fallible};
 +use script_bindings::num::Finite;
 +use script_bindings::root::DomRoot;
 +
@@ -757,12 +748,14 @@ index 0000000..d6bdc35
 +        self.inner.borrow().set_append_window_end(value);
 +    }
 +
-+    fn AppendBuffer(&self, data: ArrayBufferViewOrArrayBuffer) {
++    fn AppendBuffer(&self, data: ArrayBufferViewOrArrayBuffer) -> Fallible<()> {
 +        let vec = match data {
 +            ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
 +            ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
-+        };
++        }
++        .ok_or(Error::InvalidState(None))?;
 +        self.inner.borrow_mut().append_buffer(vec);
++        Ok(())
 +    }
 +
 +    fn Abort(&self) {
@@ -786,10 +779,10 @@ index 0000000..d6bdc35
 \ No newline at end of file
 diff --git a/components/script/dom/mse/sourcebufferlist.rs b/components/script/dom/mse/sourcebufferlist.rs
 new file mode 100644
-index 0000000..150f81e
+index 0000000..b27a2ec
 --- /dev/null
 +++ b/components/script/dom/mse/sourcebufferlist.rs
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,97 @@
 +use ipc_channel::ipc;
 +use ipc_channel::router::ROUTER;
 +use stylo_atoms::Atom;
@@ -797,13 +790,10 @@ index 0000000..150f81e
 +use script_bindings::codegen::GenericBindings::SourceBufferListBinding::SourceBufferListMethods;
 +use script_bindings::root::DomRoot;
 +
-+use crate::dom::bindings::inheritance::Castable;
 +use js::context::JSContext;
 +use script_bindings::cell::DomRefCell;
-+use crate::dom::bindings::refcounted::Trusted;
 +use crate::dom::bindings::reflector::DomGlobal;
 +use script_bindings::reflector::reflect_dom_object;
-+use crate::dom::event::{Event, EventBubbles, EventCancelable};
 +use crate::dom::eventtarget::EventTarget;
 +use crate::dom::globalscope::GlobalScope;
 +use crate::dom::sourcebuffer::SourceBuffer;
@@ -1050,7 +1040,7 @@ index 0000000..01f3f90
 \ No newline at end of file
 diff --git a/components/script_bindings/webidls/MediaSource.webidl b/components/script_bindings/webidls/MediaSource.webidl
 new file mode 100644
-index 0000000..3600889
+index 0000000..0c9ffa7
 --- /dev/null
 +++ b/components/script_bindings/webidls/MediaSource.webidl
 @@ -0,0 +1,48 @@
@@ -1095,7 +1085,7 @@ index 0000000..3600889
 +
 +    static readonly attribute boolean canConstructInDedicatedWorker;
 +
-+    [Throws] SourceBuffer addSourceBuffer(DOMString type);
++    SourceBuffer addSourceBuffer(DOMString type);
 +    undefined removeSourceBuffer(SourceBuffer sourceBuffer);
 +    undefined endOfStream(optional EndOfStreamError error);
 +    undefined setLiveSeekableRange(double start, double end);
@@ -1124,7 +1114,7 @@ index 0000000..1c8414f
 \ No newline at end of file
 diff --git a/components/script_bindings/webidls/SourceBuffer.webidl b/components/script_bindings/webidls/SourceBuffer.webidl
 new file mode 100644
-index 0000000..5a60cc8
+index 0000000..f4b5a62
 --- /dev/null
 +++ b/components/script_bindings/webidls/SourceBuffer.webidl
 @@ -0,0 +1,40 @@
@@ -1163,7 +1153,7 @@ index 0000000..5a60cc8
 +  attribute EventHandler onerror;
 +  attribute EventHandler onabort;
 +
-+  undefined appendBuffer(BufferSource data);
++  [Throws] undefined appendBuffer(BufferSource data);
 +  undefined abort();
 +  undefined changeType(DOMString type);
 +  undefined remove(double start, unrestricted double end);
