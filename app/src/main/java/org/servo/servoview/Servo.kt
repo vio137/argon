@@ -377,7 +377,9 @@ internal constructor(
         Log.i("ArgonNav", "reattach: swapping scope/client/IME callbacks, lastUrl=${ServoHolder.lastUrl}")
         this.scope = scope
         servoCallbacks.reattach(scope, client, navigator, onImeShow, onImeHide)
-        ServoHolder.lastUrl?.let { url -> scope.launch { client.onUrlChanged(url) } }
+        // Legacy replay carries no webview id (""); the client attributes it
+        // to the active tab, the pre-030 single-tab behavior.
+        ServoHolder.lastUrl?.let { url -> scope.launch { client.onUrlChanged("", url) } }
     }
 
     /** Argon: evaluate an app-bundled script in the active page. The callback
@@ -567,15 +569,19 @@ internal constructor(
     }
 
     interface Client {
-        fun onAlert(message: String)
+        /** All webview-state callbacks carry the source webview id (engine
+         * patch 030 v2); clients route by source, never by assumed-current. */
+        fun onAlert(webviewId: String, message: String)
 
-        fun onLoadStarted()
+        fun onLoadStarted(webviewId: String)
 
-        fun onLoadEnded()
+        fun onLoadEnded(webviewId: String)
 
-        fun onTitleChanged(title: String)
+        fun onTitleChanged(webviewId: String, title: String)
 
-        fun onUrlChanged(url: String)
+        fun onUrlChanged(webviewId: String, url: String)
+
+        fun onHistoryChanged(webviewId: String, canGoBack: Boolean, canGoForward: Boolean)
 
         fun onLoadError(
             webviewId: String,
@@ -629,8 +635,8 @@ internal constructor(
         // observed). pausePainting/doFrame carry the unwrap-on-None risk and
         // are guarded at the Servo level via paintingActive.
 
-        override fun onAlert(message: String) {
-            scope.launch { client.onAlert(message) }
+        override fun onAlert(webviewId: String, message: String) {
+            scope.launch { client.onAlert(webviewId, message) }
         }
 
         override fun onImeShow() {
@@ -641,25 +647,25 @@ internal constructor(
             scope.launch { onImeHide.invoke() }
         }
 
-        override fun onLoadStarted() {
+        override fun onLoadStarted(webviewId: String) {
             Log.i("ArgonNav", "loadStarted")
             Servo.navigationGeneration.incrementAndGet()
-            scope.launch { client.onLoadStarted() }
+            scope.launch { client.onLoadStarted(webviewId) }
         }
 
-        override fun onLoadEnded() {
+        override fun onLoadEnded(webviewId: String) {
             Log.i("ArgonNav", "loadEnded")
-            scope.launch { client.onLoadEnded() }
+            scope.launch { client.onLoadEnded(webviewId) }
         }
 
-        override fun onTitleChanged(title: String) {
-            scope.launch { client.onTitleChanged(title) }
+        override fun onTitleChanged(webviewId: String, title: String) {
+            scope.launch { client.onTitleChanged(webviewId, title) }
         }
 
-        override fun onUrlChanged(url: String) {
+        override fun onUrlChanged(webviewId: String, url: String) {
             Log.i("ArgonNav", "urlChanged $url")
             ServoHolder.lastUrl = url
-            scope.launch { client.onUrlChanged(url) }
+            scope.launch { client.onUrlChanged(webviewId, url) }
         }
 
         override fun onLoadError(
@@ -684,9 +690,10 @@ internal constructor(
             scope.launch { callback(json, error) }
         }
 
-        override fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean) {
-            navigator.canGoBack = canGoBack
-            navigator.canGoForward = canGoForward
+        // History state routes through the client so per-tab routing can
+        // publish it to the navigator only when the source tab is active.
+        override fun onHistoryChanged(webviewId: String, canGoBack: Boolean, canGoForward: Boolean) {
+            scope.launch { client.onHistoryChanged(webviewId, canGoBack, canGoForward) }
         }
     }
 }

@@ -84,15 +84,19 @@ internal class JNIServo {
     interface Callbacks {
         fun wakeup()
 
-        fun onAlert(message: String)
+        /** Argon (engine patch 030 v2): all webview-state callbacks carry the
+         * SOURCE webview id as first parameter, so events queued before a tab
+         * switch or from a background tab can be routed by source, never by
+         * assumed-current tab. */
+        fun onAlert(webviewId: String, message: String)
 
-        fun onLoadStarted()
+        fun onLoadStarted(webviewId: String)
 
-        fun onLoadEnded()
+        fun onLoadEnded(webviewId: String)
 
-        fun onTitleChanged(title: String)
+        fun onTitleChanged(webviewId: String, title: String)
 
-        fun onUrlChanged(url: String)
+        fun onUrlChanged(webviewId: String, url: String)
 
         /** Argon (engine patch 020 v3): a top-level page load failed. kind is
          * "network" | "tls" | "crash"; reason is a fixed ASCII category token.
@@ -112,7 +116,7 @@ internal class JNIServo {
          * request identity. Always precedes any error of the same load. */
         fun onTopLevelLoad(webviewId: String, pipelineId: String, url: String, generation: Long)
 
-        fun onHistoryChanged(canGoBack: Boolean, canGoForward: Boolean)
+        fun onHistoryChanged(webviewId: String, canGoBack: Boolean, canGoForward: Boolean)
 
         fun onImeShow()
 

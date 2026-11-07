@@ -9,7 +9,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.animation.AnimatedVisibility
+import kotlinx.coroutines.launch
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -108,6 +110,15 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private data class LoadError(val url: String, val kind: String, val reason: String)
     private var loadError by mutableStateOf<LoadError?>(null)
     private val loadErrorGate = LoadErrorGate()
+
+    // Multi-tab state (engine patch 030): every engine event is routed by its
+    // SOURCE webview id through tabManager, never by assumed-current tab, so a
+    // queued pre-switch or background event can never land on the active tab's
+    // state. tabStripVersion bumps on any tab change so the strip recomposes.
+    private val tabManager = TabManager()
+    private var tabStripVersion by mutableStateOf(0)
+    private var uiScope: kotlinx.coroutines.CoroutineScope? = null
+    private var startPageUrl = ""
     private var lastRequestedUrl = ""
     private var screen by mutableStateOf(Screen.Browser)
     private var showMenu by mutableStateOf(false)
@@ -248,7 +259,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
         // App-initiated navigation invalidates the load-error identity
         // immediately, before the engine's load-start callback arrives.
         ServoHolder.navigator.onNavigationInitiated = {
-            loadErrorGate.onNavigationInitiated()
+            // Navigation commands act on the active webview, so invalidate
+            // that webview's load-error identity only; other tabs keep theirs.
+            loadErrorGate.onNavigationInitiated(tabManager.activeId)
             loadError = null
         }
         MediaFocus.start(this)
@@ -262,7 +275,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         Blocklist.apply(this, adblock)
         history = HistoryStore(this)
         bookmarks = BookmarkStore(this)
-        val startPageUrl = StartPage.write(this, bookmarks.entries, history.entries, searchEngine)
+        startPageUrl = StartPage.write(this, bookmarks.entries, history.entries, searchEngine)
         // Experiment: user stylesheet declaring script-fallback family names
         // from the device's own font files (bounded size; no default-family
         // replacement). Null when no usable fonts found.
@@ -322,6 +335,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         setContent {
             ArgonTheme {
                 val focusManager = LocalFocusManager.current
+                uiScope = rememberCoroutineScope()
                 Box(Modifier.fillMaxSize().background(ArgonColors.Bg)) {
                     Servo(
                         experimentalModeEnabled = experimental,
@@ -364,6 +378,26 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                     }
                                 },
                             onDismiss = { loadError = null },
+                        )
+                    }
+                    val stripTabs =
+                        tabStripVersion.let {
+                            tabManager.order.map { id ->
+                                val t = tabManager.states[id]
+                                id to (
+                                    t?.title?.ifBlank { null }
+                                        ?: hostOf(displayableUrl(t?.url ?: "")).ifBlank { "New tab" }
+                                    )
+                            }
+                        }
+                    if (stripTabs.isNotEmpty()) {
+                        me.ik.argon.ui.ArgonTabStrip(
+                            tabs = stripTabs,
+                            activeId = tabManager.activeId,
+                            onSelect = { switchToTab(it) },
+                            onClose = { closeTab(it) },
+                            onNew = { openNewTab(startPageUrl) },
+                            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp),
                         )
                     }
                     me.ik.argon.ui.ArgonCommandBar(
@@ -800,36 +834,147 @@ class MainActivity : ComponentActivity(), Servo.Client {
         BackHandler { screen = Screen.Browser }
     }
 
-    // Servo.Client
-    override fun onAlert(message: String) {
-        alertMessage = message
+    // Servo.Client. Every callback is routed by its SOURCE webview id
+    // (engine patch 030 v2): events from background or just-closed tabs update
+    // their own tab's state only and never touch the active-tab UI fields.
+    override fun onAlert(webviewId: String, message: String) {
+        if (tabManager.isActive(webviewId)) {
+            alertMessage = message
+        } else {
+            // Alerts auto-confirm engine-side; a background tab's alert has no
+            // user to answer it, so it is logged, not queued.
+            Log.i("ArgonNav", "alert dropped: background tab")
+        }
     }
 
-    override fun onLoadStarted() {
-        isLoading = true
+    override fun onLoadStarted(webviewId: String) {
+        val tab = tabManager.route(webviewId) ?: return
+        tab.loading = true
+        tabStripVersion++
+        if (tabManager.isActive(webviewId)) isLoading = true
     }
 
-    override fun onLoadEnded() {
+    override fun onLoadEnded(webviewId: String) {
+        val tab = tabManager.route(webviewId) ?: return
+        tab.loading = false
+        tabStripVersion++
         // History records web pages only: file:// (start page) is not
         // browsing, and data:/about: entries can't be meaningfully
-        // revisited from the list.
-        if (currentUrl.startsWith("https://") || currentUrl.startsWith("http://")) {
-            history.add(currentUrl, currentTitle)
+        // revisited from the list. Background tabs record theirs too.
+        if (tab.url.startsWith("https://") || tab.url.startsWith("http://")) {
+            history.add(tab.url, tab.title)
         }
-        isLoading = false
+        if (tabManager.isActive(webviewId)) isLoading = false
     }
 
-    override fun onTitleChanged(title: String) {
-        currentTitle = title
-        lastTitleForTest = title
+    override fun onTitleChanged(webviewId: String, title: String) {
+        val tab = tabManager.route(webviewId) ?: return
+        tab.title = title
+        tabStripVersion++
+        if (tabManager.isActive(webviewId)) {
+            currentTitle = title
+            lastTitleForTest = title
+        }
     }
 
-    override fun onUrlChanged(url: String) {
+    override fun onUrlChanged(webviewId: String, url: String) {
+        val tab = tabManager.route(webviewId) ?: return
+        tab.url = url
+        tabStripVersion++
+        if (!tabManager.isActive(webviewId)) return
         currentUrl = url
         if (loadError != null && loadError?.url != url) loadError = null
         exitArmedAt = 0L
         if (!omniboxFocused) {
             urlState.edit { replace(0, length, hostOf(displayableUrl(url))) }
+        }
+    }
+
+    override fun onHistoryChanged(webviewId: String, canGoBack: Boolean, canGoForward: Boolean) {
+        val tab = tabManager.route(webviewId) ?: return
+        tab.canGoBack = canGoBack
+        tab.canGoForward = canGoForward
+        if (tabManager.isActive(webviewId)) {
+            navigator.canGoBack = canGoBack
+            navigator.canGoForward = canGoForward
+        }
+    }
+
+    // ---- tab operations (engine patch 030 JNI: newTab/activateTab/closeTab) ----
+
+    private fun openNewTab(url: String) {
+        if (!tabManager.canOpenNew()) {
+            alertMessage = "Tab limit reached (${TabManager.DEFAULT_MAX_TABS})."
+            return
+        }
+        val scope = uiScope ?: return
+        val servo = ServoHolder.servo ?: return
+        scope.launch {
+            val id = servo.newTab(url)
+            if (id.isEmpty()) return@launch
+            val tab = tabManager.route(id) ?: return@launch
+            tab.url = url
+            tab.loading = true
+            tabManager.markActive(id)
+            tabStripVersion++
+            loadError = null
+            publishActiveTab()
+        }
+    }
+
+    private fun switchToTab(id: String) {
+        if (id == tabManager.activeId) return
+        val scope = uiScope ?: return
+        val servo = ServoHolder.servo ?: return
+        scope.launch {
+            if (!servo.activateTab(id)) return@launch
+            tabManager.markActive(id)
+            loadError = null
+            publishActiveTab()
+            tabStripVersion++
+        }
+    }
+
+    private fun closeTab(id: String) {
+        // Last-tab rule: never leave the browser with no webview; recycle the
+        // only tab into the start page instead of closing it.
+        if (tabManager.order.size <= 1) {
+            navigate(startPageUrl)
+            return
+        }
+        val scope = uiScope ?: return
+        val servo = ServoHolder.servo ?: return
+        scope.launch {
+            if (!servo.closeTab(id)) return@launch
+            val wasActive = tabManager.onClosed(id)
+            tabStripVersion++
+            if (wasActive) {
+                // The engine has already activated the next-newest tab.
+                val newActive = servo.activeTabId()
+                if (newActive.isNotEmpty()) {
+                    tabManager.route(newActive)
+                    tabManager.markActive(newActive)
+                    loadError = null
+                    publishActiveTab()
+                    tabStripVersion++
+                }
+            }
+        }
+    }
+
+    /** Publish the active tab's state to the single-tab UI fields after a
+     * switch. The engine re-reports title/url/history for the newly active
+     * webview as well; publishing immediately keeps strip and omnibox
+     * consistent in the meantime. */
+    private fun publishActiveTab() {
+        val tab = tabManager.states[tabManager.activeId] ?: return
+        currentUrl = tab.url
+        currentTitle = tab.title
+        isLoading = tab.loading
+        navigator.canGoBack = tab.canGoBack
+        navigator.canGoForward = tab.canGoForward
+        if (!omniboxFocused) {
+            urlState.edit { replace(0, length, hostOf(displayableUrl(tab.url))) }
         }
     }
 
@@ -849,13 +994,21 @@ class MainActivity : ComponentActivity(), Servo.Client {
             Log.i("ArgonNav", "loadError dropped: stale identity gen=$generation")
             return
         }
+        if (!tabManager.isActive(webviewId)) {
+            Log.i("ArgonNav", "loadError dropped: background tab")
+            return
+        }
         loadError = LoadError(url, kind, reason)
     }
 
     override fun onTopLevelLoad(webviewId: String, pipelineId: String, url: String, generation: Long) {
-        // A new top-level request supersedes any error card still showing.
+        // Adopt the first webview here (it is the engine's earliest signal)
+        // so all later id-tagged events route to a known tab.
+        tabManager.route(webviewId)
+        // A new top-level request supersedes any error card still showing on
+        // ITS OWN webview; other tabs' cards are unaffected.
         loadErrorGate.onTopLevelLoad(webviewId, pipelineId, generation)
-        loadError = null
+        if (tabManager.isActive(webviewId)) loadError = null
     }
 
     override fun onDestroy() {

@@ -1,0 +1,111 @@
+package me.ik.argon
+
+/** Standalone state-machine tests for TabManager (kotlinc-run, no device). */
+private fun check(cond: Boolean, name: String) {
+    if (!cond) throw AssertionError("FAIL: $name") else println("PASS: $name")
+}
+
+fun main() {
+    // 1. first event adopts the first tab and makes it active
+    run {
+        val tm = TabManager()
+        val t = tm.route("wv1")!!
+        check(tm.activeId == "wv1", "first webview becomes active")
+        t.url = "https://a.example"
+        check(tm.states["wv1"]?.url == "https://a.example", "routed state persists")
+    }
+    // 2. stale background event: pre-switch queued event lands on its own tab
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        tm.route("wv2")
+        tm.markActive("wv2") // user switched before wv1's event arrived
+        val t = tm.route("wv1")!! // stale queued event from the old tab
+        t.title = "old title"
+        check(tm.states["wv1"]?.title == "old title", "stale event updates its source tab")
+        check(tm.states["wv2"]?.title == "", "active tab state untouched by stale event")
+        check(!tm.isActive("wv1"), "stale source is not active; UI must not publish it")
+    }
+    // 3. out-of-order: event for a tab that was closed is re-adopted but never
+    //    becomes active (engine never reports events for closed webviews in
+    //    practice; if a race did, it must not hijack the active tab)
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        tm.route("wv2")
+        tm.markActive("wv2")
+        tm.onClosed("wv1")
+        val t = tm.route("wv1")!! // resurrected by a racing event
+        t.loading = true
+        check(tm.activeId == "wv2", "racing event never changes the active tab")
+        check(!tm.isActive("wv1"), "resurrected tab is not active")
+    }
+    // 4. close active: engine activates next-newest; manager drops state and
+    //    reports the closure so the caller re-reads activeTabId()
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        tm.route("wv2")
+        tm.markActive("wv2")
+        check(tm.onClosed("wv2"), "closing active tab reported")
+        check("wv2" !in tm.states, "closed tab state dropped")
+        tm.markActive("wv1") // engine-reported next active
+        check(tm.activeId == "wv1", "engine-chosen next tab becomes active")
+    }
+    // 5. last-tab close is refused by the UI rule (MainActivity recycles it to
+    //    the start page); the manager itself only tracks order
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        check(tm.order.size == 1, "single tab: UI must recycle, not close")
+    }
+    // 6. tab cap: user-initiated opens stop at the cap; engine adoption does not
+    run {
+        val tm = TabManager(maxTabs = 3)
+        tm.route("wv1")
+        tm.route("wv2")
+        tm.route("wv3")
+        check(!tm.canOpenNew(), "cap reached: no user-initiated new tab")
+        tm.route("wv4") // engine-adopted id still tracked (e.g. window.open)
+        check(tm.states.containsKey("wv4"), "engine-adopted tab tracked past the cap")
+    }
+    // 7. per-tab independence of nav state
+    run {
+        val tm = TabManager()
+        val a = tm.route("wv1")!!
+        val b = tm.route("wv2")!!
+        a.canGoBack = true
+        b.canGoForward = true
+        check(tm.states["wv1"]?.canGoBack == true && tm.states["wv1"]?.canGoForward == false,
+            "tab1 nav state independent")
+        check(tm.states["wv2"]?.canGoForward == true && tm.states["wv2"]?.canGoBack == false,
+            "tab2 nav state independent")
+    }
+    // 8. legacy empty-id events attribute to the active tab (reattach replay)
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        tm.route("wv2")
+        tm.markActive("wv2")
+        val t = tm.route("")!!
+        t.url = "https://replay.example"
+        check(tm.states["wv2"]?.url == "https://replay.example", "empty id attributes to active")
+        check(tm.isActive(""), "empty id counts as active (legacy single-tab path)")
+    }
+    // 9. empty id before any tab exists routes to nothing
+    run {
+        val tm = TabManager()
+        check(tm.route("") == null, "empty id with no active tab routes nowhere")
+    }
+    // 10. closing a background tab leaves the active tab intact
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        tm.route("wv2")
+        tm.markActive("wv1")
+        check(!tm.onClosed("wv2"), "background close not reported as active-close")
+        check(tm.activeId == "wv1", "active tab unchanged by background close")
+        check(tm.order == listOf("wv1"), "order shrinks to remaining tab")
+    }
+    println("ALL TABMANAGER TESTS PASSED")
+}

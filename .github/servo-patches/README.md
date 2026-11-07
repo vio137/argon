@@ -90,11 +90,19 @@ site-loading and browsing performance before drawing conclusions.
   newTab(url): String, activateTab(id): Boolean, closeTab(id): Boolean,
   activeTabId(): String. Tab ids cross JNI as opaque WebViewId Display
   strings, matched by exact string equality engine-side. Navigation commands
-  (loadUri/back/forward/reload/stop) and title/url/history/load-status
-  callbacks already act on the ACTIVE webview (update_user_interface_state),
-  so switching tabs re-reports the new active tab's state without callback
-  multiplexing. Closing the active tab activates the next-newest; the app
-  keeps at least one tab open by UI rule.
+  (loadUri/back/forward/reload/stop) act on the ACTIVE webview.
+- 030 v2 (current): every webview-state host callback is source-id-tagged
+  (onTitleChanged/onUrlChanged/onHistoryChanged/onLoadStarted/onLoadEnded/
+  onAlert all carry the webview id; onLoadError/onTopLevelLoad already did).
+  update_user_interface_state samples the ACTIVE webview, but queued
+  pre-switch events are routed app-side by source id, so an event from a
+  background or just-closed tab can never land on the active tab's state;
+  per-tab history/scroll are preserved because hidden webviews keep their
+  pipelines. Closing the active tab activates the next-newest; the app
+  keeps at least one tab open by UI rule. Target scoping: the desktop
+  servoshell host module is cfg-gated out of Android builds and the ohos
+  HostCallbacks would need the same signature updates if composed for
+  those targets - Android-only compile is unaffected.
 
 ### 020 revision history
 - v1 (2ad46c0): initial signal; raw bounded reason string (RETRACTED:

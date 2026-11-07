@@ -1,6 +1,7 @@
 package me.ik.argon
 
-/** Standalone state-machine tests for LoadErrorGate (kotlinc-run, no device). */
+/** Standalone state-machine tests for LoadErrorGate (kotlinc-run, no device).
+ * The gate is keyed per webview since engine patch 030 (tabs). */
 private fun check(cond: Boolean, name: String) {
     if (!cond) throw AssertionError("FAIL: $name") else println("PASS: $name")
 }
@@ -11,14 +12,14 @@ fun main() {
         val g = LoadErrorGate()
         g.onTopLevelLoad("wv1", "p1", 1)
         check(g.shouldShowError("wv1", "p1", 1), "current error shows")
-        g.onNavigationInitiated()
+        g.onNavigationInitiated("wv1")
         check(!g.shouldShowError("wv1", "p1", 1), "stale error after submit dropped")
     }
     // 2. stale error after new start (old tuple vs new tuple)
     run {
         val g = LoadErrorGate()
         g.onTopLevelLoad("wv1", "p1", 1)
-        g.onNavigationInitiated()
+        g.onNavigationInitiated("wv1")
         g.onTopLevelLoad("wv1", "p2", 2)
         check(!g.shouldShowError("wv1", "p1", 1), "old load error dropped after new start")
         check(g.shouldShowError("wv1", "p2", 2), "new load error shows")
@@ -27,7 +28,7 @@ fun main() {
     run {
         val g = LoadErrorGate()
         g.onTopLevelLoad("wv1", "p1", 1)
-        g.onNavigationInitiated()
+        g.onNavigationInitiated("wv1")
         g.onTopLevelLoad("wv1", "p1", 2) // same-URL reload may reuse nothing
         check(!g.shouldShowError("wv1", "p1", 1), "same-URL older generation dropped")
         check(g.shouldShowError("wv1", "p1", 2), "same-URL newer generation shows")
@@ -39,45 +40,48 @@ fun main() {
         g.onTopLevelLoad("wv1", "p1", 5)
         check(g.shouldShowError("wv1", "p1", 5), "redirected load failure shows (url ignored)")
     }
-    // 5. failed pending load: A starts, B starts before A fails
+    // 5. generation 0 (untracked, fail-closed overflow policy) never matches
     run {
         val g = LoadErrorGate()
-        g.onTopLevelLoad("wv1", "pA", 1)
-        g.onTopLevelLoad("wv1", "pB", 2)
-        check(!g.shouldShowError("wv1", "pA", 1), "superseded pending load error dropped")
-        check(g.shouldShowError("wv1", "pB", 2), "current pending load error shows")
+        g.onTopLevelLoad("wv1", "p1", 0)
+        check(!g.shouldShowError("wv1", "p1", 0), "gen0 start clears; gen0 error never shows")
+        check(g.currentFor("wv1") == null, "gen0 clears the webview identity")
     }
-    // 6. out of order: start A, start B, error B, error A
+    // 6. untracked webview error never shows
     run {
         val g = LoadErrorGate()
-        g.onTopLevelLoad("wv1", "pA", 1)
-        g.onTopLevelLoad("wv1", "pB", 2)
-        check(g.shouldShowError("wv1", "pB", 2), "later load error shows first")
-        check(!g.shouldShowError("wv1", "pA", 1), "earlier load error after still dropped")
+        check(!g.shouldShowError("wvX", "p9", 9), "untracked webview error dropped")
     }
-    // 7. untracked generation (0) never matches, even against nothing
-    run {
-        val g = LoadErrorGate()
-        check(!g.shouldShowError("wv1", "pX", 0), "gen0 with no identity dropped")
-        check(!g.shouldShowError("wv1", "pX", 0), "gen0 error dropped")
-    }
-    // 7b. gen0 start (fail-closed overflow) clears a previous identity
+    // 7. per-webview isolation: navigation on wv1 does not invalidate wv2
     run {
         val g = LoadErrorGate()
         g.onTopLevelLoad("wv1", "p1", 1)
-        g.onTopLevelLoad("wv1", "p2", 0)
-        check(g.current == null, "gen0 start clears identity")
-        check(!g.shouldShowError("wv1", "p1", 1), "pre-overflow error dropped after gen0 start")
-        check(!g.shouldShowError("wv1", "p2", 0), "overflow load error never shows")
+        g.onTopLevelLoad("wv2", "p2", 1)
+        g.onNavigationInitiated("wv1")
+        check(!g.shouldShowError("wv1", "p1", 1), "navigated webview identity cleared")
+        check(g.shouldShowError("wv2", "p2", 1), "other tab identity untouched")
     }
-    // 8. lifecycle: invalidation then fresh start
+    // 8. per-webview isolation: an error keyed to wv2 never matches wv1's tuple
     run {
         val g = LoadErrorGate()
-        g.onTopLevelLoad("wv1", "p1", 1)
-        g.onNavigationInitiated()
-        check(g.current == null, "invalidation clears identity")
-        g.onTopLevelLoad("wv1", "p3", 3)
-        check(g.shouldShowError("wv1", "p3", 3), "fresh start after invalidation works")
+        g.onTopLevelLoad("wv1", "p1", 3)
+        check(!g.shouldShowError("wv2", "p1", 3), "cross-webview tuple never matches")
     }
-    println("ALL LOADERRORGATE TESTS PASS")
+    // 9. a background tab starting a new load does not disturb the active tab
+    run {
+        val g = LoadErrorGate()
+        g.onTopLevelLoad("wvActive", "pa", 1)
+        g.onTopLevelLoad("wvBg", "pb", 7)
+        check(g.shouldShowError("wvActive", "pa", 1), "active identity survives background start")
+        check(g.shouldShowError("wvBg", "pb", 7), "background tab tracks its own identity")
+    }
+    // 10. monotonic generations: replayed old generation after newer start drops
+    run {
+        val g = LoadErrorGate()
+        g.onTopLevelLoad("wv1", "p1", 10)
+        g.onTopLevelLoad("wv1", "p2", 11)
+        check(!g.shouldShowError("wv1", "p1", 10), "older generation dropped")
+        check(g.shouldShowError("wv1", "p2", 11), "newest generation shows")
+    }
+    println("ALL LOADERRORGATE TESTS PASSED")
 }
