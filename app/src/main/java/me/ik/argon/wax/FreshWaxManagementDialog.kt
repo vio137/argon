@@ -115,9 +115,9 @@ object FreshWaxManagementDialog {
         if(setupUnknown)text.append("An earlier setup attempt ended with an unknown result: an account may remain on Cloudflare that Argon cannot recover or delete. Continuing may create a duplicate account.\n\n")
         else if(resume)text.append("An account was already created on this device but setup did not finish. Continuing completes setup with the SAME account - no new account is created.\n\n")
         text.append("Argon is not affiliated with Cloudflare, and Cloudflare does not officially support unofficial WARP apps. Cloudflare has blocked such apps before and may decline or block this setup; if that happens it fails and Argon does not try to work around it.\n\n")
-        text.append("Tapping the agree button contacts Cloudflare's service, accepts Cloudflare's Application Terms of Service and Privacy Policy, and creates a free WARP account for this device:\n\n")
-        text.append("https://www.cloudflare.com/application/terms/\nhttps://www.cloudflare.com/application/privacypolicy/\n\n")
-        text.append("The account key, token and profile are stored encrypted on this device and never shown. This step only creates the account: routing stays off until you separately enable and connect, the connection itself is not verified internet access, and WARP is not designed to make you anonymous.")
+        if(resume && !setupUnknown) text.append("Finishing setup contacts Cloudflare to retrieve configuration for the stored account. No new account is created and no new terms-acceptance request is sent. The provider's Application Terms and Privacy Policy are linked below.\n\n")
+        else text.append("Tapping the agree button contacts Cloudflare's service, accepts Cloudflare's Application Terms of Service and Privacy Policy, and requests a free WARP account for this device. Read both linked policies below.\n\n")
+        text.append("The account key, token and profile are stored encrypted on this device and never shown. Routing stays off until you separately enable and connect. An account or stored profile is not verified internet access, and WARP is not designed to make you anonymous.")
         return text.toString()
     }
     fun registrationDisclosureTitle(resume:Boolean,setupUnknown:Boolean):String=
