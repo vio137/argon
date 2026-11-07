@@ -179,9 +179,27 @@ object ReaderMode {
 
 @Composable
 fun ReaderOverlay(article: ReaderArticle, onClose: () -> Unit) {
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    // Reading progress: fraction of the article scrolled, drawn as the
+    // signature hairline along the top edge. Derived from item offsets,
+    // no animation loop.
+    val progress: Float by androidx.compose.runtime.derivedStateOf {
+        val info = listState.layoutInfo
+        val total = info.totalItemsCount
+        if (total <= 1) 0f
+        else {
+            val first = info.visibleItemsInfo.firstOrNull()
+            val index = first?.index ?: 0
+            val within =
+                if (first != null && first.size > 0)
+                    (-first.offset).coerceIn(0, first.size).toFloat() / first.size
+                else 0f
+            ((index + within) / (total - 1)).coerceIn(0f, 1f)
+        }
+    }
+    Box(Modifier.fillMaxSize().background(ArgonColors.Surface)) {
     Column(
         Modifier.fillMaxSize()
-            .background(ArgonColors.Surface)
             .statusBarsPadding()
             .navigationBarsPadding()
             .padding(horizontal = 20.dp),
@@ -204,7 +222,7 @@ fun ReaderOverlay(article: ReaderArticle, onClose: () -> Unit) {
                 )
             }
         }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(14.dp)) {
             item {
                 Column {
                     Text(
@@ -230,5 +248,18 @@ fun ReaderOverlay(article: ReaderArticle, onClose: () -> Unit) {
             }
             item { Spacer(Modifier.height(32.dp)) }
         }
+    }
+    Box(
+        Modifier.fillMaxWidth()
+            .height(2.5.dp)
+            .align(Alignment.TopCenter)
+            .background(ArgonColors.Hairline),
+    ) {
+        Box(
+            Modifier.fillMaxWidth(progress)
+                .height(2.5.dp)
+                .background(ArgonColors.Accent),
+        )
+    }
     }
 }

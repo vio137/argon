@@ -5,6 +5,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -24,7 +25,7 @@ object ArgonColors {
     val SurfaceHigh = Color(0xFF181C23)
     val Text = Color(0xFFF2F4F8)
     val Text2 = Color(0xFF9AA1AD)
-    val Text3 = Color(0xFF626A76)
+    val Text3 = Color(0xFF79828F)
     val Accent = Color(0xFF7AA7FF)
     val AccentSoft = Color(0x1F7AA7FF)
     val OnAccent = Color(0xFF0A0D14)
@@ -42,10 +43,10 @@ object ArgonType {
     val BodySmall = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Normal, lineHeight = 21.sp)
     val Caption = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Normal, lineHeight = 18.sp)
 
-    // Long-form reading (Reader view): article display sizes sit between
-    // Title and Hero, with a looser measure for paragraphs.
-    val ArticleTitle = TextStyle(fontSize = 25.sp, fontWeight = FontWeight.SemiBold, lineHeight = 31.sp)
-    val ArticleBody = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Normal, lineHeight = 27.sp)
+    // Long-form reading (Reader view): the one partner family - serif for
+    // article text, so reading feels different from UI chrome on purpose.
+    val ArticleTitle = TextStyle(fontFamily = FontFamily.Serif, fontSize = 25.sp, fontWeight = FontWeight.SemiBold, lineHeight = 31.sp)
+    val ArticleBody = TextStyle(fontFamily = FontFamily.Serif, fontSize = 17.sp, fontWeight = FontWeight.Normal, lineHeight = 27.sp)
 }
 
 // 4dp-base spacing scale.
