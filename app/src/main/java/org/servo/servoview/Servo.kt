@@ -278,6 +278,81 @@ object ServoHolder {
 }
 
 @Stable
+    /** Argon (engine patch 054): tracks one long-press gesture. [onEvent] arms a
+ * handler timer on DOWN and cancels it on slop-exceeding move, UP, CANCEL or
+ * an extra pointer; on timeout it invokes the callback with the down
+ * coordinates. [consumeFired] reports (once) that the current gesture already
+ * opened the menu, so its UP becomes a cancel rather than a click. */
+/** Argon (engine patch 054): one context-menu entry; null label = separator. */
+class ContextMenuEntry(val label: String?, val enabled: Boolean)
+
+private class LongPressState {
+    private var armed = false
+    private var fired = false
+    private var downX = 0f
+    private var downY = 0f
+    private var slopSq = 0f
+    private var pending: Runnable? = null
+
+    fun onEvent(
+        ev: MotionEvent,
+        handler: Handler,
+        slop: Int,
+        onLongPress: (Float, Float) -> Unit,
+    ) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                cancelPending(handler)
+                armed = true
+                fired = false
+                downX = ev.x
+                downY = ev.y
+                slopSq = (slop * slop).toFloat()
+                val r = Runnable {
+                    if (armed) {
+                        fired = true
+                        armed = false
+                        onLongPress(downX, downY)
+                    }
+                }
+                pending = r
+                handler.postDelayed(r, ViewConfiguration.getLongPressTimeout().toLong())
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (armed) {
+                    val dx = ev.x - downX
+                    val dy = ev.y - downY
+                    if (dx * dx + dy * dy > slopSq) {
+                        armed = false
+                        cancelPending(handler)
+                    }
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                armed = false
+                cancelPending(handler)
+            }
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL -> {
+                armed = false
+                cancelPending(handler)
+            }
+        }
+    }
+
+    private fun cancelPending(handler: Handler) {
+        pending?.let { handler.removeCallbacks(it) }
+        pending = null
+    }
+
+    /** True exactly once after the menu fired for the current gesture. */
+    fun consumeFired(): Boolean {
+        val f = fired
+        fired = false
+        return f
+    }
+}
+
 class ServoNavigator {
     private sealed interface NavigationEvent : Interaction {
         data class Navigate(val uri: String) : NavigationEvent
@@ -641,82 +716,7 @@ internal constructor(
     }
 
     interface Client {
-        /** Argon (engine patch 054): tracks one long-press gesture. [onEvent] arms a
- * handler timer on DOWN and cancels it on slop-exceeding move, UP, CANCEL or
- * an extra pointer; on timeout it invokes the callback with the down
- * coordinates. [consumeFired] reports (once) that the current gesture already
- * opened the menu, so its UP becomes a cancel rather than a click. */
-/** Argon (engine patch 054): one context-menu entry; null label = separator. */
-class ContextMenuEntry(val label: String?, val enabled: Boolean)
-
-private class LongPressState {
-    private var armed = false
-    private var fired = false
-    private var downX = 0f
-    private var downY = 0f
-    private var slopSq = 0f
-    private var pending: Runnable? = null
-
-    fun onEvent(
-        ev: MotionEvent,
-        handler: Handler,
-        slop: Int,
-        onLongPress: (Float, Float) -> Unit,
-    ) {
-        when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                cancelPending(handler)
-                armed = true
-                fired = false
-                downX = ev.x
-                downY = ev.y
-                slopSq = (slop * slop).toFloat()
-                val r = Runnable {
-                    if (armed) {
-                        fired = true
-                        armed = false
-                        onLongPress(downX, downY)
-                    }
-                }
-                pending = r
-                handler.postDelayed(r, ViewConfiguration.getLongPressTimeout().toLong())
-            }
-            MotionEvent.ACTION_MOVE -> {
-                if (armed) {
-                    val dx = ev.x - downX
-                    val dy = ev.y - downY
-                    if (dx * dx + dy * dy > slopSq) {
-                        armed = false
-                        cancelPending(handler)
-                    }
-                }
-            }
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                armed = false
-                cancelPending(handler)
-            }
-            MotionEvent.ACTION_UP,
-            MotionEvent.ACTION_CANCEL -> {
-                armed = false
-                cancelPending(handler)
-            }
-        }
-    }
-
-    private fun cancelPending(handler: Handler) {
-        pending?.let { handler.removeCallbacks(it) }
-        pending = null
-    }
-
-    /** True exactly once after the menu fired for the current gesture. */
-    fun consumeFired(): Boolean {
-        val f = fired
-        fired = false
-        return f
-    }
-}
-
-/** All webview-state callbacks carry the source webview id (engine
+            /** All webview-state callbacks carry the source webview id (engine
          * patch 030 v2); clients route by source, never by assumed-current. */
         fun onAlert(webviewId: String, message: String)
 
