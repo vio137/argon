@@ -1,0 +1,604 @@
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 7d189e9df..4f442af32 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -8,7 +8,7 @@ use servo_base::generic_channel::GenericCallback;
+ use servo_media::{MediaInstance, MediaInstanceError};
+ use servo_media_player::{
+     PlaybackState, Player, PlayerError, PlayerEvent,
+-    append::{AppendCallback, AppendEvent},
++    append::{AppendCallback, AppendEvent, AppendNotification, AppendOperationCallback},
+     metadata::Metadata,
+     video::VideoFrameRenderer,
+ };
+@@ -22,7 +22,7 @@ struct BufferState {
+     ready: bool,
+     updating: bool,
+     operation: u64,
+-    callback: Arc<dyn Fn(AppendEvent) + Send + Sync>,
++    callback: Arc<dyn Fn(AppendNotification) + Send + Sync>,
+ }
+ impl BufferState {
+     fn accepts(&self, operation: u64) -> bool {
+@@ -97,7 +97,10 @@ impl AndroidAppendPlayer {
+                             .filter(|b| b.accepts(operation))
+                             .map(|b| b.callback.clone());
+                         if let Some(callback) = callback {
+-                            callback(AppendEvent::UpdateStart);
++                            callback(AppendNotification {
++                                operation,
++                                event: AppendEvent::UpdateStart,
++                            });
+                         }
+                     },
+                     Event::CommandApplied(Applied::BufferAdded(id)) => {
+@@ -109,7 +112,10 @@ impl AndroidAppendPlayer {
+                             })
+                         };
+                         if let Some(cb) = cb {
+-                            cb(AppendEvent::Ready);
++                            cb(AppendNotification {
++                                operation: 0,
++                                event: AppendEvent::Ready,
++                            });
+                         }
+                     },
+                     Event::CommandApplied(Applied::Appended(id, operation)) => {
+@@ -125,8 +131,14 @@ impl AndroidAppendPlayer {
+                                 })
+                         };
+                         if let Some((cb, _updating)) = cb {
+-                            cb(AppendEvent::Update);
+-                            cb(AppendEvent::UpdateEnd);
++                            cb(AppendNotification {
++                                operation,
++                                event: AppendEvent::Update,
++                            });
++                            cb(AppendNotification {
++                                operation,
++                                event: AppendEvent::UpdateEnd,
++                            });
+                         }
+                     },
+                     Event::CommandApplied(_) => (),
+@@ -235,14 +247,20 @@ impl AndroidAppendPlayer {
+                                 .map(|b| {
+                                     let updating = b.updating;
+                                     b.updating = false;
+-                                    (b.callback.clone(), updating)
++                                    (b.callback.clone(), updating, b.operation)
+                                 })
+                                 .collect::<Vec<_>>()
+                         };
+-                        for (cb, updating) in callbacks {
+-                            cb(AppendEvent::Error);
++                        for (cb, updating, operation) in callbacks {
++                            cb(AppendNotification {
++                                operation,
++                                event: AppendEvent::Error,
++                            });
+                             if updating {
+-                                cb(AppendEvent::UpdateEnd);
++                                cb(AppendNotification {
++                                    operation,
++                                    event: AppendEvent::UpdateEnd,
++                                });
+                             }
+                         }
+                         send(PlayerEvent::Error(
+@@ -286,13 +304,16 @@ impl AndroidAppendPlayer {
+             s.paused = true;
+             std::mem::take(&mut s.buffers)
+                 .into_values()
+-                .map(|b| b.callback)
++                .map(|b| (b.callback, b.operation))
+                 .collect::<Vec<_>>()
+         };
+         let worker = self.worker.lock().unwrap().take();
+         drop(worker);
+-        for cb in callbacks {
+-            cb(AppendEvent::Closed);
++        for (cb, operation) in callbacks {
++            cb(AppendNotification {
++                operation,
++                event: AppendEvent::Closed,
++            });
+         }
+     }
+ }
+@@ -430,6 +451,30 @@ impl Player for AndroidAppendPlayer {
+         Err(PlayerError::SetTrackFailed)
+     }
+     fn append_add_buffer(&self, id: u32, callback: AppendCallback) -> Result<(), PlayerError> {
++        self.append_add_buffer_operations(
++            id,
++            Box::new(move |notification| callback(notification.event)),
++        )
++    }
++    fn append_abort(&self, id: u32) -> Result<u64, PlayerError> {
++        let mut s = self.state.lock().unwrap();
++        if s.stopped || s.input_ended {
++            return Err(error());
++        }
++        let buffer = s.buffers.get_mut(&id).ok_or_else(error)?;
++        let operation = buffer.operation.checked_add(1).ok_or_else(error)?;
++        // No callbacks are emitted for this command before or after acceptance.
++        // The caller owns abort/updateend event delivery and its task floor.
++        self.command(Command::AbortAppend(id))?;
++        buffer.operation = operation;
++        buffer.updating = false;
++        Ok(operation)
++    }
++    fn append_add_buffer_operations(
++        &self,
++        id: u32,
++        callback: AppendOperationCallback,
++    ) -> Result<(), PlayerError> {
+         let mut s = self.state.lock().unwrap();
+         if s.stopped || s.input_ended || s.buffers.len() >= 2 || s.buffers.contains_key(&id) {
+             return Err(error());
+@@ -502,6 +547,9 @@ impl Player for AndroidAppendPlayer {
+             .unwrap_or_default()
+     }
+     fn append_to_buffer(&self, id: u32, bytes: Vec<u8>) -> Result<(), PlayerError> {
++        self.append_to_buffer_operation(id, bytes).map(|_| ())
++    }
++    fn append_to_buffer_operation(&self, id: u32, bytes: Vec<u8>) -> Result<u64, PlayerError> {
+         let mut s = self.state.lock().unwrap();
+         if s.stopped || s.input_ended {
+             return Err(error());
+@@ -525,7 +573,7 @@ impl Player for AndroidAppendPlayer {
+             buffer.operation = previous_operation;
+             return Err(error);
+         }
+-        Ok(())
++        Ok(operation)
+     }
+ }
+ 
+@@ -657,4 +705,48 @@ mod tests {
+         assert!(!buffer.accepts(2));
+         assert!(buffer.accepts(3));
+     }
++    #[test]
++    fn rejected_abort_preserves_operation_and_inflight_state() {
++        let player = AndroidAppendPlayer::new(
++            72,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let (tx, rx) = mpsc::channel();
++        player
++            .lock()
++            .unwrap()
++            .append_add_buffer(
++                1,
++                Box::new(move |e| {
++                    let _ = tx.send(e);
++                }),
++            )
++            .unwrap();
++        assert_eq!(
++            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
++            AppendEvent::Ready
++        );
++        let p = player.lock().unwrap();
++        let old = p.worker.lock().unwrap().take();
++        drop(old);
++        let (worker, _receiver) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut state = p.state.lock().unwrap();
++            let buffer = state.buffers.get_mut(&1).unwrap();
++            buffer.operation = 17;
++            buffer.updating = true;
++        }
++        assert_eq!(p.append_abort(1), Err(PlayerError::EnoughData));
++        {
++            let state = p.state.lock().unwrap();
++            let buffer = state.buffers.get(&1).unwrap();
++            assert_eq!(buffer.operation, 17);
++            assert!(buffer.updating);
++        }
++        assert!(rx.try_recv().is_err());
++    }
+ }
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index 543e9c640..ee66986a6 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -192,6 +192,19 @@ impl Worker {
+             thread: Some(thread),
+         })
+     }
++    #[cfg(test)]
++    pub(crate) fn saturated_for_test() -> (Self, mpsc::Receiver<Command>) {
++        let (tx, rx) = mpsc::sync_channel(1);
++        tx.try_send(Command::Playing(false)).ok().unwrap();
++        (
++            Self {
++                tx: Some(tx),
++                cancel: Arc::new(AtomicBool::new(false)),
++                thread: None,
++            },
++            rx,
++        )
++    }
+     pub fn try_command(&self, command: Command) -> Result<(), SendError> {
+         if let Command::Append { bytes, .. } = &command {
+             if bytes.len() > 4 * 1024 * 1024 {
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index 469594a83..f39a49fe3 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -103,6 +103,10 @@ pub trait Player: Send + MediaInstance {
+     ) -> Result<(), PlayerError> {
+         Err(PlayerError::SetStreamFailed)
+     }
++    fn append_add_buffer_operations(&self,_id:u32,_callback:append::AppendOperationCallback)->Result<(),PlayerError> {Err(PlayerError::SetStreamFailed)}
++    /// Return an operation floor for filtering canceled notifications.
++    fn append_abort(&self,_id:u32)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
++    fn append_to_buffer_operation(&self,_id:u32,_bytes:Vec<u8>)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
+     fn append_to_buffer(&self, _id: u32, _bytes: Vec<u8>) -> Result<(), PlayerError> {
+         Err(PlayerError::BufferPushFailed)
+     }
+@@ -121,7 +125,6 @@ pub trait Player: Send + MediaInstance {
+     fn append_tracks(&self, _id: u32) -> Vec<append::AppendTrack> { vec![] }
+ 
+ }
+-
+ // END OWNER API
+ 
+ #[test] fn player_api_matches_owner_source() {
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index f24699ad8..5bb4272b9 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -54,7 +54,7 @@ mod tests {
+         let mut ended = false;
+         for _ in 0..6 {
+             if rx.recv_timeout(Duration::from_secs(2)).unwrap()
+-                == SourceEvent::BufferEvent(buffer.id(), AppendEvent::UpdateEnd)
++                == SourceEvent::BufferEvent(buffer.id(), AppendEvent::UpdateEnd,1)
+             {
+                 ended = true;
+                 break;
+@@ -132,7 +132,7 @@ mod pipeline_tests {
+         let mut ended = false;
+         for _ in 0..8 {
+             if rx.recv_timeout(Duration::from_secs(2)).unwrap()
+-                == SourceEvent::BufferEvent(buffer.id(), AppendEvent::UpdateEnd)
++                == SourceEvent::BufferEvent(buffer.id(), AppendEvent::UpdateEnd,1)
+             {
+                 ended = true;
+                 break;
+@@ -188,14 +188,56 @@ mod pipeline_tests {
+         let player=AndroidAppendPlayer::new(10,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
+         let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));
+         source.attach(player).unwrap();let buffer=source.add_buffer("video/mp4").unwrap();
+-        loop {if rx.recv_timeout(Duration::from_secs(2)).unwrap()==SourceEvent::BufferEvent(buffer.id(),AppendEvent::Ready){break;}}
++        loop {if rx.recv_timeout(Duration::from_secs(2)).unwrap()==SourceEvent::BufferEvent(buffer.id(),AppendEvent::Ready,0){break;}}
+         // BufferAdded may be queued after Ready on the worker: drain only the
+         // structural event, never mistake it for an append lifecycle event.
+         for event in rx.try_iter(){assert_eq!(event,SourceEvent::BufferAdded(buffer.id()));}
+         assert_eq!(buffer.append(vec![0;4*1024*1024+1]),Err(SourceError::Quota));
+         assert!(!buffer.updating());assert!(rx.try_recv().is_err());
+         buffer.append(vec![]).unwrap();
+-        for expected in [AppendEvent::UpdateStart,AppendEvent::Update,AppendEvent::UpdateEnd] {assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(buffer.id(),expected));}
++        for expected in [AppendEvent::UpdateStart,AppendEvent::Update,AppendEvent::UpdateEnd] {assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(buffer.id(),expected,1));}
+         assert!(!buffer.updating());source.detach();
+     }
+ }
++
++#[cfg(test)] mod abort_handshake_tests {
++    use crate::{Player,append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};
++    use std::{sync::{Arc,mpsc},time::Duration};
++    #[test] fn abort_floor_invalidates_old_queued_events_but_not_normal_prior_updateend() {
++        let player=AndroidAppendPlayer::new(71,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++        let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));
++        source.attach(player).unwrap();let buffer=source.add_buffer("video/mp4").unwrap();
++        loop {if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++        buffer.set_options(1.0,0.5..2.0).unwrap();
++        buffer.append(vec![0,0,0]).unwrap();
++        let mut queued=vec![];
++        loop {let e=rx.recv_timeout(Duration::from_secs(2)).unwrap();queued.push(e);if matches!(e,SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,_)){break;}}
++        assert!(queued.iter().any(|e|matches!(e,SourceEvent::BufferEvent(_,AppendEvent::UpdateStart,1))));
++        assert!(buffer.accepts_operation(1,AppendEvent::Update));
++        buffer.abort().unwrap();assert!(!buffer.updating());
++        assert_eq!(buffer.options().unwrap(),(1.0,0.0..f64::INFINITY));
++        for e in queued {if let SourceEvent::BufferEvent(_,event,operation)=e {assert!(!buffer.accepts_operation(operation,event));}}
++        buffer.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();
++        loop {let e=rx.recv_timeout(Duration::from_secs(2)).unwrap();if let SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,token)=e {assert_eq!(token,3);break;}}
++        assert!(buffer.accepts_operation(3,AppendEvent::UpdateEnd));
++        buffer.append(vec![]).unwrap();
++        // A normal later append must not discard the preceding updateend task.
++        assert!(buffer.accepts_operation(3,AppendEvent::UpdateEnd));
++        loop {if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,4)){break;}}
++        source.end_input().unwrap();assert_eq!(buffer.abort(),Err(SourceError::InvalidState));
++        source.detach();assert_eq!(buffer.abort(),Err(SourceError::InvalidState));
++    }
++    #[test] fn immediate_abort_then_append_receives_its_own_native_completion() {
++        for id in 0..16 {
++            let player=AndroidAppendPlayer::new(id,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++            let(tx,rx)=mpsc::channel();
++            player.lock().unwrap().append_add_buffer_operations(1,Box::new(move|e|{let _=tx.send(e);})).unwrap();
++            assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().event,AppendEvent::Ready);
++            let mut p=player.lock().unwrap();assert_eq!(p.append_to_buffer_operation(1,vec![0,0,0]).unwrap(),1);
++            assert_eq!(p.append_abort(1).unwrap(),2);assert_eq!(p.append_to_buffer_operation(1,include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap(),3);
++            drop(p);
++            loop {let e=rx.recv_timeout(Duration::from_secs(2)).unwrap();if e.operation==3 && e.event==AppendEvent::UpdateEnd {break;}}
++            player.lock().unwrap().stop().unwrap();
++        }
++    }
++}
+diff --git a/components/media/player/append.rs b/components/media/player/append.rs
+index a70aecc0a..9906bcaa7 100644
+--- a/components/media/player/append.rs
++++ b/components/media/player/append.rs
+@@ -17,3 +17,8 @@ pub type AppendCallback = Box<dyn Fn(AppendEvent) + Send + Sync>;
+ 
+ #[derive(Clone,Debug,PartialEq,Eq)]
+ pub struct AppendTrack { pub id:u32, pub mime:String }
++
++/// Native operation identity survives callback races and queued script tasks.
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub struct AppendNotification {pub operation:u64,pub event:AppendEvent}
++pub type AppendOperationCallback=Box<dyn Fn(AppendNotification)+Send+Sync>;
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+index 6b998d464..e2af697a5 100644
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -21,7 +21,7 @@ pub enum SourceEvent {
+     Ended,
+     Closed,
+     BufferAdded(u32),
+-    BufferEvent(u32, AppendEvent),
++    BufferEvent(u32, AppendEvent, u64),
+ }
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum SourceError {
+@@ -37,6 +37,8 @@ struct Buffer {
+     window: std::ops::Range<f64>,
+     updating: bool,
+     ready: bool,
++    floor: u64,
++    operation: u64,
+ }
+ struct State {
+     state: SourceState,
+@@ -122,6 +124,8 @@ impl AppendSource {
+                     window: 0.0..f64::INFINITY,
+                     updating: false,
+                     ready: false,
++                    floor: 0,
++                    operation: 0,
+                 },
+             );
+             (
+@@ -131,7 +135,9 @@ impl AppendSource {
+             )
+         };
+         let weak = Arc::downgrade(&self.0);
+-        let callback = Box::new(move |event| {
++        let callback = Box::new(move |notification: crate::append::AppendNotification| {
++            let event = notification.event;
++            let operation = notification.operation;
+             let Some(inner) = weak.upgrade() else {
+                 return;
+             };
+@@ -140,10 +146,17 @@ impl AppendSource {
+                 if s.epoch != epoch {
+                     false
+                 } else if let Some(b) = s.buffers.get_mut(&id) {
++                    if event != AppendEvent::Ready && operation < b.floor {
++                        return;
++                    }
+                     match event {
+                         AppendEvent::Ready => b.ready = true,
+-                        AppendEvent::UpdateStart => b.updating = true,
+-                        AppendEvent::UpdateEnd | AppendEvent::Closed => b.updating = false,
++                        AppendEvent::UpdateStart if operation == b.operation => b.updating = true,
++                        AppendEvent::UpdateEnd | AppendEvent::Closed
++                            if operation == b.operation =>
++                        {
++                            b.updating = false
++                        },
+                         _ => (),
+                     }
+                     true
+@@ -152,13 +165,13 @@ impl AppendSource {
+                 }
+             };
+             if accepted {
+-                (inner.callback)(SourceEvent::BufferEvent(id, event));
++                (inner.callback)(SourceEvent::BufferEvent(id, event, operation));
+             }
+         });
+         if player
+             .lock()
+             .unwrap()
+-            .append_add_buffer(id, callback)
++            .append_add_buffer_operations(id, callback)
+             .is_err()
+         {
+             self.0.state.lock().unwrap().buffers.remove(&id);
+@@ -296,35 +309,73 @@ impl AppendBuffer {
+             .map(|p| p.lock().unwrap().append_buffered(self.id))
+             .unwrap_or_default()
+     }
+-    pub fn append(&self, bytes: Vec<u8>) -> Result<(), SourceError> {
++    /// The floor is checked both at callback arrival and again by queued DOM
++    /// tasks, closing the race where a worker cloned its callback before abort.
++    pub fn accepts_operation(&self, operation: u64, event: AppendEvent) -> bool {
++        self.owner.upgrade().is_some_and(|inner| {
++            let s = inner.state.lock().unwrap();
++            s.epoch == self.epoch
++                && s.buffers
++                    .get(&self.id)
++                    .is_some_and(|b| event == AppendEvent::Ready || operation >= b.floor)
++        })
++    }
++    pub fn abort(&self) -> Result<(), SourceError> {
+         let inner = self.owner.upgrade().ok_or(SourceError::InvalidState)?;
+-        let player = {
+-            let mut s = inner.state.lock().unwrap();
+-            if s.epoch != self.epoch || s.state != SourceState::Open {
+-                return Err(SourceError::InvalidState);
+-            }
+-            let b = s
+-                .buffers
+-                .get_mut(&self.id)
+-                .ok_or(SourceError::InvalidState)?;
+-            if b.updating {
+-                return Err(SourceError::InvalidState);
+-            }
+-            b.updating = true;
+-            s.player.clone().ok_or(SourceError::InvalidState)?
+-        };
+-        let result = player.lock().unwrap().append_to_buffer(self.id, bytes);
+-        if let Err(error) = result {
+-            let mut s = inner.state.lock().unwrap();
+-            if let Some(b) = s.buffers.get_mut(&self.id) {
+-                b.updating = false;
+-            }
+-            return Err(if error == PlayerError::EnoughData {
++        let mut s = inner.state.lock().unwrap();
++        if s.epoch != self.epoch
++            || s.state != SourceState::Open
++            || !s.buffers.contains_key(&self.id)
++        {
++            return Err(SourceError::InvalidState);
++        }
++        let player = s.player.clone().ok_or(SourceError::InvalidState)?;
++        let floor = player.lock().unwrap().append_abort(self.id).map_err(|e| {
++            if e == PlayerError::EnoughData {
+                 SourceError::Quota
+             } else {
+                 SourceError::Backend
+-            });
++            }
++        })?;
++        let buffer = s
++            .buffers
++            .get_mut(&self.id)
++            .ok_or(SourceError::InvalidState)?;
++        buffer.floor = floor;
++        buffer.operation = floor;
++        buffer.updating = false;
++        buffer.window = 0.0..f64::INFINITY;
++        Ok(())
++    }
++    pub fn append(&self, bytes: Vec<u8>) -> Result<(), SourceError> {
++        let inner = self.owner.upgrade().ok_or(SourceError::InvalidState)?;
++        let mut s = inner.state.lock().unwrap();
++        if s.epoch != self.epoch || s.state != SourceState::Open {
++            return Err(SourceError::InvalidState);
+         }
++        if s.buffers.get(&self.id).is_none_or(|b| b.updating) {
++            return Err(SourceError::InvalidState);
++        }
++        let player = s.player.clone().ok_or(SourceError::InvalidState)?;
++        // Hold the controller lock until the accepted operation receipt is
++        // stored. Worker callbacks release Player state before entering here.
++        let operation = player
++            .lock()
++            .unwrap()
++            .append_to_buffer_operation(self.id, bytes)
++            .map_err(|e| {
++                if e == PlayerError::EnoughData {
++                    SourceError::Quota
++                } else {
++                    SourceError::Backend
++                }
++            })?;
++        let buffer = s
++            .buffers
++            .get_mut(&self.id)
++            .ok_or(SourceError::InvalidState)?;
++        buffer.updating = true;
++        buffer.operation = operation;
+         Ok(())
+     }
+ }
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 7e62d9230..9c650625f 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -141,6 +141,10 @@ pub trait Player: Send + MediaInstance {
+     ) -> Result<(), PlayerError> {
+         Err(PlayerError::SetStreamFailed)
+     }
++    fn append_add_buffer_operations(&self,_id:u32,_callback:append::AppendOperationCallback)->Result<(),PlayerError> {Err(PlayerError::SetStreamFailed)}
++    /// Return an operation floor for filtering canceled notifications.
++    fn append_abort(&self,_id:u32)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
++    fn append_to_buffer_operation(&self,_id:u32,_bytes:Vec<u8>)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
+     fn append_to_buffer(&self, _id: u32, _bytes: Vec<u8>) -> Result<(), PlayerError> {
+         Err(PlayerError::BufferPushFailed)
+     }
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+index c7572fad3..04610a0cc 100644
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -180,11 +180,11 @@ impl MediaSource {
+                     .fire_event(cx, stylo_atoms::Atom::from("sourceclose"));
+             },
+             SourceEvent::BufferAdded(_) => (),
+-            SourceEvent::BufferEvent(id, event) => {
++            SourceEvent::BufferEvent(id, event, operation) => {
+                 if let Some(list) = self.source_buffers.get() {
+                     for buffer in list.buffers() {
+                         if buffer.buffer_id() == id {
+-                            buffer.fire_backend_event(cx, event);
++                            buffer.fire_backend_event(cx, event, operation);
+                             break;
+                         }
+                     }
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+index 2c7b24993..b4103d48f 100644
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -161,7 +161,11 @@ impl SourceBuffer {
+         &self,
+         cx: &mut JSContext,
+         event: servo_media::player::append::AppendEvent,
++        operation: u64,
+     ) {
++        if !self.buffer.accepts_operation(operation, event) {
++            return;
++        }
+         use servo_media::player::append::AppendEvent;
+         // DOM observable state changes on the media task, not on the native
+         // worker before its completion event has been delivered to script.
+@@ -276,9 +280,27 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+         Ok(())
+     }
+     fn Abort(&self) -> Fallible<()> {
+-        Err(Error::NotSupported(Some(
+-            "Decoder/parser abort reset is not implemented".to_owned(),
+-        )))
++        self.buffer.abort().map_err(source_error)?;
++        let was_updating = self.updating.replace(false);
++        self.last_start.set(0.0);
++        self.last_end.set(f64::INFINITY);
++        if was_updating {
++            let this = Trusted::new(self);
++            self.global()
++                .task_manager()
++                .media_element_task_source()
++                .queue(task!(append_aborted:move|cx|{
++                    this.root().upcast::<EventTarget>().fire_event(cx,atom!("abort"));
++                }));
++            let this = Trusted::new(self);
++            self.global()
++                .task_manager()
++                .media_element_task_source()
++                .queue(task!(append_abort_ended:move|cx|{
++                    this.root().upcast::<EventTarget>().fire_event(cx,atom!("updateend"));
++                }));
++        }
++        Ok(())
+     }
+     fn ChangeType(&self, _: DOMString) -> Fallible<()> {
+         Err(Error::NotSupported(Some(
