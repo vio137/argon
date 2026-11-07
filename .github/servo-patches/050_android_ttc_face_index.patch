@@ -1,0 +1,64 @@
+From 7e7653377ce23f0f9c46e76d9ee0a03584e29f9f Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sat, 7 Nov 2026 15:37:24 +0530
+Subject: [PATCH] 050: parse fonts.xml index attr, thread face_index for TTC
+ faces
+
+---
+ components/fonts/platform/freetype/android/font_list.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/components/fonts/platform/freetype/android/font_list.rs b/components/fonts/platform/freetype/android/font_list.rs
+index 664af85..7aca085 100644
+--- a/components/fonts/platform/freetype/android/font_list.rs
++++ b/components/fonts/platform/freetype/android/font_list.rs
+@@ -108,6 +108,7 @@ static FONT_LIST: LazyLock<FontList> = LazyLock::new(FontList::new);
+ 
+ struct Font {
+     filename: String,
++    index: u32,
+     weight: Option<i32>,
+     style: Option<String>,
+ }
+@@ -216,6 +217,7 @@ impl FontList {
+                 name: item.0.into(),
+                 fonts: vec![Font {
+                     filename: item.1.into(),
++                    index: 0,
+                     weight: None,
+                     style: None,
+                 }],
+@@ -379,6 +381,7 @@ impl FontList {
+                 .iter()
+                 .map(|f| Font {
+                     filename: f.clone(),
++                    index: 0,
+                     weight: None,
+                     style: None,
+                 })
+@@ -398,9 +401,13 @@ impl FontList {
+             // Parse font weight
+             let weight = Self::find_attrib("weight", attrs).and_then(|w| w.parse().ok());
+             let style = Self::find_attrib("style", attrs);
++            let index = Self::find_attrib("index", attrs)
++                .and_then(|i| i.parse().ok())
++                .unwrap_or(0);
+ 
+             out.push(Font {
+                 filename,
++                index,
+                 weight,
+                 style,
+             })
+@@ -486,7 +493,7 @@ where
+     let mut produce_font = |font: &Font| {
+         let local_font_identifier = LocalFontIdentifier {
+             path: Atom::from(FontList::font_absolute_path(&font.filename)),
+-            face_index: 0,
++            face_index: font.index as u16,
+             named_instance_index: 0,
+         };
+         let width = StyleFontWidth::NORMAL;
+-- 
+2.34.1
+
