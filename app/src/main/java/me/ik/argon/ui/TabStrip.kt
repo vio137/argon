@@ -1,6 +1,7 @@
 package me.ik.argon.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -21,12 +22,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import me.ik.argon.ArgonColors
 import me.ik.argon.ArgonType
+import me.ik.argon.FaviconStore
 
 /** Snapshot of the strip's presentation data. @Immutable so ArgonTabStrip is
  * skippable: without a stable wrapper the List<Pair<..>> parameter makes every
@@ -74,8 +78,12 @@ fun ArgonTabStrip(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Reading FaviconStore.version subscribes the strip to icon pushes.
+        val faviconVersion = FaviconStore.version
         data.chips.forEach { (id, label) ->
             val selected = id == data.activeId
+            val favicon =
+                androidx.compose.runtime.remember(id, faviconVersion) { FaviconStore.get(id) }
             Surface(
                 color = if (selected) ArgonColors.AccentSoft else ArgonColors.BgRaise,
                 shape = RoundedCornerShape(12.dp),
@@ -91,11 +99,24 @@ fun ArgonTabStrip(
                         ),
             ) {
                 if (compact) {
-                    // Compact density: fixed-size monogram chip, tinted per
-                    // site (site monogram placeholder until a favicon pipeline
-                    // lands); close only on the active chip so background chips
-                    // stay tap targets.
+                    // Compact density: favicon when the engine has pushed one
+                    // (patch 055), else the per-site tinted monogram; close
+                    // only on the active chip so background chips stay tap
+                    // targets.
                     Box(contentAlignment = Alignment.Center, modifier = Modifier.height(48.dp)) {
+                        if (favicon != null) {
+                            Image(
+                                bitmap = favicon.asImageBitmap(),
+                                contentDescription = null,
+                                modifier =
+                                    Modifier.padding(
+                                            start = 15.dp,
+                                            end = if (selected) 1.dp else 15.dp,
+                                        )
+                                        .size(18.dp)
+                                        .clip(RoundedCornerShape(4.dp)),
+                            )
+                        } else {
                         Text(
                             label.firstOrNull()?.uppercase() ?: "?",
                             color = if (selected) ArgonColors.Accent else siteTint(label),
@@ -106,6 +127,7 @@ fun ArgonTabStrip(
                                     end = if (selected) 2.dp else 16.dp,
                                 ),
                         )
+                        }
                     }
                     if (selected) {
                         Box(
@@ -120,6 +142,16 @@ fun ArgonTabStrip(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.height(48.dp).padding(start = 12.dp),
                 ) {
+                    if (favicon != null) {
+                        Image(
+                            bitmap = favicon.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp).clip(RoundedCornerShape(3.dp)),
+                        )
+                        androidx.compose.foundation.layout.Spacer(
+                            modifier = Modifier.padding(end = 6.dp)
+                        )
+                    }
                     Text(
                         label,
                         color = if (selected) ArgonColors.Text else ArgonColors.Text2,

@@ -1265,6 +1265,16 @@ class MainActivity : ComponentActivity(), Servo.Client {
         }
     }
 
+    override fun onFaviconChanged(webviewId: String, rgba: ByteArray, width: Int, height: Int) {
+        // Argon (engine patch 055): drop icons for closed or never-adopted
+        // webviews; adopting an unknown id from an icon push would resurrect
+        // a dead tab. Size/dimension validation and cache bounds live in
+        // FaviconStore.
+        if (tabManager.isTombstoned(webviewId)) return
+        if (!tabManager.states.containsKey(webviewId)) return
+        if (FaviconStore.put(webviewId, rgba, width, height)) tabStripVersion++
+    }
+
     override fun onUrlChanged(webviewId: String, url: String) {
         // Argon (engine patch 054): a navigation invalidates the page's
         // pending context menu; reply dismiss and drop the UI.
@@ -1372,6 +1382,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
             if (!servo.closeTab(id)) return@launch
             tabManager.states[id]?.let { recentlyClosed.add(it.url, it.title) }
             val wasActive = tabManager.onClosed(id)
+            FaviconStore.evict(id)
             tabStripVersion++
             if (wasActive) reconcileAfterActiveClosed()
         }
@@ -1387,6 +1398,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         val known = tabManager.states.containsKey(webviewId)
         if (known) tabManager.states[webviewId]?.let { recentlyClosed.add(it.url, it.title) }
         val wasActive = tabManager.onClosed(webviewId)
+        FaviconStore.evict(webviewId)
         if (!known) return
         tabStripVersion++
         if (wasActive) reconcileAfterActiveClosed()

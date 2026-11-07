@@ -733,6 +733,11 @@ internal constructor(
         /** Engine-initiated webview close (engine patch 030 v4). */
         fun onTabClosed(webviewId: String)
 
+        /** Argon (engine patch 055): favicon changed for the SOURCE webview;
+         * rgba is width x height RGBA8. The client validates bounds and keeps
+         * a bounded cache; malformed or oversized frames are dropped. */
+        fun onFaviconChanged(webviewId: String, rgba: ByteArray, width: Int, height: Int)
+
         fun onLoadError(
             webviewId: String,
             pipelineId: String,
@@ -904,6 +909,10 @@ internal constructor(
         override fun onTabClosed(webviewId: String) {
             Log.i("ArgonNav", "tabClosed")
             scope.launch { client.onTabClosed(webviewId) }
+        }
+
+        override fun onFaviconChanged(webviewId: String, rgba: ByteArray, width: Int, height: Int) {
+            scope.launch { client.onFaviconChanged(webviewId, rgba, width, height) }
         }
     }
 }

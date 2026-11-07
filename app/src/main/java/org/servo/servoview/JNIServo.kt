@@ -138,6 +138,12 @@ internal class JNIServo {
          * the app's own closeTab, so the app can tombstone the id. */
         fun onTabClosed(webviewId: String)
 
+        /** Argon (engine patch 055): favicon changed for the SOURCE webview.
+         * rgba is width x height RGBA8; the app validates size/dimension
+         * bounds and keeps a bounded per-webview cache. Malformed or
+         * oversized frames and icons for closed tabs are dropped. */
+        fun onFaviconChanged(webviewId: String, rgba: ByteArray, width: Int, height: Int)
+
         fun onImeShow()
 
         fun onImeHide()
