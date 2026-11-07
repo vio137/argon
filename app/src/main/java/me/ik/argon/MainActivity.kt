@@ -571,6 +571,20 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     if (showAbout) {
                         AboutDialog(onDismiss = { showAbout = false })
                     }
+                    if (StoreHealth.corruptPreserveError.value) {
+                        AlertDialog(
+                            onDismissRequest = { StoreHealth.corruptPreserveError.value = false },
+                            title = { Text("Data file unreadable") },
+                            text = {
+                                Text(
+                                    "A saved data file couldn't be read, and it couldn't be safely moved aside either. It has been left untouched, and saving is paused for that list so nothing is overwritten. Freeing storage space and restarting Argon may recover it."
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = { StoreHealth.corruptPreserveError.value = false }) { Text("OK") }
+                            },
+                        )
+                    }
                     if (StoreHealth.writeError.value) {
                         AlertDialog(
                             onDismissRequest = { StoreHealth.writeError.value = false },

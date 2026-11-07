@@ -10,6 +10,12 @@ object Blocklist {
     private const val FILE_NAME = "android_hosts"
     private const val DIGEST_FILE = "$FILE_NAME.sha256"
     private const val LEGACY_MARKER = "$FILE_NAME.version"
+    // SHA-256 of the hosts.txt shipped in every build so far (unchanged
+    // since the initial commit). A legacy version marker alone cannot prove
+    // the bytes on disk are ours - the user may have edited the file - so
+    // only this content digest does.
+    private const val SHIPPED_DIGEST =
+        "9490e167cc4c8c224130bea890ded1040474ecc3814771a78bb1f2b2ac12bc5d"
     private const val EMPTY_FILE = "android_hosts_empty"
 
     private fun sha256(bytes: ByteArray): String =
@@ -35,7 +41,7 @@ object Blocklist {
                 if (out.exists() && out.length() > 0) runCatching { sha256(out.readBytes()) }.getOrNull()
                 else null
             val isOurCopy =
-                fileDigest != null && (fileDigest == recorded || legacy.exists())
+                fileDigest != null && (fileDigest == recorded || fileDigest == SHIPPED_DIGEST)
             when {
                 fileDigest == assetDigest -> Unit // already current
                 fileDigest == null || isOurCopy ->
@@ -48,18 +54,24 @@ object Blocklist {
             legacy.delete()
             Os.setenv("HOST_FILE", out.absolutePath, true)
         } else {
-            // Only remove a file we can prove is our copy; a custom list
-            // stays on disk. Either way the engine gets an empty list so
-            // blocking really turns off.
+            // Either way the engine gets an empty list so blocking really
+            // turns off; the file itself is only touched when provably ours.
             val recorded = runCatching { marker.readText().trim() }.getOrNull()
             val fileDigest =
                 if (out.exists() && out.length() > 0) runCatching { sha256(out.readBytes()) }.getOrNull()
                 else null
-            if (fileDigest == null || fileDigest == recorded || legacy.exists()) {
+            // Only remove bytes we can prove are ours (our recorded write or
+            // the shipped list). Missing/empty is safe to remove; custom,
+            // unknown or UNREADABLE files are always left in place.
+            val removable =
+                !out.exists() ||
+                    (out.length() == 0L && fileDigest == null) ||
+                    (fileDigest != null && (fileDigest == recorded || fileDigest == SHIPPED_DIGEST))
+            if (removable) {
                 out.delete()
                 marker.delete()
-                legacy.delete()
             }
+            legacy.delete()
             val empty = File(dir, EMPTY_FILE)
             runCatching { if (!empty.exists()) empty.writeBytes(ByteArray(0)) }
             Os.setenv("HOST_FILE", empty.absolutePath, true)

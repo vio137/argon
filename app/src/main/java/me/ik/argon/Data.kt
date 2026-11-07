@@ -1,6 +1,7 @@
 package me.ik.argon
 
 import android.content.Context
+import android.util.AtomicFile
 import java.io.File
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -18,39 +19,57 @@ private val storeJson = Json { ignoreUnknownKeys = true }
  */
 object StoreHealth {
     val writeError = androidx.compose.runtime.mutableStateOf(false)
+    /** A corrupt store could not even be moved aside safely; the original is
+     * untouched and all saves for that store are blocked. */
+    val corruptPreserveError = androidx.compose.runtime.mutableStateOf(false)
 }
 
-/** Atomic store write: serialize to a sibling temp file, then rename over
- * the target, so a crash mid-write can never leave a truncated store.
- * Returns success; failures are surfaced via [StoreHealth] and never
- * swallowed silently. */
+/** Result of loading a store: the decoded entries and whether a corrupt
+ * original could NOT be quarantined (in which case saves must stay blocked
+ * so the original is never overwritten). */
+private class LoadedStore<T>(val entries: List<T>, val quarantineFailed: Boolean)
+
+/** Durable store write via AtomicFile: the previous good bytes are kept in
+ * AtomicFile's own backup until finishWrite syncs the replacement, so a
+ * crash or failure mid-write leaves the last good store recoverable. The
+ * target is never deleted to make room for a save. */
 private fun writeStore(file: File, payload: String): Boolean {
-    val tmp = File(file.parentFile, file.name + ".tmp")
-    return runCatching {
-            tmp.writeText(payload)
-            if (!tmp.renameTo(file)) {
-                // Some filesystems refuse rename-over-existing; fall back to
-                // delete+rename, still never writing the target in place.
-                file.delete()
-                check(tmp.renameTo(file))
-            }
-        }
-        .onFailure { StoreHealth.writeError.value = true }
-        .isSuccess
+    val af = AtomicFile(file)
+    var out: java.io.FileOutputStream? = null
+    return try {
+        out = af.startWrite()
+        out.write(payload.toByteArray(Charsets.UTF_8))
+        out.flush()
+        af.finishWrite(out)
+        true
+    } catch (t: Throwable) {
+        af.failWrite(out)
+        StoreHealth.writeError.value = true
+        false
+    }
 }
 
-/**
- * Load a JSON store. A present-but-undecodable file is RENAMED ASIDE
- * (preserved as <name>.corrupt) instead of being left in place where the
- * next save would silently overwrite potentially recoverable data.
- */
-private inline fun <reified T> loadStore(file: File, fallback: List<T>): List<T> {
-    val decoded = runCatching { storeJson.decodeFromString<List<T>>(file.readText()) }
-    return decoded.getOrElse {
-        if (file.exists() && file.length() > 0) {
-            runCatching { file.renameTo(File(file.parentFile, file.name + ".corrupt")) }
+private inline fun <reified T> loadStore(file: File): LoadedStore<T> {
+    if (!file.exists()) return LoadedStore(emptyList(), quarantineFailed = false)
+    val bytes = runCatching { AtomicFile(file).openRead().use { it.readBytes() } }.getOrNull()
+    val decoded = bytes?.let { runCatching { storeJson.decodeFromString<List<T>>(String(it, Charsets.UTF_8)) }.getOrNull() }
+    if (decoded != null) return LoadedStore(decoded, quarantineFailed = false)
+    if (bytes == null || bytes.isEmpty()) return LoadedStore(emptyList(), quarantineFailed = false)
+    // Corrupt content: move it aside under a UNIQUE name so later saves can
+    // never overwrite recoverable data. If quarantine itself fails, the
+    // original stays put, saves are blocked, and the user is told.
+    var attempt = 0
+    while (true) {
+        val quarantine =
+            File(file.parentFile, "${file.name}.corrupt-${System.currentTimeMillis()}-${attempt}")
+        if (quarantine.exists()) { attempt += 1; continue }
+        val moved = runCatching { file.renameTo(quarantine) }.getOrDefault(false)
+        return if (moved) {
+            LoadedStore(emptyList(), quarantineFailed = false)
+        } else {
+            StoreHealth.corruptPreserveError.value = true
+            LoadedStore(emptyList(), quarantineFailed = true)
         }
-        fallback
     }
 }
 
@@ -60,8 +79,14 @@ class HistoryStore(context: Context) {
     var entries: List<HistoryEntry> = emptyList()
         private set
 
+    /** When true, a corrupt original could not be quarantined; saving is
+     * blocked so the original bytes are never overwritten. */
+    private var savesBlocked = false
+
     init {
-        entries = loadStore(file, emptyList())
+        val loaded = loadStore<HistoryEntry>(file)
+        entries = loaded.entries
+        savesBlocked = loaded.quarantineFailed
     }
 
     @Synchronized
@@ -92,6 +117,10 @@ class HistoryStore(context: Context) {
     }
 
     private fun save() {
+        if (savesBlocked) {
+            StoreHealth.corruptPreserveError.value = true
+            return
+        }
         writeStore(file, storeJson.encodeToString(entries))
     }
 }
@@ -102,10 +131,14 @@ class BookmarkStore(context: Context) {
     var entries: List<Bookmark> = emptyList()
         private set
 
+    private var savesBlocked = false
+
     init {
         // No shipped bookmarks: the start page must only ever show pages
         // the user actually starred (same rule as history).
-        entries = loadStore(file, emptyList())
+        val loaded = loadStore<Bookmark>(file)
+        entries = loaded.entries
+        savesBlocked = loaded.quarantineFailed
     }
 
     @Synchronized
@@ -131,6 +164,10 @@ class BookmarkStore(context: Context) {
     }
 
     private fun save() {
+        if (savesBlocked) {
+            StoreHealth.corruptPreserveError.value = true
+            return
+        }
         writeStore(file, storeJson.encodeToString(entries))
     }
 }
