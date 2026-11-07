@@ -1,0 +1,460 @@
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 43aa3b93e..fdcbbaef9 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -35,11 +35,21 @@ struct State {
+     volume: f64,
+     stopped: bool,
+     input_ended: bool,
++    pending_seek: Option<u64>,
+     buffers: BTreeMap<u32, BufferState>,
+     buffered: Vec<Range<f64>>,
+     buffer_ranges: BTreeMap<u32, Vec<Range<f64>>>,
+     buffer_tracks: BTreeMap<u32, Vec<servo_media_player::append::AppendTrack>>,
+ }
++impl State {
++    fn finish_seek(&mut self, operation: u64) -> bool {
++        if self.pending_seek != Some(operation) || self.stopped {
++            return false;
++        }
++        self.pending_seek = None;
++        true
++    }
++}
+ pub struct AndroidAppendPlayer {
+     id: usize,
+     state: Arc<Mutex<State>>,
+@@ -63,6 +73,7 @@ impl AndroidAppendPlayer {
+             volume: 1.0,
+             stopped: false,
+             input_ended: false,
++            pending_seek: None,
+             buffers: BTreeMap::new(),
+             buffered: vec![],
+             buffer_ranges: BTreeMap::new(),
+@@ -88,9 +99,24 @@ impl AndroidAppendPlayer {
+                     }
+                 };
+                 match event {
+-                    // Real Player seek will own these only after its state/
+-                    // generation and HTML completion routing is implemented.
+-                    Event::SeekReady { .. } | Event::SeekRejected(_) => (),
++                    Event::SeekReady {
++                        operation,
++                        target_us,
++                    } => {
++                        let mut s = shared.lock().unwrap();
++                        if s.finish_seek(operation) {
++                            send(PlayerEvent::AppendSeekDone {
++                                operation,
++                                position: target_us as f64 / 1e6,
++                            });
++                        }
++                    },
++                    Event::SeekRejected(operation) => {
++                        let mut s = shared.lock().unwrap();
++                        if s.finish_seek(operation) {
++                            send(PlayerEvent::AppendSeekRejected(operation));
++                        }
++                    },
+                     Event::AppendStarted(id, operation) => {
+                         let callback = shared
+                             .lock()
+@@ -203,7 +229,7 @@ impl AndroidAppendPlayer {
+                                 width: u32::from(width),
+                                 height: u32::from(height),
+                                 format: "video/mp4".to_owned(),
+-                                is_seekable: false,
++                                is_seekable: true,
+                                 video_tracks: if status.video_size.is_some() {
+                                     vec!["video/avc".to_owned()]
+                                 } else {
+@@ -229,6 +255,7 @@ impl AndroidAppendPlayer {
+                                 let mut s = shared.lock().unwrap();
+                                 s.paused = true;
+                                 s.stopped = true;
++                                s.pending_seek = None;
+                             }
+                             send(PlayerEvent::EndOfStream);
+                             send(PlayerEvent::StateChanged(PlaybackState::Paused));
+@@ -244,6 +271,7 @@ impl AndroidAppendPlayer {
+                         let callbacks = {
+                             let mut s = shared.lock().unwrap();
+                             s.stopped = true;
++                            s.pending_seek = None;
+                             s.paused = true;
+                             s.buffers
+                                 .values_mut()
+@@ -304,6 +332,7 @@ impl AndroidAppendPlayer {
+         let callbacks = {
+             let mut s = self.state.lock().unwrap();
+             s.stopped = true;
++            s.pending_seek = None;
+             s.paused = true;
+             std::mem::take(&mut s.buffers)
+                 .into_values()
+@@ -371,8 +400,42 @@ impl Player for AndroidAppendPlayer {
+     fn seek(&self, _: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
+     }
++    fn append_seek(&self, operation: u64, time: f64) -> Result<(), PlayerError> {
++        if !time.is_finite() || time < 0.0 || time * 1e6 >= i64::MAX as f64 {
++            return Err(PlayerError::SeekOutOfRange);
++        }
++        let mut s = self.state.lock().unwrap();
++        if s.stopped || s.buffers.is_empty() || s.buffers.values().any(|b| !b.ready || b.updating) {
++            return Err(error());
++        }
++        if !s.buffered.iter().any(|r| r.contains(&time)) {
++            return Err(PlayerError::SeekOutOfRange);
++        }
++        let previous = s.pending_seek.replace(operation);
++        if let Err(error) = self.command(Command::Seek {
++            operation,
++            target_us: (time * 1e6) as i64,
++        }) {
++            s.pending_seek = previous;
++            return Err(error);
++        }
++        Ok(())
++    }
+     fn seekable(&self) -> Vec<Range<f64>> {
+-        vec![]
++        let s = self.state.lock().unwrap();
++        if s.stopped {
++            vec![]
++        } else {
++            // Retained ranges are half-open; expose the last retained microsecond,
++            // not an exclusive endpoint with no frame covering it.
++            s.buffered
++                .iter()
++                .filter_map(|r| {
++                    let end = r.end - 1e-6;
++                    (end >= r.start).then_some(r.start..end)
++                })
++                .collect()
++        }
+     }
+     fn set_mute(&self, muted: bool) -> Result<(), PlayerError> {
+         let mut s = self.state.lock().unwrap();
+@@ -752,4 +815,149 @@ mod tests {
+         }
+         assert!(rx.try_recv().is_err());
+     }
++    fn seek_test_player() -> Arc<Mutex<AndroidAppendPlayer>> {
++        AndroidAppendPlayer::new(
++            76,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap()
++    }
++    #[test]
++    fn latest_seek_completion_is_one_shot_and_stopped_player_discards_it() {
++        let player = seek_test_player();
++        let p = player.lock().unwrap();
++        let mut s = p.state.lock().unwrap();
++        s.pending_seek = Some(9);
++        assert!(!s.finish_seek(8));
++        assert_eq!(s.pending_seek, Some(9));
++        assert!(s.finish_seek(9));
++        assert!(!s.finish_seek(9));
++        s.pending_seek = Some(10);
++        s.stopped = true;
++        assert!(!s.finish_seek(10));
++    }
++    #[test]
++    fn append_seek_rejects_invalid_target_unready_or_updating_buffers() {
++        let player = seek_test_player();
++        let p = player.lock().unwrap();
++        for time in [f64::NAN, f64::INFINITY, -1.0, i64::MAX as f64 / 1e6] {
++            assert_eq!(p.append_seek(1, time), Err(PlayerError::SeekOutOfRange));
++        }
++        assert!(p.append_seek(1, 0.0).is_err());
++        {
++            let mut s = p.state.lock().unwrap();
++            s.buffered = vec![1.0..2.0];
++            s.buffers.insert(
++                1,
++                BufferState {
++                    ready: false,
++                    updating: false,
++                    operation: 0,
++                    callback: Arc::new(|_| {}),
++                },
++            );
++        }
++        assert!(p.append_seek(1, 1.5).is_err());
++        {
++            let mut s = p.state.lock().unwrap();
++            let b = s.buffers.get_mut(&1).unwrap();
++            b.ready = true;
++            b.updating = true;
++        }
++        assert!(p.append_seek(1, 1.5).is_err());
++        p.state
++            .lock()
++            .unwrap()
++            .buffers
++            .get_mut(&1)
++            .unwrap()
++            .updating = false;
++        assert_eq!(p.append_seek(1, 2.0), Err(PlayerError::SeekOutOfRange));
++        assert_eq!(p.append_seek(1, 0.5), Err(PlayerError::SeekOutOfRange));
++        assert_eq!(p.state.lock().unwrap().pending_seek, None);
++    }
++    #[test]
++    fn rejected_seek_queue_preserves_prior_pending_operation() {
++        let player = seek_test_player();
++        let p = player.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, _rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut s = p.state.lock().unwrap();
++            s.buffered = vec![0.0..2.0];
++            s.pending_seek = Some(8);
++            s.buffers.insert(
++                1,
++                BufferState {
++                    ready: true,
++                    updating: false,
++                    operation: 0,
++                    callback: Arc::new(|_| {}),
++                },
++            );
++        }
++        assert_eq!(p.append_seek(9, 1.0), Err(PlayerError::EnoughData));
++        assert_eq!(p.state.lock().unwrap().pending_seek, Some(8));
++    }
++    #[test]
++    fn seekable_ranges_exclude_unretained_endpoint_and_closed_player() {
++        let player = seek_test_player();
++        let p = player.lock().unwrap();
++        p.state.lock().unwrap().buffered = vec![1.0..2.0];
++        assert_eq!(p.seekable(), vec![1.0..1.999999]);
++        p.close();
++        assert!(p.seekable().is_empty());
++        assert!(p.append_seek(1, 1.0).is_err());
++    }
++    #[test]
++    fn worker_rejection_returns_tagged_result_without_fabricating_seek_done() {
++        let (tx, rx) = mpsc::channel();
++        let player = AndroidAppendPlayer::new(
++            77,
++            GenericCallback::new(move |m| {
++                if let Ok(e) = m {
++                    let _ = tx.send(e);
++                }
++            })
++            .unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        {
++            let p = player.lock().unwrap();
++            let mut s = p.state.lock().unwrap();
++            // Force a stale player snapshot. The worker remains authoritative and
++            // must reject without poisoning playback or completing the seek.
++            s.buffered = vec![0.0..2.0];
++            s.buffers.insert(
++                1,
++                BufferState {
++                    ready: true,
++                    updating: false,
++                    operation: 0,
++                    callback: Arc::new(|_| {}),
++                },
++            );
++        }
++        player.lock().unwrap().append_seek(123, 1.0).unwrap();
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                PlayerEvent::AppendSeekRejected(123) => break,
++                PlayerEvent::SeekDone(_)
++                | PlayerEvent::AppendSeekDone { .. }
++                | PlayerEvent::Error(_) => {
++                    panic!("rejected target became completion or fatal failure")
++                },
++                _ => (),
++            }
++        }
++        let p = player.lock().unwrap();
++        let s = p.state.lock().unwrap();
++        assert_eq!(s.pending_seek, None);
++        assert!(!s.stopped);
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index f39a49fe3..92db0508c 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -50,6 +50,9 @@ pub enum PlayerEvent {
+     SeekData(u64, SeekLock),
+     /// The player has performed a seek to the given time offset in seconds.
+     SeekDone(f64),
++    /// Append output is ready for this exact seek, not a superseded target.
++    AppendSeekDone { operation: u64, position: f64 },
++    AppendSeekRejected(u64),
+     StateChanged(PlaybackState),
+ }
+ #[derive(Clone,Copy,Debug,PartialEq)]
+@@ -95,6 +98,10 @@ pub trait Player: Send + MediaInstance {
+     fn render_use_gl(&self) -> bool;
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
++    /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
++        Err(PlayerError::NonSeekableStream)
++    }
+     /// Private append-backed source contract. Unsupported backends fail closed.
+     fn append_add_buffer(
+         &self,
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 9c650625f..d8e7ca236 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -87,6 +87,9 @@ pub enum PlayerEvent {
+     SeekData(u64, SeekLock),
+     /// The player has performed a seek to the given time offset in seconds.
+     SeekDone(f64),
++    /// Append output is ready for this exact seek, not a superseded target.
++    AppendSeekDone { operation: u64, position: f64 },
++    AppendSeekRejected(u64),
+     StateChanged(PlaybackState),
+ }
+ 
+@@ -133,6 +136,10 @@ pub trait Player: Send + MediaInstance {
+     fn render_use_gl(&self) -> bool;
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
++    /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
++        Err(PlayerError::NonSeekableStream)
++    }
+     /// Private append-backed source contract. Unsupported backends fail closed.
+     fn append_add_buffer(
+         &self,
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index ffdd84367..c392c39fe 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -246,6 +246,7 @@ pub(crate) struct HTMLMediaElement {
+     volume: Cell<f64>,
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-seeking>
+     seeking: Cell<bool>,
++    append_seek_operation: Cell<u64>,
+     /// The latest seek position (in seconds) is used to distinguish whether the seek request was
+     /// initiated by a script or by the user agent itself, rather than by the media engine and to
+     /// abort other running instance of the `seek` algorithm.
+@@ -450,6 +451,7 @@ impl HTMLMediaElement {
+             default_playback_start_position: Cell::new(0.),
+             volume: Cell::new(1.0),
+             seeking: Cell::new(false),
++            append_seek_operation: Cell::new(0),
+             current_seek_position: Cell::new(f64::NAN),
+             resource_url: DomRefCell::new(None),
+             blob_url: DomRefCell::new(None),
+@@ -2176,6 +2178,8 @@ impl HTMLMediaElement {
+         // algorithm is already running. Abort that other instance of the algorithm without waiting
+         // for the step that it is running to complete.
+         self.current_seek_position.set(f64::NAN);
++        let Some(operation) = self.append_seek_operation.get().checked_add(1) else { return; };
++        self.append_seek_operation.set(operation);
+ 
+         // Step 4. Set the seeking IDL attribute to true.
+         self.seeking.set(true);
+@@ -2248,14 +2252,22 @@ impl HTMLMediaElement {
+         // Step 11. Set the current playback position to the new playback position.
+         self.current_playback_position.set(time);
+ 
+-        if let Some(ref player) = *self.player.borrow() &&
+-            let Err(error) = player.lock().unwrap().seek(time)
+-        {
++        self.current_seek_position.set(time);
++        let result = self.player.borrow().as_ref().ok_or(PlayerError::NonSeekableStream).and_then(|player| {
++            let player = player.lock().unwrap();
++            if self.attached_append_source.get().is_some() {
++                player.append_seek(operation, time)
++            } else {
++                player.seek(time)
++            }
++        });
++        if let Err(error) = result {
+             error!("Could not seek player: {error:?}");
++            self.current_playback_position.set(self.official_playback_position.get());
++            self.current_seek_position.set(f64::NAN);
++            self.seeking.set(false);
+         }
+ 
+-        self.current_seek_position.set(time);
+-
+         // Step 12. Wait until the user agent has established whether or not the media data for the
+         // new playback position is available, and, if it is, until it has decoded enough data to
+         // play back that position.
+@@ -2432,6 +2444,8 @@ impl HTMLMediaElement {
+     fn reset_media_player(&self, no_gc: &NoGC) {
+         if let Some(source) = self.attached_append_source.get() {
+             self.attached_append_source.set(None);
++            self.seeking.set(false);
++            self.current_seek_position.set(f64::NAN);
+             source.detach();
+         }
+         if self.player.borrow().is_none() {
+@@ -3014,6 +3028,7 @@ impl HTMLMediaElement {
+         let task = MediaElementMicrotask::Seeked {
+             elem: Dom::from_ref(self),
+             generation_id: self.generation_id.get(),
++            seek_operation: self.append_seek_operation.get(),
+         };
+ 
+         ScriptThread::await_stable_state(cx, Box::new(task));
+@@ -3880,6 +3895,7 @@ pub(crate) enum MediaElementMicrotask {
+     Seeked {
+         elem: Dom<HTMLMediaElement>,
+         generation_id: u32,
++        seek_operation: u64,
+     },
+     SelectNextSourceChild {
+         elem: Dom<HTMLMediaElement>,
+@@ -3925,8 +3941,10 @@ impl MicrotaskRunnable for MediaElementMicrotask {
+             &MediaElementMicrotask::Seeked {
+                 ref elem,
+                 generation_id,
++                seek_operation,
+             } => {
+-                if generation_id == elem.generation_id.get() {
++                if generation_id == elem.generation_id.get()
++                    && seek_operation == elem.append_seek_operation.get() && elem.seeking.get() {
+                     elem.seek_end(cx);
+                 }
+             },
+@@ -4491,7 +4509,25 @@ impl HTMLMediaElementEventHandler {
+             PlayerEvent::SeekData(offset, seek_lock) => {
+                 element.fetch_request(cx, Some(offset), Some(seek_lock))
+             },
+-            PlayerEvent::SeekDone(position) => element.playback_seek_done(cx, position),
++            PlayerEvent::SeekDone(position) => {
++                if element.attached_append_source.get().is_none() {
++                    element.playback_seek_done(cx, position);
++                }
++            },
++            PlayerEvent::AppendSeekDone { operation, position } => {
++                if element.attached_append_source.get().is_some()
++                    && operation == element.append_seek_operation.get() {
++                    element.playback_seek_done(cx, position);
++                }
++            },
++            PlayerEvent::AppendSeekRejected(operation) => {
++                if element.attached_append_source.get().is_some()
++                    && operation == element.append_seek_operation.get() {
++                    element.current_playback_position.set(element.official_playback_position.get());
++                    element.current_seek_position.set(f64::NAN);
++                    element.seeking.set(false);
++                }
++            },
+             PlayerEvent::StateChanged(ref state) => element.playback_state_changed(cx, state),
+             PlayerEvent::VideoFrameUpdated => element.playback_video_frame_updated(cx.no_gc()),
+         }
