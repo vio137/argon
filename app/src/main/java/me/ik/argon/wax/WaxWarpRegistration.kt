@@ -48,7 +48,7 @@ sealed interface WaxRegOutcome {
     /** Provider declined this client (HTTP 401/403). Honest stop; no workaround is attempted. */
     data object DeclinedByProvider : WaxRegOutcome
 
-    /** Any other definite HTTP rejection (the server answered; nothing was created). */
+    /** HTTP rejection on the resume GET (creates nothing; the stored account is safe). */
     data object ProviderRejected : WaxRegOutcome
 
     /**
@@ -99,7 +99,8 @@ sealed interface WaxRegOutcome {
  * development). Outcomes therefore never claim connect-readiness.
  *
  * Fail-closed policy: no TLS or header fingerprint mimicry, no endpoint or API-version
- * cycling to evade a refusal. 401/403 maps to [WaxRegOutcome.DeclinedByProvider].
+ * cycling to evade a refusal. Every non-200 POST outcome remains unknown;
+ * 401/403 on a resume GET maps to [WaxRegOutcome.DeclinedByProvider].
  */
 class WaxWarpRegistration(
     private val transport: WaxRegTransport,
@@ -161,17 +162,10 @@ class WaxWarpRegistration(
                 // May or may not have reached the provider; marker retained.
                 return WaxRegOutcome.RegistrationUnknown
             }
-            when (response.status) {
-                200 -> {}
-                401, 403 -> {
-                    store.clearPending() // definite refusal: nothing was created
-                    return WaxRegOutcome.DeclinedByProvider
-                }
-                else -> {
-                    store.clearPending() // definite rejection: nothing was created
-                    return WaxRegOutcome.ProviderRejected
-                }
-            }
+            // No public contract proves that any non-200 POST status implies no
+            // server-side creation. Retain the marker for ALL such responses, even
+            // 401/403; stop honestly without retrying or attempting a workaround.
+            if (response.status != 200) return WaxRegOutcome.RegistrationUnknown
             val registered = parseRegistration(response.body)
                 ?: return WaxRegOutcome.RegistrationUnknown // success claimed, unreadable
             val created = WaxAccount.of(registered.id, registered.token, registered.license, privateB64)

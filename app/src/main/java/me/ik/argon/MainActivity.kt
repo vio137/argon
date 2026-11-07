@@ -1116,9 +1116,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         }
                     }
                     WaxRegOutcome.DeclinedByProvider ->
-                        "Cloudflare declined setup from an unofficial app. Nothing was created and no workaround was attempted."
+                        "Cloudflare declined the request while finishing setup. The stored account is kept; no workaround was attempted."
                     WaxRegOutcome.ProviderRejected ->
-                        "WARP setup was rejected by the service. Nothing was created; try again later."
+                        "The WARP service rejected the request while finishing setup. The stored account resumes next time."
                     WaxRegOutcome.Unreachable ->
                         "Couldn't reach the WARP service to finish setup. The stored account resumes next time."
                     WaxRegOutcome.RegistrationUnknown ->

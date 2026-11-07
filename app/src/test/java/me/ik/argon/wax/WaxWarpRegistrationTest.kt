@@ -130,22 +130,36 @@ class WaxWarpRegistrationTest {
     }
 
     @Test
-    fun declinedByProviderClearsPendingAndStops() {
-        val transport = FakeTransport(403 to "error 1020")
-        val store = MemStore()
-        assertEquals(WaxRegOutcome.DeclinedByProvider, WaxWarpRegistration(transport).provision(store))
-        assertEquals(1, transport.calls.size)
-        assertNull(store.account)
-        assertNull(store.pending) // definite refusal: marker cleared
+    fun nonSuccessPostRetainsPendingAndStopsWithoutAssumingNoCreation() {
+        for (status in listOf(201, 302, 400, 401, 403, 409, 429, 500, 502, 503)) {
+            val transport = FakeTransport(status to "refused or unknown")
+            val store = MemStore()
+            assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport).provision(store))
+            assertEquals(1, transport.calls.size)
+            assertNull(store.account)
+            assertNotNull(store.pending)
+            assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport).provision(store))
+            assertEquals(1, transport.calls.size)
+        }
     }
 
     @Test
-    fun serverErrorClearsPending() {
-        val transport = FakeTransport(500 to "")
+    fun serverCommitThen5xxRetainsPendingAndBlocksAutoRetry() {
+        var serverCommitCount = 0
+        val transport = object : WaxRegTransport {
+            override fun request(method: String, url: String, bearerToken: String?, jsonBody: String?): WaxRegHttpResponse {
+                assertEquals("POST", method)
+                serverCommitCount++ // Fake server creates the account before its response fails.
+                return WaxRegHttpResponse(503, "response unavailable")
+            }
+        }
         val store = MemStore()
-        assertEquals(WaxRegOutcome.ProviderRejected, WaxWarpRegistration(transport).provision(store))
-        assertNull(store.pending)
+        assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport).provision(store))
+        assertEquals(1, serverCommitCount)
+        assertNotNull(store.pending)
         assertNull(store.account)
+        assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport).provision(store))
+        assertEquals(1, serverCommitCount) // No second server creation.
     }
 
     @Test
