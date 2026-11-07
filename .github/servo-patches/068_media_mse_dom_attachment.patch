@@ -253,17 +253,17 @@ index 1a5bd4dee..7e62d9230 100644
 +
  }
 diff --git a/components/script/dom/audio/audiotracklist.rs b/components/script/dom/audio/audiotracklist.rs
-index 1b4a393c0..43bf2c550 100644
+index 1b4a393c0..7b35610f9 100644
 --- a/components/script/dom/audio/audiotracklist.rs
 +++ b/components/script/dom/audio/audiotracklist.rs
-@@ -20,6 +20,7 @@ use crate::dom::window::Window;
- 
+@@ -21,6 +21,7 @@ use crate::dom::window::Window;
  #[dom_struct]
  pub(crate) struct AudioTrackList {
-+    owns_tracks: bool,
      eventtarget: EventTarget,
++    owns_tracks: bool,
      tracks: DomRefCell<Vec<Dom<AudioTrack>>>,
      media_element: Option<Dom<HTMLMediaElement>>,
+ }
 @@ -31,6 +32,7 @@ impl AudioTrackList {
          media_element: Option<&HTMLMediaElement>,
      ) -> AudioTrackList {
@@ -610,17 +610,17 @@ index fa38a79f4..ffdd84367 100644
          self.media_element_load_algorithm(cx);
      }
 diff --git a/components/script/dom/media/videotracklist.rs b/components/script/dom/media/videotracklist.rs
-index 5bdfc60ff..e7d5c86f3 100644
+index 5bdfc60ff..65f0bc57f 100644
 --- a/components/script/dom/media/videotracklist.rs
 +++ b/components/script/dom/media/videotracklist.rs
-@@ -20,6 +20,7 @@ use crate::dom::window::Window;
- 
+@@ -21,6 +21,7 @@ use crate::dom::window::Window;
  #[dom_struct]
  pub(crate) struct VideoTrackList {
-+    owns_tracks: bool,
      eventtarget: EventTarget,
++    owns_tracks: bool,
      tracks: DomRefCell<Vec<Dom<VideoTrack>>>,
      media_element: Option<Dom<HTMLMediaElement>>,
+ }
 @@ -31,6 +32,7 @@ impl VideoTrackList {
          media_element: Option<&HTMLMediaElement>,
      ) -> VideoTrackList {
@@ -651,6 +651,17 @@ index 5bdfc60ff..e7d5c86f3 100644
      pub(crate) fn len(&self) -> usize {
          self.tracks.borrow().len()
      }
+@@ -104,8 +121,8 @@ impl VideoTrackList {
+ 
+     pub(crate) fn add(&self, track: &VideoTrack) {
+         self.tracks.borrow_mut().push(Dom::from_ref(track));
+-        if track.selected() &&
+-            let Some(idx) = self.selected_index()
++        if track.selected()
++            && let Some(idx) = self.selected_index()
+         {
+             self.set_selected(idx, false);
+         }
 @@ -113,10 +130,12 @@ impl VideoTrackList {
      }
  
@@ -683,10 +694,10 @@ index 403936fda..15e337698 100644
  pub(crate) mod mimetype;
 diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
 new file mode 100644
-index 000000000..7d3c1b206
+index 000000000..f375b469f
 --- /dev/null
 +++ b/components/script/dom/mse/mediasource.rs
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,287 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
@@ -754,7 +765,7 @@ index 000000000..7d3c1b206
 +fn source_error(error: SourceError) -> Error {
 +    match error {
 +        SourceError::InvalidState | SourceError::Backend => Error::InvalidState(None),
-+        SourceError::Type => Error::Type("Invalid source parameters".to_owned()),
++        SourceError::Type => Error::Type(c"Invalid source parameters".to_owned()),
 +        SourceError::NotSupported => Error::NotSupported(None),
 +        SourceError::Quota => Error::QuotaExceeded {
 +            quota: None,
@@ -852,15 +863,18 @@ index 000000000..7d3c1b206
 +    }
 +    fn backend_event(&self, cx: &mut JSContext, event: SourceEvent) {
 +        match event {
-+            SourceEvent::Open => self
-+                .upcast::<EventTarget>()
-+                .fire_event(cx, stylo_atoms::Atom::from("sourceopen")),
-+            SourceEvent::Ended => self
-+                .upcast::<EventTarget>()
-+                .fire_event(cx, stylo_atoms::Atom::from("sourceended")),
-+            SourceEvent::Closed => self
-+                .upcast::<EventTarget>()
-+                .fire_event(cx, stylo_atoms::Atom::from("sourceclose")),
++            SourceEvent::Open => {
++                self.upcast::<EventTarget>()
++                    .fire_event(cx, stylo_atoms::Atom::from("sourceopen"));
++            },
++            SourceEvent::Ended => {
++                self.upcast::<EventTarget>()
++                    .fire_event(cx, stylo_atoms::Atom::from("sourceended"));
++            },
++            SourceEvent::Closed => {
++                self.upcast::<EventTarget>()
++                    .fire_event(cx, stylo_atoms::Atom::from("sourceclose"));
++            },
 +            SourceEvent::BufferAdded(_) => (),
 +            SourceEvent::BufferEvent(id, event) => {
 +                if let Some(list) = self.source_buffers.get() {
@@ -915,7 +929,7 @@ index 000000000..7d3c1b206
 +        mime: DOMString,
 +    ) -> Fallible<DomRoot<SourceBuffer>> {
 +        if mime.is_empty() {
-+            return Err(Error::Type("Empty SourceBuffer type".to_owned()));
++            return Err(Error::Type(c"Empty SourceBuffer type".to_owned()));
 +        }
 +        let media = self.media.get().ok_or(Error::InvalidState(None))?;
 +        let handle = self
@@ -982,7 +996,7 @@ index 000000000..3827c6fc7
 +pub(crate) mod sourcebufferlist;
 diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
 new file mode 100644
-index 000000000..5b9449db0
+index 000000000..d8abccb33
 --- /dev/null
 +++ b/components/script/dom/mse/sourcebuffer.rs
 @@ -0,0 +1,271 @@
@@ -1040,7 +1054,7 @@ index 000000000..5b9449db0
 +}
 +fn source_error(error: SourceError) -> Error {
 +    match error {
-+        SourceError::Type => Error::Type("Invalid append timestamp/window".to_owned()),
++        SourceError::Type => Error::Type(c"Invalid append timestamp/window".to_owned()),
 +        SourceError::NotSupported => Error::NotSupported(None),
 +        SourceError::Quota => Error::QuotaExceeded {
 +            quota: None,
@@ -1233,7 +1247,7 @@ index 000000000..5b9449db0
 +            ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
 +            ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
 +        }
-+        .ok_or_else(|| Error::Type("Buffer is detached".to_owned()))?;
++        .ok_or_else(|| Error::Type(c"Buffer is detached".to_owned()))?;
 +        self.buffer.append(bytes).map_err(source_error)
 +    }
 +    fn Abort(&self) -> Fallible<()> {
@@ -1352,7 +1366,7 @@ index 000000000..3908d9007
 +    );
 +}
 diff --git a/components/script/dom/url/url.rs b/components/script/dom/url/url.rs
-index 7af3ab63a..0885fef10 100644
+index 7af3ab63a..03b99b8bb 100644
 --- a/components/script/dom/url/url.rs
 +++ b/components/script/dom/url/url.rs
 @@ -15,6 +15,7 @@ use net_traits::filemanager_thread::FileManagerThreadMsg;
@@ -1363,7 +1377,15 @@ index 7af3ab63a..0885fef10 100644
  use script_bindings::reflector::{Reflector, reflect_weak_referenceable_dom_object_with_proto};
  use servo_base::generic_channel::GenericSend;
  use servo_url::{ImmutableOrigin, ServoUrl};
-@@ -193,14 +194,27 @@ impl URLMethods<crate::DomTypeHolder> for URL {
+@@ -26,7 +27,6 @@ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+ use crate::dom::bindings::str::{DOMString, USVString};
+-use crate::dom::blob::Blob;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::url::urlhelper::UrlHelper;
+ use crate::dom::url::urlsearchparams::URLSearchParams;
+@@ -193,14 +193,27 @@ impl URLMethods<crate::DomTypeHolder> for URL {
      }
  
      /// <https://w3c.github.io/FileAPI/#dfn-createObjectURL>
@@ -1394,7 +1416,7 @@ index 7af3ab63a..0885fef10 100644
      }
  
      /// <https://w3c.github.io/FileAPI/#dfn-revokeObjectURL>
-@@ -209,6 +223,11 @@ impl URLMethods<crate::DomTypeHolder> for URL {
+@@ -209,10 +222,15 @@ impl URLMethods<crate::DomTypeHolder> for URL {
          // if the value provided for the url argument does not have an entry in the Blob URL Store,
          // this method call does nothing. User agents may display a message on the error console.
          let origin = global.origin().immutable().clone();
@@ -1404,8 +1426,15 @@ index 7af3ab63a..0885fef10 100644
 +            }
 +        }
  
-         if let Ok(url) = ServoUrl::parse(&url.str()) &&
-             url.fragment().is_none() &&
+-        if let Ok(url) = ServoUrl::parse(&url.str()) &&
+-            url.fragment().is_none() &&
+-            let Ok(id) = parse_blob_url(&url)
++        if let Ok(url) = ServoUrl::parse(&url.str())
++            && url.fragment().is_none()
++            && let Ok(id) = parse_blob_url(&url)
+         {
+             let resource_threads = global.resource_threads();
+             let (tx, rx) = generic_channel::channel(global.time_profiler_chan().clone()).unwrap();
 diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
 index 87b3cf859..463384634 100644
 --- a/components/script_bindings/codegen/Bindings.conf
