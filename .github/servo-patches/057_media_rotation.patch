@@ -1,0 +1,294 @@
+commit da79472eb5785fc04e69306e1a7aa23058f69bcf
+Author: Instinct Agent <agent@instinct.com>
+Date:   Sat Nov 7 19:56:35 2026 +0530
+
+    057 media: I420 rotation for container rotation-degrees (host-tested)
+
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
+index fedd74857..f051d385b 100644
+--- a/components/media/backends/android/android_impl/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
+@@ -380,6 +380,9 @@ struct TrackDecoder {
+     /// ("color-standard"/"color-range"); None when the codec omits them.
+     color_standard: Option<i32>,
+     color_range: Option<i32>,
++    /// Video only: container-declared "rotation-degrees" (0 when absent).
++    /// Surface-mode decode does not rotate; applied on readback (rotate.rs).
++    rotation_degrees: i32,
+ }
+ 
+ unsafe impl Send for TrackDecoder {}
+@@ -725,6 +728,11 @@ impl Pipeline {
+             held_frame: None,
+             color_standard: None,
+             color_range: None,
++            rotation_degrees: if is_video {
++                get_format_i32(format, c"rotation-degrees").unwrap_or(0)
++            } else {
++                0
++            },
+         };
+         unsafe { sys::AMediaFormat_delete(format) };
+         Ok(decoder)
+@@ -1023,6 +1031,9 @@ impl Pipeline {
+                     if let Some(v) = self.video.as_mut() {
+                         v.color_standard = get_format_i32(format, c"color-standard");
+                         v.color_range = get_format_i32(format, c"color-range");
++                        if let Some(deg) = get_format_i32(format, c"rotation-degrees") {
++                            v.rotation_degrees = deg;
++                        }
+                     }
+                     unsafe { sys::AMediaFormat_delete(format) };
+                 }
+@@ -1122,7 +1133,23 @@ impl Pipeline {
+                 warn!("android media backend: could not pack YUV_420_888 image planes");
+                 return;
+             };
+-            let (w, h) = (width as usize, height as usize);
++            let (mut packed, mut w, mut h) = (packed, width as usize, height as usize);
++            let rotation = self.video.as_ref().map(|v| v.rotation_degrees).unwrap_or(0);
++            if rotation != 0 {
++                // Surface-mode decode never rotates; the container's
++                // "rotation-degrees" must be applied on readback.
++                match crate::rotate::rotate_i420(&packed, w, h, rotation) {
++                    Some((buf, nw, nh)) => {
++                        packed = buf;
++                        w = nw;
++                        h = nh;
++                    },
++                    None => {
++                        warn!("android media backend: unsupported rotation {rotation}, frame dropped");
++                        return;
++                    },
++                }
++            }
+             let (cw, ch) = (w / 2, h / 2);
+             let image420 = YuvPlanarImage {
+                 width: w as u32,
+@@ -1158,7 +1185,7 @@ impl Pipeline {
+             match converted {
+                 Ok(()) => {
+                     if let Some(frame) =
+-                        VideoFrame::new(width, height, Arc::new(RawFrameBuffer(bgra)))
++                        VideoFrame::new(w as i32, h as i32, Arc::new(RawFrameBuffer(bgra)))
+                     {
+                         renderer.lock().unwrap().render(frame);
+                         send_event(&self.sender, PlayerEvent::VideoFrameUpdated);
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+index 3c12309dd..439b924b0 100644
+--- a/components/media/backends/android/hosttest/src/lib.rs
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -6,6 +6,8 @@ pub mod buffer;
+ pub mod clock;
+ #[path = "../../color.rs"]
+ pub mod color;
++#[path = "../../rotate.rs"]
++pub mod rotate;
+ #[path = "../../mime_table.rs"]
+ pub mod mime_table;
+ #[path = "../../yuv_pack.rs"]
+diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
+index b55b5023d..32110fe99 100644
+--- a/components/media/backends/android/lib.rs
++++ b/components/media/backends/android/lib.rs
+@@ -18,6 +18,7 @@
+ pub mod clock;
+ pub mod color;
+ pub mod focus;
++pub mod rotate;
+ mod buffer;
+ mod mime_table;
+ mod yuv_pack;
+diff --git a/components/media/backends/android/rotate.rs b/components/media/backends/android/rotate.rs
+new file mode 100644
+index 000000000..e5a9f5d57
+--- /dev/null
++++ b/components/media/backends/android/rotate.rs
+@@ -0,0 +1,187 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! I420 frame rotation for clips whose container declares
++//! "rotation-degrees". Surface-mode decode does NOT apply rotation on
++//! AImage readback, so the app must rotate. Pure logic: hosttest/ runs these
++//! tests on the host against the exact file the Android build compiles.
++//!
++//! Input/output are tightly packed I420 (Y plane w*h, then U and V planes at
++//! half resolution), which is exactly what yuv_pack::pack_i420 produces.
++
++/// Rotate a packed I420 frame by `degrees` (must be a multiple of 90).
++/// Returns (buffer, out_width, out_height); 90/270 swap the dimensions.
++/// Returns None for non-right-angle rotations or bad geometry/buffer sizes.
++pub fn rotate_i420(src: &[u8], w: usize, h: usize, degrees: i32) -> Option<(Vec<u8>, usize, usize)> {
++    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
++        return None;
++    }
++    let cw = w / 2;
++    let ch = h / 2;
++    if src.len() != w * h + 2 * cw * ch {
++        return None;
++    }
++    let (y, rest) = src.split_at(w * h);
++    let (u, v) = rest.split_at(cw * ch);
++    if degrees % 90 != 0 {
++        return None;
++    }
++    let quarter = ((degrees % 360) + 360) % 360 / 90;
++    match quarter {
++        0 => Some((src.to_vec(), w, h)),
++        1 => {
++            // 90 clockwise: out(y', x') = in(h - 1 - x', y'); dims swap.
++            let out_y = rotate_plane_cw(y, w, h);
++            let out_u = rotate_plane_cw(u, cw, ch);
++            let out_v = rotate_plane_cw(v, cw, ch);
++            let mut out = out_y;
++            out.extend_from_slice(&out_u);
++            out.extend_from_slice(&out_v);
++            Some((out, h, w))
++        },
++        2 => {
++            let out_y = rotate_plane_180(y, w, h);
++            let out_u = rotate_plane_180(u, cw, ch);
++            let out_v = rotate_plane_180(v, cw, ch);
++            let mut out = out_y;
++            out.extend_from_slice(&out_u);
++            out.extend_from_slice(&out_v);
++            Some((out, w, h))
++        },
++        3 => {
++            // 270 clockwise: out(y', x') = in(x', w - 1 - y'); dims swap.
++            let out_y = rotate_plane_ccw(y, w, h);
++            let out_u = rotate_plane_ccw(u, cw, ch);
++            let out_v = rotate_plane_ccw(v, cw, ch);
++            let mut out = out_y;
++            out.extend_from_slice(&out_u);
++            out.extend_from_slice(&out_v);
++            Some((out, h, w))
++        },
++        _ => None,
++    }
++}
++
++fn rotate_plane_cw(src: &[u8], w: usize, h: usize) -> Vec<u8> {
++    let mut out = vec![0u8; w * h];
++    for y in 0..h {
++        for x in 0..w {
++            out[x * h + (h - 1 - y)] = src[y * w + x];
++        }
++    }
++    out
++}
++
++fn rotate_plane_180(src: &[u8], w: usize, h: usize) -> Vec<u8> {
++    let mut out = vec![0u8; w * h];
++    for y in 0..h {
++        for x in 0..w {
++            out[(h - 1 - y) * w + (w - 1 - x)] = src[y * w + x];
++        }
++    }
++    out
++}
++
++fn rotate_plane_ccw(src: &[u8], w: usize, h: usize) -> Vec<u8> {
++    let mut out = vec![0u8; w * h];
++    for y in 0..h {
++        for x in 0..w {
++            out[(w - 1 - x) * h + y] = src[y * w + x];
++        }
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// 4x2 luma pattern with a distinct value per pixel; 2x1 chroma planes.
++    fn frame_4x2() -> (Vec<u8>, usize, usize) {
++        let y: Vec<u8> = vec![
++            1, 2, 3, 4, // row 0
++            5, 6, 7, 8, // row 1
++        ];
++        let u: Vec<u8> = vec![101, 102];
++        let v: Vec<u8> = vec![201, 202];
++        let mut f = y;
++        f.extend_from_slice(&u);
++        f.extend_from_slice(&v);
++        (f, 4, 2)
++    }
++
++    #[test]
++    fn cw90_rotates_pixels_and_swaps_dims() {
++        let (f, w, h) = frame_4x2();
++        let (out, ow, oh) = rotate_i420(&f, w, h, 90).unwrap();
++        assert_eq!((ow, oh), (2, 4));
++        // 90 CW: top row of input becomes right column of output.
++        // out rows: [5,1] [6,2] [7,3] [8,4]
++        assert_eq!(&out[..8], &[5, 1, 6, 2, 7, 3, 8, 4]);
++        // Chroma 2x1 -> 1x2: CW puts the left sample on top.
++        assert_eq!(&out[8..10], &[101, 102]);
++        assert_eq!(&out[10..12], &[201, 202]);
++    }
++
++    #[test]
++    fn cw180_flips_both_axes() {
++        let (f, w, h) = frame_4x2();
++        let (out, ow, oh) = rotate_i420(&f, w, h, 180).unwrap();
++        assert_eq!((ow, oh), (4, 2));
++        assert_eq!(&out[..8], &[8, 7, 6, 5, 4, 3, 2, 1]);
++        assert_eq!(&out[8..10], &[102, 101]);
++        assert_eq!(&out[10..12], &[202, 201]);
++    }
++
++    #[test]
++    fn cw270_rotates_pixels_and_swaps_dims() {
++        let (f, w, h) = frame_4x2();
++        let (out, ow, oh) = rotate_i420(&f, w, h, 270).unwrap();
++        assert_eq!((ow, oh), (2, 4));
++        // 270 CW: bottom row of input becomes left column of output.
++        // out rows: [4,8] [3,7] [2,6] [1,5]
++        assert_eq!(&out[..8], &[4, 8, 3, 7, 2, 6, 1, 5]);
++        // Chroma 2x1 -> 1x2: CCW puts the right sample on top.
++        assert_eq!(&out[8..10], &[102, 101]);
++        assert_eq!(&out[10..12], &[202, 201]);
++    }
++
++    #[test]
++    fn negative_and_large_degrees_normalize() {
++        let (f, w, h) = frame_4x2();
++        let (a, ..) = rotate_i420(&f, w, h, -90).unwrap();
++        let (b, ..) = rotate_i420(&f, w, h, 270).unwrap();
++        assert_eq!(a, b);
++        let (c, ..) = rotate_i420(&f, w, h, 450).unwrap();
++        let (d, ..) = rotate_i420(&f, w, h, 90).unwrap();
++        assert_eq!(c, d);
++    }
++
++    #[test]
++    fn zero_is_passthrough() {
++        let (f, w, h) = frame_4x2();
++        let (out, ow, oh) = rotate_i420(&f, w, h, 0).unwrap();
++        assert_eq!((ow, oh), (w, h));
++        assert_eq!(out, f);
++    }
++
++    #[test]
++    fn bad_geometry_and_non_right_angles_rejected() {
++        let (f, w, h) = frame_4x2();
++        assert!(rotate_i420(&f, w, h, 45).is_none());
++        assert!(rotate_i420(&f, 3, 2, 90).is_none()); // odd width
++        assert!(rotate_i420(&f, 0, 2, 90).is_none());
++        assert!(rotate_i420(&f[..5], w, h, 90).is_none()); // truncated buffer
++    }
++
++    #[test]
++    fn double_rotation_composes() {
++        let (f, w, h) = frame_4x2();
++        let (once, w1, h1) = rotate_i420(&f, w, h, 90).unwrap();
++        let (twice, w2, h2) = rotate_i420(&once, w1, h1, 90).unwrap();
++        let (direct, w3, h3) = rotate_i420(&f, w, h, 180).unwrap();
++        assert_eq!((w2, h2), (w3, h3));
++        assert_eq!(twice, direct);
++    }
++}
