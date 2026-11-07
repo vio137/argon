@@ -1,0 +1,468 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 5c46c8247..5c6cdbfc5 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -487,6 +487,18 @@ impl AppendPlayback {
+         let r = session.append(bytes).map_err(|_| ());
+         self.checked(r)
+     }
++    /// Serialized worker-side parser reset. Decoder/output queues retain
++    /// accepted samples; public abort still needs its own event handshake.
++    pub fn abort_append(&mut self, id: u32) -> Result<(), ()> {
++        if self.failed || self.input_ended {
++            return Err(());
++        }
++        self.sessions
++            .get_mut(&id)
++            .ok_or(())?
++            .abort_append()
++            .map_err(|_| ())
++    }
+     pub fn end_input(&mut self) -> Result<(), ()> {
+         if self.failed {
+             return Err(());
+@@ -656,7 +668,7 @@ impl AppendPlayback {
+                             self.playing,
+                             &mut self.clock,
+                         )?;
+-                    }
++                    },
+                     MseOutput::Pcm {
+                         samples,
+                         pts_us,
+@@ -667,7 +679,7 @@ impl AppendPlayback {
+                                 .ok_or(())?,
+                         );
+                         self.audio_done = eos;
+-                    }
++                    },
+                     MseOutput::EndOfStream => self.audio_done = true,
+                     MseOutput::Retry | MseOutput::CodecConfig => (),
+                     _ => return Err(()),
+@@ -703,7 +715,7 @@ impl AppendPlayback {
+                     MseOutput::SurfaceReleased { eos, .. } => {
+                         self.video_pending = Some(Instant::now());
+                         self.video_done = eos;
+-                    }
++                    },
+                     MseOutput::EndOfStream => self.video_done = true,
+                     MseOutput::FormatChanged {
+                         color_standard,
+@@ -711,7 +723,7 @@ impl AppendPlayback {
+                         ..
+                     } => {
+                         self.video_color = (color_standard, color_range);
+-                    }
++                    },
+                     MseOutput::Retry | MseOutput::CodecConfig => (),
+                     _ => return Err(()),
+                 }
+@@ -729,7 +741,7 @@ impl AppendPlayback {
+                     if started.elapsed() > Duration::from_secs(2) {
+                         return Err(());
+                     }
+-                }
++                },
+                 _ => self.drain_wait = Some((Instant::now(), position)),
+             }
+         } else {
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index 4c830568b..020899893 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -417,3 +417,22 @@ unsafe extern "C" fn AImage_getPlanePixelStride(
+     }
+     0
+ }
++
++#[test]
++fn parser_abort_keeps_playback_usable_but_cannot_reopen_ended_input() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut playback = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    playback.add_buffer(1).unwrap();
++    assert!(playback.abort_append(2).is_err());
++    playback.append(1, &[0, 0, 0]).unwrap();
++    playback.abort_append(1).unwrap();
++    playback
++        .append(
++            1,
++            include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++        )
++        .unwrap();
++    assert_eq!(playback.pump().unwrap().buffered, [0..1_000_000]);
++    playback.end_input().unwrap();
++    assert!(playback.abort_append(1).is_err());
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 6a5a6321b..7d189e9df 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -21,8 +21,14 @@ use std::{
+ struct BufferState {
+     ready: bool,
+     updating: bool,
++    operation: u64,
+     callback: Arc<dyn Fn(AppendEvent) + Send + Sync>,
+ }
++impl BufferState {
++    fn accepts(&self, operation: u64) -> bool {
++        self.updating && self.operation == operation
++    }
++}
+ struct State {
+     paused: bool,
+     muted: bool,
+@@ -82,13 +88,13 @@ impl AndroidAppendPlayer {
+                     }
+                 };
+                 match event {
+-                    Event::AppendStarted(id) => {
++                    Event::AppendStarted(id, operation) => {
+                         let callback = shared
+                             .lock()
+                             .unwrap()
+                             .buffers
+                             .get(&id)
+-                            .filter(|b| b.updating)
++                            .filter(|b| b.accepts(operation))
+                             .map(|b| b.callback.clone());
+                         if let Some(callback) = callback {
+                             callback(AppendEvent::UpdateStart);
+@@ -106,14 +112,17 @@ impl AndroidAppendPlayer {
+                             cb(AppendEvent::Ready);
+                         }
+                     },
+-                    Event::CommandApplied(Applied::Appended(id)) => {
++                    Event::CommandApplied(Applied::Appended(id, operation)) => {
+                         let cb = {
+                             let mut s = shared.lock().unwrap();
+-                            s.buffers.get_mut(&id).map(|b| {
+-                                let updating = b.updating;
+-                                b.updating = false;
+-                                (b.callback.clone(), updating)
+-                            })
++                            s.buffers
++                                .get_mut(&id)
++                                .filter(|b| b.accepts(operation))
++                                .map(|b| {
++                                    let updating = b.updating;
++                                    b.updating = false;
++                                    (b.callback.clone(), updating)
++                                })
+                         };
+                         if let Some((cb, _updating)) = cb {
+                             cb(AppendEvent::Update);
+@@ -430,6 +439,7 @@ impl Player for AndroidAppendPlayer {
+             BufferState {
+                 ready: false,
+                 updating: false,
++                operation: 0,
+                 callback: Arc::from(callback),
+             },
+         );
+@@ -500,14 +510,19 @@ impl Player for AndroidAppendPlayer {
+         if buffer.updating {
+             return Err(error());
+         }
++        let operation = buffer.operation.checked_add(1).ok_or_else(error)?;
++        let previous_operation = buffer.operation;
++        buffer.operation = operation;
+         buffer.updating = true;
+         // Worker callbacks acquire state after queue acceptance. A synchronous
+         // rejection must not fabricate updatestart/error/updateend events.
+         if let Err(error) = self.command(Command::Append {
+             buffer_id: id,
++            operation,
+             bytes,
+         }) {
+             buffer.updating = false;
++            buffer.operation = previous_operation;
+             return Err(error);
+         }
+         Ok(())
+@@ -625,4 +640,21 @@ mod tests {
+         }
+         player.lock().unwrap().stop().unwrap();
+     }
++    #[test]
++    fn superseded_completion_cannot_finish_the_current_append() {
++        let mut buffer = BufferState {
++            ready: true,
++            updating: true,
++            operation: 2,
++            callback: Arc::new(|_| {}),
++        };
++        assert!(!buffer.accepts(1));
++        assert!(buffer.accepts(2));
++        buffer.updating = false;
++        assert!(!buffer.accepts(2));
++        buffer.operation = 3;
++        buffer.updating = true;
++        assert!(!buffer.accepts(2));
++        assert!(buffer.accepts(3));
++    }
+ }
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index c12bf8e6b..543e9c640 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -18,8 +18,10 @@ use std::{
+ 
+ pub enum Command {
+     AddBuffer(u32),
++    AbortAppend(u32),
+     Append {
+         buffer_id: u32,
++        operation: u64,
+         bytes: Vec<u8>,
+     },
+     Options {
+@@ -42,14 +44,15 @@ pub enum SendError {
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Applied {
+     BufferAdded(u32),
+-    Appended(u32),
++    AppendAborted(u32),
++    Appended(u32, u64),
+     Options(u32),
+     InputEnded,
+     Playing,
+     Volume,
+ }
+ pub enum Event {
+-    AppendStarted(u32),
++    AppendStarted(u32, u64),
+     /// Identifies command acceptance/processing, not audible or visible output.
+     CommandApplied(Applied),
+     Status(PumpStatus),
+@@ -96,9 +99,12 @@ impl Worker {
+                                         Applied::Options(*buffer_id)
+                                     },
+                                     Command::AddBuffer(id) => Applied::BufferAdded(*id),
+-                                    Command::Append { buffer_id, .. } => {
+-                                        Applied::Appended(*buffer_id)
+-                                    },
++                                    Command::AbortAppend(id) => Applied::AppendAborted(*id),
++                                    Command::Append {
++                                        buffer_id,
++                                        operation,
++                                        ..
++                                    } => Applied::Appended(*buffer_id, *operation),
+                                     Command::EndInput => Applied::InputEnded,
+                                     Command::Playing(_) => Applied::Playing,
+                                     Command::Volume { .. } => Applied::Volume,
+@@ -110,8 +116,13 @@ impl Worker {
+                                         window,
+                                     } => playback.set_options(buffer_id, offset_us, window),
+                                     Command::AddBuffer(id) => playback.add_buffer(id),
+-                                    Command::Append { buffer_id, bytes } => {
+-                                        event(Event::AppendStarted(buffer_id));
++                                    Command::AbortAppend(id) => playback.abort_append(id),
++                                    Command::Append {
++                                        buffer_id,
++                                        operation,
++                                        bytes,
++                                    } => {
++                                        event(Event::AppendStarted(buffer_id, operation));
+                                         playback.append(buffer_id, &bytes)
+                                     },
+                                     Command::EndInput => playback.end_input(),
+@@ -241,6 +252,7 @@ mod tests {
+         assert!(worker.try_command(Command::Playing(false)).is_ok());
+         match worker.try_command(Command::Append {
+             buffer_id: 1,
++            operation: 1,
+             bytes: vec![1, 2, 3],
+         }) {
+             Err(SendError::Full(Command::Append { bytes, .. })) => assert_eq!(bytes, [1, 2, 3]),
+@@ -248,6 +260,7 @@ mod tests {
+         }
+         match worker.try_command(Command::Append {
+             buffer_id: 1,
++            operation: 1,
+             bytes: vec![7; 4 * 1024 * 1024 + 1],
+         }) {
+             Err(SendError::TooLarge(Command::Append { bytes, .. })) => {
+@@ -256,4 +269,93 @@ mod tests {
+             _ => panic!("oversized append accepted"),
+         }
+     }
++    #[test]
++    fn parser_abort_is_serialized_between_appends_and_acknowledged() {
++        let (tx, rx) = mpsc::channel();
++        let worker = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |event| {
++                let _ = tx.send(event);
++            }),
++        )
++        .unwrap();
++        let send = |command| {
++            assert!(worker.try_command(command).is_ok());
++        };
++        let await_ack = |expected| {
++            loop {
++                match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                    Event::CommandApplied(ack) if ack == expected => break,
++                    Event::Error => panic!("worker failed"),
++                    _ => (),
++                }
++            }
++        };
++        send(Command::AddBuffer(1));
++        await_ack(Applied::BufferAdded(1));
++        send(Command::Append {
++            buffer_id: 1,
++            operation: 1,
++            bytes: vec![0, 0, 0],
++        });
++        await_ack(Applied::Appended(1, 1));
++        send(Command::AbortAppend(1));
++        await_ack(Applied::AppendAborted(1));
++        send(Command::Append {
++            buffer_id: 1,
++            operation: 1,
++            bytes: include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4").to_vec(),
++        });
++        await_ack(Applied::Appended(1, 1));
++        send(Command::EndInput);
++        await_ack(Applied::InputEnded);
++    }
++    #[test]
++    fn append_start_and_completion_preserve_each_operation_token() {
++        let (tx, rx) = mpsc::channel();
++        let worker = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |e| {
++                let _ = tx.send(e);
++            }),
++        )
++        .unwrap();
++        assert!(worker.try_command(Command::AddBuffer(7)).is_ok());
++        loop {
++            if matches!(
++                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
++                Event::CommandApplied(Applied::BufferAdded(7))
++            ) {
++                break;
++            }
++        }
++        for operation in [21, 22] {
++            assert!(
++                worker
++                    .try_command(Command::Append {
++                        buffer_id: 7,
++                        operation,
++                        bytes: vec![]
++                    })
++                    .is_ok()
++            );
++            let mut started = false;
++            loop {
++                match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                    Event::AppendStarted(id, token) => {
++                        assert_eq!((id, token), (7, operation));
++                        assert!(!started);
++                        started = true;
++                    },
++                    Event::CommandApplied(Applied::Appended(id, token)) => {
++                        assert!(started);
++                        assert_eq!((id, token), (7, operation));
++                        break;
++                    },
++                    Event::Error => panic!("worker failed"),
++                    _ => (),
++                }
++            }
++        }
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index 258c8f422..827d10fe5 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -473,3 +473,34 @@ fn a_known_empty_track_prevents_false_muxed_buffer_coverage() {
+     stream.abort();
+     assert!(!stream.descriptions().is_empty());
+ }
++
++#[test] fn session_abort_discards_partial_bytes_but_preserves_accepted_frames_and_delivery() {
++    use servo_media_android_hosttest::mse_demux::{session::AppendSession,delivery::CodecInput,bridge::DecoderConfig};
++    struct Sink {pts:Vec<i64>,configs:usize}
++    impl CodecInput for Sink {
++        fn configure(&mut self,_:&DecoderConfig)->Result<(),()>{self.configs+=1;Ok(())}
++        fn submit(&mut self,_:u32,_:&[u8],pts:i64)->Result<bool,()>{self.pts.push(pts);Ok(true)}
++    }
++    let bs=boxes();let mut session=AppendSession::new(1<<20,128);
++    session.set_append_options(1_000_000,0..1_500_000).unwrap();
++    let mut first_end=0;
++    for (i,b) in bs.iter().enumerate() {session.append(b).unwrap();if &b[4..8]==b"mdat" {first_end=i+1;break;}}
++    assert_eq!(session.buffered(),[1_000_000..1_500_000]);
++    session.append(&[0,0,0]).unwrap();session.abort_append().unwrap();
++    assert_eq!(session.buffered(),[1_000_000..1_500_000]);
++    for b in &bs[first_end..]{session.append(b).unwrap();}
++    session.end_of_stream().unwrap();
++    let mut sink=Sink{pts:vec![],configs:0};while session.pump_input(&mut sink).unwrap(){}
++    // Offset remains 1s; abort resets the old end-window so the second frame
++    // at 1.5s is accepted. Accepted first packet/config was not dropped.
++    assert_eq!(sink.pts,[1_000_000,1_500_000]);assert_eq!(sink.configs,1);
++    assert_eq!(session.buffered(),[1_000_000..2_000_000]);
++    assert!(session.abort_append().is_err());
++}
++#[test] fn session_abort_cannot_resurrect_a_failed_parser() {
++    use servo_media_android_hosttest::mse_demux::session::{AppendSession,SessionError};
++    let mut session=AppendSession::new(1024,32);
++    assert!(session.append(&[0,0,0,7,b'f',b'r',b'e',b'e']).is_err());
++    assert_eq!(session.abort_append(),Err(SessionError::Failed));
++    assert!(session.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).is_err());
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index 0db1d0dda..57983e8a4 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -44,7 +44,7 @@ impl AppendSession {
+             Err(_) => {
+                 self.failed = true;
+                 return Err(SessionError::Append);
+-            }
++            },
+         };
+         self.queue(units)
+     }
+@@ -57,7 +57,7 @@ impl AppendSession {
+             Err(_) => {
+                 self.failed = true;
+                 return Err(SessionError::Append);
+-            }
++            },
+         };
+         self.queue(units)?;
+         self.ended = true;
+@@ -83,7 +83,7 @@ impl AppendSession {
+                 Err(_) => {
+                     self.failed = true;
+                     return Err(SessionError::Configuration);
+-                }
++                },
+             };
+             if self.delivery.push(packet).is_err() {
+                 self.failed = true;
+@@ -104,6 +104,18 @@ impl AppendSession {
+         self.window = window;
+         Ok(())
+     }
++    /// Reset an unfinished append without deleting already accepted frames or
++    /// packets. A decoder failure is not repaired by a parser reset. This is
++    /// the worker-side operation only, not the DOM abort/event handshake.
++    pub fn abort_append(&mut self) -> Result<(), SessionError> {
++        if self.failed || self.ended {
++            return Err(SessionError::Failed);
++        }
++        self.stream.abort();
++        self.store.discontinuity();
++        self.window = 0..i64::MAX;
++        Ok(())
++    }
+     pub fn evict_before(&mut self, cutoff_us: i64) -> usize {
+         self.store.evict_before(cutoff_us)
+     }
