@@ -165,7 +165,7 @@ private fun WelcomePage() {
         )
         FeatureLine("Ad and tracker blocking", "On by default, no account needed.")
         Spacer(Modifier.height(20.dp))
-        FeatureLine("Reading view", "One tap turns cluttered articles into clean text.")
+        FeatureLine("Find in page", "Jump straight to any word on a page, from the menu.")
         Spacer(Modifier.height(20.dp))
         FeatureLine("Your data stays here", "History and bookmarks never leave the device.")
     }
