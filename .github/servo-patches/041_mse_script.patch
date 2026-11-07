@@ -289,10 +289,10 @@ index 0000000..03ccb97
 \ No newline at end of file
 diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
 new file mode 100644
-index 0000000..40a9c36
+index 0000000..09e49d6
 --- /dev/null
 +++ b/components/script/dom/mse/mediasource.rs
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,277 @@
 +use std::str::FromStr;
 +use dom_struct::dom_struct;
 +use js::context::JSContext;
@@ -302,6 +302,7 @@ index 0000000..40a9c36
 +    EndOfStreamError, MediaSourceMethods, ReadyState,
 +};
 +use script_bindings::domstring::DOMString;
++use script_bindings::error::{Error, Fallible};
 +use script_bindings::num::Finite;
 +use script_bindings::root::DomRoot;
 +
@@ -326,10 +327,14 @@ index 0000000..40a9c36
 +}
 +
 +impl MediaSource {
-+    pub(crate) fn new_inherited() -> Self {
++    /// Fallible: no MSE-capable backend exists yet in servo-media, so this is
++    /// None today. The constructor surfaces NotSupportedError instead of a
++    /// panic; even so, the interfaces stay unexposed (pref defaults FALSE and
++    /// is not in servoshell's EXPERIMENTAL_PREFS allowlist).
++    pub(crate) fn new_inherited() -> Option<Self> {
 +        let this = MediaSource {
 +            event_target: EventTarget::new_inherited(),
-+            inner: ServoMedia::get().create_mse_source().unwrap(),
++            inner: ServoMedia::get().create_mse_source()?,
 +        };
 +        // Register events
 +        // Due to the fact on_source_open takes a closure that is Send+Sync we have to use a channel.
@@ -431,15 +436,18 @@ index 0000000..40a9c36
 +        //         })
 +        //     );
 +        // }
-+        this
++        Some(this)
 +    }
 +
 +    pub(crate) fn new_with_proto(
 +        cx: &mut JSContext,
 +        global: &GlobalScope,
 +        proto: Option<HandleObject>,
-+    ) -> DomRoot<Self> {
-+        reflect_dom_object_with_proto(cx, Box::new(Self::new_inherited()), global, proto)
++    ) -> Fallible<DomRoot<Self>> {
++        let this = Self::new_inherited().ok_or(Error::NotSupported(Some(
++            "MSE backend not available".to_owned(),
++        )))?;
++        Ok(reflect_dom_object_with_proto(cx, Box::new(this), global, proto))
 +    }
 +
 +    /// Used by URL.createObjectURL
@@ -457,7 +465,7 @@ index 0000000..40a9c36
 +        cx: &mut JSContext,
 +        global: &Window,
 +        proto: Option<HandleObject>,
-+    ) -> DomRoot<MediaSource> {
++    ) -> Fallible<DomRoot<MediaSource>> {
 +        MediaSource::new_with_proto(cx, global.as_global_scope(), proto)
 +    }
 +
@@ -498,12 +506,22 @@ index 0000000..40a9c36
 +        false
 +    }
 +
-+    fn AddSourceBuffer(&self, cx: &mut JSContext, type_: DOMString) -> DomRoot<SourceBuffer> {
-+        SourceBuffer::new(
++    fn AddSourceBuffer(
++        &self,
++        cx: &mut JSContext,
++        type_: DOMString,
++    ) -> Fallible<DomRoot<SourceBuffer>> {
++        let buffer = self
++            .inner
++            .add_source_buffer(&type_.to_string())
++            .ok_or(Error::NotSupported(Some(
++                "MSE backend refused source buffer".to_owned(),
++            )))?;
++        Ok(SourceBuffer::new(
 +            cx,
 +            &*self.global(),
-+            DomRefCell::new(self.inner.add_source_buffer(&type_.to_string()).unwrap()),
-+        )
++            DomRefCell::new(buffer),
++        ))
 +    }
 +
 +    fn RemoveSourceBuffer(&self, source_buffer: &SourceBuffer) {
@@ -1032,7 +1050,7 @@ index 0000000..01f3f90
 \ No newline at end of file
 diff --git a/components/script_bindings/webidls/MediaSource.webidl b/components/script_bindings/webidls/MediaSource.webidl
 new file mode 100644
-index 0000000..2635272
+index 0000000..3600889
 --- /dev/null
 +++ b/components/script_bindings/webidls/MediaSource.webidl
 @@ -0,0 +1,48 @@
@@ -1062,7 +1080,7 @@ index 0000000..2635272
 +// https://www.w3.org/TR/media-source-2/#dom-mediasource
 +[Pref="dom_media_source_extensions_enabled", Exposed=(Window)]
 +interface MediaSource : EventTarget {
-+    constructor();
++    [Throws] constructor();
 +
 +    // [SameObject, Exposed=DedicatedWorker]
 +    // readonly  attribute MediaSourceHandle handle;
@@ -1077,7 +1095,7 @@ index 0000000..2635272
 +
 +    static readonly attribute boolean canConstructInDedicatedWorker;
 +
-+    SourceBuffer addSourceBuffer(DOMString type);
++    [Throws] SourceBuffer addSourceBuffer(DOMString type);
 +    undefined removeSourceBuffer(SourceBuffer sourceBuffer);
 +    undefined endOfStream(optional EndOfStreamError error);
 +    undefined setLiveSeekableRange(double start, double end);
