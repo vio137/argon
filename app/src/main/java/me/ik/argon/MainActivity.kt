@@ -433,6 +433,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
                                 cm.setPrimaryClip(android.content.ClipData.newPlainText("link", currentUrl))
                             },
+                            onOpenIn = {
+                                showMenu = false
+                                startActivity(
+                                    Intent(Intent.ACTION_VIEW, android.net.Uri.parse(currentUrl))
+                                        .addCategory(Intent.CATEGORY_BROWSABLE)
+                                )
+                            },
                             onBookmarks = {
                                 showMenu = false
                                 screen = Screen.Bookmarks

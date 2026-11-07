@@ -68,13 +68,20 @@ function highlight(q) {
     if (el.closest && el.closest("[contenteditable],[hidden],[inert],template")) return 2;
     return 1;
   }});
-  var nodes = [], n;
-  // Bound traversal, not just marks: a huge page must not walk its whole
-  // DOM for one query.
-  while ((n = walker.nextNode()) && nodes.length < 2000) nodes.push(n);
+  var nodes = [], n, visited = 0;
+  // The budget counts VISITED nodes, rejected ones included: a page whose
+  // DOM never matches still stops after the budget. Matching candidates are
+  // a second, tighter bound.
+  while ((n = walker.nextNode()) && visited++ < 5000 && nodes.length < 2000) nodes.push(n);
   for (var k = 0; k < nodes.length && marks.length < 500; k++) {
     var node = nodes[k];
     if (!node.parentNode) continue;
+    // Skip subtrees hidden via CSS (display:none / visibility:hidden), which
+    // attribute checks above cannot see. Runs only on budgeted candidates.
+    try {
+      var cs = getComputedStyle(node.parentNode);
+      if (cs.display === "none" || cs.visibility === "hidden" || cs.visibility === "collapse") continue;
+    } catch (e) {}
     var text = node.nodeValue, lower = text.toLowerCase(), pos = 0, idx, frag = null;
     while ((idx = lower.indexOf(ql, pos)) !== -1 && marks.length < 500) {
       if (!frag) frag = document.createDocumentFragment();

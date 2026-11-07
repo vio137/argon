@@ -144,7 +144,10 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
-                            IconButton(onClick = { history.remove(entry) }) {
+                            IconButton(onClick = {
+                                history.remove(entry)
+                                onCleared() // same refresh path as clear: start page Recent must not keep it
+                            }) {
                                 Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
                             }
                         }
@@ -399,6 +402,7 @@ fun MenuSheet(
     onShare: () -> Unit,
     onFind: () -> Unit,
     onCopyLink: () -> Unit,
+    onOpenIn: () -> Unit,
     onBookmarks: () -> Unit,
     currentHost: String,
     onDismiss: () -> Unit,
@@ -433,6 +437,7 @@ fun MenuSheet(
             SheetRow(R.drawable.ic_search, "Find in page", shareEnabled, onFind)
             SheetRow(R.drawable.ic_share, "Share page", shareEnabled, onShare)
             SheetRow(R.drawable.ic_copy, "Copy link", shareEnabled, onCopyLink)
+            SheetRow(R.drawable.ic_open_in, "Open in another app", shareEnabled, onOpenIn)
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetLabel("App")
