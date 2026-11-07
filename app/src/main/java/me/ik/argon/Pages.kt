@@ -160,12 +160,14 @@ fun SettingsScreen(
         Column(Modifier.fillMaxSize()) {
             PageTopBar("Settings", onBack)
             Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+                SettingsLabel("Privacy")
                 SettingSwitch(
                     title = "Ad blocking",
                     subtitle = "${String.format("%,d", Blocklist.DOMAIN_COUNT)} ad and tracker domains blocked at the engine level",
                     checked = adblock,
                     onCheckedChange = onAdblock,
                 )
+                SettingsLabel("General")
                 SettingClick(
                     title = "Search engine",
                     subtitle = searchEngine.label,
@@ -189,6 +191,7 @@ fun SettingsScreen(
                     checked = experimental,
                     onCheckedChange = onExperimental,
                 )
+                SettingsLabel("Data")
                 SettingClick(
                     title = "Export bookmarks",
                     subtitle = "Save as browser-compatible HTML",
@@ -257,6 +260,16 @@ fun SettingsScreen(
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
         )
     }
+}
+
+@Composable
+private fun SettingsLabel(label: String) {
+    Text(
+        label,
+        color = ArgonColors.Text3,
+        style = ArgonType.Caption,
+        modifier = Modifier.padding(top = 20.dp, bottom = 2.dp),
+    )
 }
 
 @Composable
@@ -335,10 +348,12 @@ fun MenuSheet(
                     Text("Page actions", color = ArgonColors.Text3, style = ArgonType.Caption)
                 }
             }
+            SheetLabel("This page")
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
             SheetRow(R.drawable.ic_reader, "Reader view", readerEnabled, onReader)
-            SheetRow(R.drawable.ic_reader, "View DOM (current page)", readerEnabled, onViewDom)
+            SheetRow(R.drawable.ic_code, "View DOM (current page)", readerEnabled, onViewDom)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
+            SheetLabel("App")
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
             SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
@@ -359,6 +374,16 @@ private fun HostGlyph(host: String) {
     ) {
         Text(letter, color = ArgonColors.Accent, style = ArgonType.Heading)
     }
+}
+
+@Composable
+private fun SheetLabel(label: String) {
+    Text(
+        label,
+        color = ArgonColors.Text3,
+        style = ArgonType.Caption,
+        modifier = Modifier.padding(start = 24.dp, top = 16.dp, bottom = 4.dp),
+    )
 }
 
 @Composable
@@ -397,6 +422,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 Text("Ad and tracker list: StevenBlack/hosts, MIT license", style = ArgonType.BodySmall)
                 Text("Reader view: Mozilla Readability 0.6.0, Apache-2.0", style = ArgonType.BodySmall)
                 Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", style = ArgonType.BodySmall)
+                Text("Reviewed against Apple's Human Interface Guidelines (apple-design-skill) and mobile-app-ui-design", style = ArgonType.BodySmall)
                 Text("Argon is an independent shell and is not affiliated with the Servo project.", style = ArgonType.Caption, color = ArgonColors.Text2)
             }
         },
