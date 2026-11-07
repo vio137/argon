@@ -289,10 +289,10 @@ index 0000000..03ccb97
 \ No newline at end of file
 diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
 new file mode 100644
-index 0000000..4e3e540
+index 0000000..b70cffe
 --- /dev/null
 +++ b/components/script/dom/mse/mediasource.rs
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,279 @@
 +use std::str::FromStr;
 +use dom_struct::dom_struct;
 +use js::context::JSContext;
@@ -506,12 +506,24 @@ index 0000000..4e3e540
 +        false
 +    }
 +
-+    fn AddSourceBuffer(&self, cx: &mut JSContext, type_: DOMString) -> DomRoot<SourceBuffer> {
-+        SourceBuffer::new(
++    fn AddSourceBuffer(
++        &self,
++        cx: &mut JSContext,
++        type_: DOMString,
++    ) -> Fallible<DomRoot<SourceBuffer>> {
++        // Spec step 4: readyState must be "open".
++        // DEBT (pref-OFF scaffolding): steps 1-3 are not enforceable yet -
++        // empty-type TypeError, unsupported-MIME NotSupportedError and
++        // QuotaExceededError require a real backend + real isTypeSupported
++        // and a fallible 040 add_source_buffer trait contract (S3).
++        if self.inner.ready_state() != servo_media::mse::ReadyState::Open {
++            return Err(Error::InvalidState(None));
++        }
++        Ok(SourceBuffer::new(
 +            cx,
 +            &*self.global(),
 +            DomRefCell::new(self.inner.add_source_buffer(&type_.to_string())),
-+        )
++        ))
 +    }
 +
 +    fn RemoveSourceBuffer(&self, source_buffer: &SourceBuffer) {
@@ -628,10 +640,10 @@ index 0000000..155dbf3
 \ No newline at end of file
 diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
 new file mode 100644
-index 0000000..e7873a0
+index 0000000..f8a043d
 --- /dev/null
 +++ b/components/script/dom/mse/sourcebuffer.rs
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,149 @@
 +use dom_struct::dom_struct;
 +use script_bindings::codegen::GenericBindings::SourceBufferBinding::{
 +    AppendMode, SourceBufferMethods,
@@ -749,11 +761,16 @@ index 0000000..e7873a0
 +    }
 +
 +    fn AppendBuffer(&self, data: ArrayBufferViewOrArrayBuffer) -> Fallible<()> {
++        // WebIDL BufferSource conversion of a detached buffer yields zero
++        // bytes (to_vec is None); browsers treat that as an empty append,
++        // not an exception. [Throws] stays on the surface for the real
++        // spec exceptions (readyState != open / updating) - DEBT: those
++        // checks need backend state + are not enforced yet (pref OFF).
 +        let vec = match data {
 +            ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
 +            ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
 +        }
-+        .ok_or(Error::InvalidState(None))?;
++        .unwrap_or_default();
 +        self.inner.borrow_mut().append_buffer(vec);
 +        Ok(())
 +    }
@@ -1040,7 +1057,7 @@ index 0000000..01f3f90
 \ No newline at end of file
 diff --git a/components/script_bindings/webidls/MediaSource.webidl b/components/script_bindings/webidls/MediaSource.webidl
 new file mode 100644
-index 0000000..0c9ffa7
+index 0000000..3600889
 --- /dev/null
 +++ b/components/script_bindings/webidls/MediaSource.webidl
 @@ -0,0 +1,48 @@
@@ -1085,7 +1102,7 @@ index 0000000..0c9ffa7
 +
 +    static readonly attribute boolean canConstructInDedicatedWorker;
 +
-+    SourceBuffer addSourceBuffer(DOMString type);
++    [Throws] SourceBuffer addSourceBuffer(DOMString type);
 +    undefined removeSourceBuffer(SourceBuffer sourceBuffer);
 +    undefined endOfStream(optional EndOfStreamError error);
 +    undefined setLiveSeekableRange(double start, double end);
