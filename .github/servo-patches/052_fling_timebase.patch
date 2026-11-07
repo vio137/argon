@@ -522,6 +522,13 @@ diff --git a/ports/servoshell/egl/android/mod.rs b/ports/servoshell/egl/android/
 index 262883692..1bd2728ef 100644
 --- a/ports/servoshell/egl/android/mod.rs
 +++ b/ports/servoshell/egl/android/mod.rs
+@@ -16,5 +16,5 @@
+ use jni::errors::{Error, ThrowRuntimeExAndDefault};
+ use jni::objects::{Global, JClass, JObject, JString, JValue, JValueOwned};
+ use jni::strings::JNIStr;
+-use jni::sys::{jboolean, jfloat, jint, jobject};
++use jni::sys::{jboolean, jfloat, jint, jlong, jobject};
+ use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 @@ -498,9 +498,12 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_goForward<'local>(
  pub extern "C" fn Java_org_servo_servoview_JNIServo_doFrame<'local>(
      mut env: EnvUnowned<'local>,
