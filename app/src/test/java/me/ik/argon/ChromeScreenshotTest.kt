@@ -179,6 +179,89 @@ class ChromeScreenshotTest {
         }
     }
 
+    /** Deterministic 32x32 test icon: left half violet, right half white, so
+     * rendered favicon pixels are easy to distinguish from monogram fallback. */
+    private fun seedTestFavicon(id: String) {
+        val w = 32
+        val h = 32
+        val rgba = ByteArray(w * h * 4)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val i = (y * w + x) * 4
+                if (x < w / 2) {
+                    rgba[i] = 0x7A
+                    rgba[i + 1] = 0x5C
+                    rgba[i + 2] = 0xFF.toByte()
+                } else {
+                    rgba[i] = 0xFF.toByte()
+                    rgba[i + 1] = 0xFF.toByte()
+                    rgba[i + 2] = 0xFF.toByte()
+                }
+                rgba[i + 3] = 0xFF.toByte()
+            }
+        }
+        check(FaviconStore.put(id, rgba, w, h))
+    }
+
+    @Test
+    fun tabStripFavicons() {
+        // Engine patch 055 consumer: chip 1 shows the pushed favicon, chip 2
+        // keeps the text-only look (no icon pushed). The store is a process
+        // global, so evict after the snapshot or other strip tests inherit
+        // this icon for their own chip id "1".
+        seedTestFavicon("1")
+        try {
+        paparazzi.snapshot {
+            ArgonTabStrip(
+                data =
+                    TabStripData(
+                        chips =
+                            listOf(
+                                "1" to "Example page",
+                                "2" to "No icon yet",
+                            ),
+                        activeId = "1",
+                    ),
+                onSelect = {},
+                onClose = {},
+                onNew = {},
+                onLongPress = {},
+            )
+        }
+        } finally {
+            FaviconStore.evict("1")
+        }
+    }
+
+    @Test
+    fun tabStripCompactFavicons() {
+        // Compact density: chip 1 favicon replaces the monogram; chip 2 keeps
+        // the tinted monogram fallback.
+        seedTestFavicon("1")
+        try {
+        paparazzi.snapshot {
+            ArgonTabStrip(
+                data =
+                    TabStripData(
+                        chips =
+                            listOf(
+                                "1" to "Example page",
+                                "2" to "servo.org",
+                            ),
+                        activeId = "1",
+                    ),
+                onSelect = {},
+                onClose = {},
+                onNew = {},
+                onLongPress = {},
+                compact = true,
+            )
+        }
+        } finally {
+            FaviconStore.evict("1")
+        }
+    }
+
     @Test
     fun settingsScreen() {
         paparazzi.snapshot {
@@ -238,9 +321,12 @@ class ChromeScreenshotTest {
     @Test
     fun historyPage() {
         val history = HistoryStore(tempStoreFile("history"))
-        history.add("https://servo.org/docs", "Servo documentation")
-        history.add("https://github.com/servo/servo", "servo/servo: the Servo browser engine")
-        history.add("https://developer.mozilla.org/en-US/docs/Web", "MDN Web Docs")
+        // Fixed timestamps: the golden must not depend on the wall clock
+        // (a plain add() stamps System.currentTimeMillis() and drifts).
+        val fixedAt = 1_762_512_300_000L
+        history.addAt("https://servo.org/docs", "Servo documentation", fixedAt)
+        history.addAt("https://github.com/servo/servo", "servo/servo: the Servo browser engine", fixedAt + 60_000)
+        history.addAt("https://developer.mozilla.org/en-US/docs/Web", "MDN Web Docs", fixedAt + 120_000)
         val closed = RecentlyClosedStore(tempStoreFile("closed"))
         closed.add("https://news.ycombinator.com", "Hacker News")
         paparazzi.snapshot {

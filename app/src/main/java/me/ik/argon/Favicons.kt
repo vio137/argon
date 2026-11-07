@@ -35,9 +35,20 @@ object FaviconStore {
         val bmp =
             try {
                 Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
-                    // ARGB_8888 pixels are laid out R,G,B,A in memory on
-                    // little-endian, matching the engine's RGBA8 frame.
-                    it.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
+                    // ARGB_8888 is little-endian B,G,R,A in memory, so the
+                    // engine's RGBA8 frame needs R<->B swapped per pixel
+                    // (Config.RGBA_8888 is gone from the compileSdk stubs;
+                    // swap verified by golden pixel inspection).
+                    val swizzled = ByteArray(rgba.size)
+                    var i = 0
+                    while (i < rgba.size) {
+                        swizzled[i] = rgba[i + 2]
+                        swizzled[i + 1] = rgba[i + 1]
+                        swizzled[i + 2] = rgba[i]
+                        swizzled[i + 3] = rgba[i + 3]
+                        i += 4
+                    }
+                    it.copyPixelsFromBuffer(ByteBuffer.wrap(swizzled))
                 }
             } catch (_: RuntimeException) {
                 return false

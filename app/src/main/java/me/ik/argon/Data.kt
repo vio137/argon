@@ -184,6 +184,14 @@ class HistoryStore internal constructor(private val file: File) {
         save()
     }
 
+    /** Test-only: insert with an explicit timestamp so host-rendered golden
+     * screenshots do not depend on the wall clock. */
+    internal fun addAt(url: String, title: String, atMs: Long) {
+        if (url.isBlank() || url == "about:blank") return
+        entries = (listOf(HistoryEntry(url, title.ifBlank { url }, atMs)) + entries).take(500)
+        save()
+    }
+
     @Synchronized
     fun remove(entry: HistoryEntry) {
         entries = entries - entry
