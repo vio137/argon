@@ -1,0 +1,933 @@
+From 26c8a70d8cb5cef0d7b7e8583be3e8bb09ed1afe Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sat, 7 Nov 2026 23:51:31 +0530
+Subject: [PATCH] 064 media: stage append lifecycle and bounded native codec
+ input adapter
+
+---
+ .../backends/android/android_impl/mod.rs      |   1 +
+ .../android/android_impl/mse_codec.rs         | 158 ++++++++++++++
+ .../backends/android/android_impl/sys.rs      |   4 +
+ .../hosttest/tests/fixtures/synthetic-aac.mp4 | Bin 0 -> 2988 bytes
+ .../android/hosttest/tests/mse_fixture.rs     | 129 ++++++++++++
+ .../backends/android/mse_demux/README.md      |   2 +
+ .../backends/android/mse_demux/append.rs      | 139 +++++++++++++
+ .../backends/android/mse_demux/bridge.rs      | 151 ++++++++++++++
+ .../backends/android/mse_demux/delivery.rs    | 192 ++++++++++++++++++
+ .../media/backends/android/mse_demux/mod.rs   |   4 +
+ 10 files changed, 780 insertions(+)
+ create mode 100644 components/media/backends/android/android_impl/mse_codec.rs
+ create mode 100644 components/media/backends/android/hosttest/tests/fixtures/synthetic-aac.mp4
+ create mode 100644 components/media/backends/android/mse_demux/append.rs
+ create mode 100644 components/media/backends/android/mse_demux/bridge.rs
+ create mode 100644 components/media/backends/android/mse_demux/delivery.rs
+
+diff --git a/components/media/backends/android/android_impl/mod.rs b/components/media/backends/android/android_impl/mod.rs
+index ed1f9fe3c..d8bba9968 100644
+--- a/components/media/backends/android/android_impl/mod.rs
++++ b/components/media/backends/android/android_impl/mod.rs
+@@ -4,6 +4,7 @@
+ 
+ //! Android-only NDK parts of the backend (compiled only for Android targets).
+ mod player;
++mod mse_codec;
+ mod source;
+ mod sys;
+ 
+diff --git a/components/media/backends/android/android_impl/mse_codec.rs b/components/media/backends/android/android_impl/mse_codec.rs
+new file mode 100644
+index 000000000..15781babe
+--- /dev/null
++++ b/components/media/backends/android/android_impl/mse_codec.rs
+@@ -0,0 +1,158 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Dormant NDK input adapter. No DOM/pipeline call site yet. Caller must pump
++//! decoder output and preserve the borrowed surface lifetime. A format change
++//! requires a new adapter until coordinated output-drain/reconfigure is wired.
++use super::sys;
++use crate::mse_demux::{bridge::DecoderConfig, delivery::CodecInput};
++use std::{ffi::CString, ptr};
++
++pub struct MseCodecInput<'a> {
++    codec: *mut sys::AMediaCodec,
++    surface: Option<&'a sys::ANativeWindow>,
++    track: Option<u32>,
++}
++impl<'a> MseCodecInput<'a> {
++    pub fn new(surface: Option<&'a sys::ANativeWindow>) -> Self {
++        Self {
++            codec: ptr::null_mut(),
++            surface,
++            track: None,
++        }
++    }
++    /// A borrowed handle, never transfer ownership. The output-pump integration
++    /// must release each dequeued output buffer before dropping this adapter.
++    pub fn codec(&self) -> *mut sys::AMediaCodec {
++        self.codec
++    }
++}
++impl CodecInput for MseCodecInput<'_> {
++    fn configure(&mut self, c: &DecoderConfig) -> Result<(), ()> {
++        if !self.codec.is_null() {
++            return Err(());
++        } // No uncoordinated format replacement.
++        if c.csd0.is_empty() || c.csd0.len() > 64 * 1024 || c.csd1.len() > 64 * 1024 {
++            return Err(());
++        }
++        let video = c.mime == "video/avc";
++        if (!video && c.mime != "audio/mp4a-latm")
++            || (video && (c.width == 0 || c.height == 0 || self.surface.is_none()))
++            || (!video
++                && (c.sample_rate == 0
++                    || c.sample_rate > 192000
++                    || c.channels == 0
++                    || c.channels > 8))
++        {
++            return Err(());
++        }
++        let mime = CString::new(c.mime).map_err(|_| ())?;
++        unsafe {
++            let format = sys::AMediaFormat_new();
++            if format.is_null() {
++                return Err(());
++            }
++            sys::AMediaFormat_setString(format, c"mime".as_ptr(), mime.as_ptr());
++            if video {
++                sys::AMediaFormat_setInt32(format, c"width".as_ptr(), i32::from(c.width));
++                sys::AMediaFormat_setInt32(format, c"height".as_ptr(), i32::from(c.height));
++            } else {
++                sys::AMediaFormat_setInt32(format, c"sample-rate".as_ptr(), c.sample_rate as i32);
++                sys::AMediaFormat_setInt32(
++                    format,
++                    c"channel-count".as_ptr(),
++                    i32::from(c.channels),
++                );
++            }
++            // NDK copies these buffers into the format. CSD is auto-submitted by start;
++            // do not also queue a codec-config packet.
++            sys::AMediaFormat_setBuffer(
++                format,
++                c"csd-0".as_ptr(),
++                c.csd0.as_ptr().cast(),
++                c.csd0.len(),
++            );
++            if !c.csd1.is_empty() {
++                sys::AMediaFormat_setBuffer(
++                    format,
++                    c"csd-1".as_ptr(),
++                    c.csd1.as_ptr().cast(),
++                    c.csd1.len(),
++                );
++            }
++            let codec = sys::AMediaCodec_createDecoderByType(mime.as_ptr());
++            if codec.is_null() {
++                sys::AMediaFormat_delete(format);
++                return Err(());
++            }
++            let surface = if video {
++                self.surface
++                    .map(|p| p as *const sys::ANativeWindow as *mut std::ffi::c_void)
++                    .unwrap_or(ptr::null_mut())
++            } else {
++                ptr::null_mut()
++            };
++            let configured = sys::AMediaCodec_configure(codec, format, surface, ptr::null_mut(), 0);
++            sys::AMediaFormat_delete(format);
++            if configured != sys::AMEDIA_OK {
++                sys::AMediaCodec_delete(codec);
++                return Err(());
++            }
++            if sys::AMediaCodec_start(codec) != sys::AMEDIA_OK {
++                sys::AMediaCodec_delete(codec);
++                return Err(());
++            }
++            self.codec = codec;
++            self.track = Some(c.track_id);
++        }
++        Ok(())
++    }
++    fn submit(&mut self, track_id: u32, bytes: &[u8], pts_us: i64) -> Result<bool, ()> {
++        if self.track != Some(track_id)
++            || self.codec.is_null()
++            || pts_us < 0
++            || bytes.is_empty()
++            || bytes.len() > 8 * 1024 * 1024
++        {
++            return Err(());
++        }
++        unsafe {
++            let idx = sys::AMediaCodec_dequeueInputBuffer(self.codec, 0);
++            if idx == sys::AMEDIACODEC_INFO_TRY_AGAIN_LATER {
++                return Ok(false);
++            }
++            if idx < 0 {
++                return Err(());
++            }
++            let mut capacity = 0usize;
++            let dst = sys::AMediaCodec_getInputBuffer(self.codec, idx as usize, &mut capacity);
++            if dst.is_null() || capacity < bytes.len() {
++                return Err(());
++            } // Caller poisons/drops adapter on error.
++            ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
++            if sys::AMediaCodec_queueInputBuffer(
++                self.codec,
++                idx as usize,
++                0,
++                bytes.len(),
++                pts_us as u64,
++                0,
++            ) != sys::AMEDIA_OK
++            {
++                return Err(());
++            }
++        }
++        Ok(true)
++    }
++}
++impl Drop for MseCodecInput<'_> {
++    fn drop(&mut self) {
++        if !self.codec.is_null() {
++            unsafe {
++                sys::AMediaCodec_stop(self.codec);
++                sys::AMediaCodec_delete(self.codec);
++            }
++        }
++    }
++}
+diff --git a/components/media/backends/android/android_impl/sys.rs b/components/media/backends/android/android_impl/sys.rs
+index f6dbf6b42..8f5ecba96 100644
+--- a/components/media/backends/android/android_impl/sys.rs
++++ b/components/media/backends/android/android_impl/sys.rs
+@@ -125,6 +125,10 @@ unsafe extern "C" {
+         mode: SeekMode,
+     ) -> media_status_t;
+ 
++    pub fn AMediaFormat_new() -> *mut AMediaFormat;
++    pub fn AMediaFormat_setInt32(format: *mut AMediaFormat, name: *const c_char, value: i32);
++    pub fn AMediaFormat_setString(format: *mut AMediaFormat, name: *const c_char, value: *const c_char);
++    pub fn AMediaFormat_setBuffer(format: *mut AMediaFormat, name: *const c_char, data: *const c_void, size: usize);
+     pub fn AMediaFormat_delete(format: *mut AMediaFormat) -> media_status_t;
+     pub fn AMediaFormat_getInt32(
+         format: *mut AMediaFormat,
+diff --git a/components/media/backends/android/hosttest/tests/fixtures/synthetic-aac.mp4 b/components/media/backends/android/hosttest/tests/fixtures/synthetic-aac.mp4
+new file mode 100644
+index 0000000000000000000000000000000000000000..161fbe61e9be98464ad781d6b805877e09ad9e35
+GIT binary patch
+literal 2988
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index b099b8949..e0c12d149 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -140,3 +140,132 @@ fn sample_pointer_into_box_header_is_rejected() {
+     d.init(&init).unwrap();
+     assert!(d.media(&media).is_err());
+ }
++#[test]
++fn actual_avc_fragments_prepare_codec_config_and_annexb_packets() {
++    use servo_media_android_hosttest::mse_demux::bridge::DecoderBridge;
++    let bs = boxes();
++    let mut init = vec![];
++    for b in &bs {
++        if [&b"ftyp"[..], &b"moov"[..]].contains(&&b[4..8]) {
++            init.extend(b);
++        }
++    }
++    let mut d = Demux::new(1 << 20, 64);
++    d.init(&init).unwrap();
++    let mut bridge = DecoderBridge::new(1 << 20);
++    let mut packets = vec![];
++    for pair in bs.windows(2) {
++        if &pair[0][4..8] == b"moof" && &pair[1][4..8] == b"mdat" {
++            let mut media = pair[0].clone();
++            media.extend_from_slice(&pair[1]);
++            for unit in d.media(&media).unwrap() {
++                packets.push(bridge.prepare(unit).unwrap());
++            }
++        }
++    }
++    assert_eq!(packets.len(), 2);
++    let c = packets[0].config.as_ref().unwrap();
++    assert_eq!((c.width, c.height), (32, 32));
++    assert!(c.csd0.starts_with(&[0, 0, 0, 1, 0x67]));
++    assert!(c.csd1.starts_with(&[0, 0, 0, 1, 0x68]));
++    assert_eq!(packets[1].pts_us, 500_000);
++    assert!(packets[1].config.is_none());
++    assert!(packets.iter().all(|p| p.bytes.starts_with(&[0, 0, 0, 1])));
++}
++#[test]
++fn missing_configuration_and_reset_fail_closed() {
++    use servo_media_android_hosttest::mse_demux::{
++        AccessUnit,
++        bridge::{BridgeError, DecoderBridge},
++    };
++    let mut b = DecoderBridge::new(1024);
++    b.reset();
++    let u = AccessUnit {
++        track_id: 1,
++        dts_us: 0,
++        pts_us: 0,
++        duration_us: 1,
++        keyframe: true,
++        codec_config: None,
++        data: vec![0, 0, 0, 1, 0x65],
++    };
++    assert!(matches!(
++        b.prepare(u),
++        Err(BridgeError::MissingConfiguration)
++    ));
++}
++#[test]
++fn extended_aac_configuration_is_explicitly_rejected_not_misdecoded() {
++    use servo_media_android_hosttest::mse_demux::bridge::DecoderBridge;
++    let mut framer = BoxFramer::new(1 << 20);
++    framer
++        .append(include_bytes!("fixtures/synthetic-aac.mp4"))
++        .unwrap();
++    let mut bs = vec![];
++    while let Some(b) = framer.pop_box().unwrap() {
++        bs.push(b);
++    }
++    let mut init = vec![];
++    for b in &bs {
++        if [&b"ftyp"[..], &b"moov"[..]].contains(&&b[4..8]) {
++            init.extend(b);
++        }
++    }
++    let mut d = Demux::new(1 << 20, 128);
++    d.init(&init).unwrap();
++    let mut bridge = DecoderBridge::new(1 << 20);
++    let mut packets = vec![];
++    for pair in bs.windows(2) {
++        if &pair[0][4..8] == b"moof" && &pair[1][4..8] == b"mdat" {
++            let mut media = pair[0].clone();
++            media.extend_from_slice(&pair[1]);
++            for unit in d.media(&media).unwrap() {
++                packets.push(bridge.prepare(unit));
++            }
++        }
++    }
++    assert!(!packets.is_empty());
++    assert!(matches!(
++        packets[0],
++        Err(servo_media_android_hosttest::mse_demux::bridge::BridgeError::UnsupportedConfiguration)
++    ));
++}
++#[test]
++fn append_stream_retains_segments_across_arbitrary_js_append_boundaries() {
++    use servo_media_android_hosttest::mse_demux::append::AppendStream;
++    let bytes = include_bytes!("fixtures/synthetic-fmp4.mp4");
++    for chunk in [1, 7, 17, bytes.len()] {
++        let mut stream = AppendStream::new(1 << 20, 128);
++        let mut units = vec![];
++        for c in bytes.chunks(chunk) {
++            units.extend(stream.append(c).unwrap());
++        }
++        units.extend(stream.end_of_stream().unwrap());
++        assert_eq!(units.len(), 2);
++        assert_eq!(units[1].pts_us, 500_000);
++    }
++}
++#[test]
++fn append_stream_error_stays_failed_until_explicit_abort() {
++    use servo_media_android_hosttest::mse_demux::append::AppendStream;
++    let mut stream = AppendStream::new(1 << 20, 128);
++    assert!(
++        stream
++            .append(&[0, 0, 0, 7, b'f', b'r', b'e', b'e'])
++            .is_err()
++    );
++    assert!(stream.append(&[]).is_err());
++    stream.abort();
++    let mut units = stream
++        .append(include_bytes!("fixtures/synthetic-fmp4.mp4"))
++        .unwrap();
++    units.extend(stream.end_of_stream().unwrap());
++    assert_eq!(units.len(), 2);
++}
++#[test]
++fn eos_rejects_partial_box_instead_of_marking_complete() {
++    use servo_media_android_hosttest::mse_demux::append::AppendStream;
++    let mut stream = AppendStream::new(1 << 20, 128);
++    stream.append(&[0, 0, 0]).unwrap();
++    assert!(stream.end_of_stream().is_err());
++}
+diff --git a/components/media/backends/android/mse_demux/README.md b/components/media/backends/android/mse_demux/README.md
+index 8c1751a44..c0fb4bb2a 100644
+--- a/components/media/backends/android/mse_demux/README.md
++++ b/components/media/backends/android/mse_demux/README.md
+@@ -9,3 +9,5 @@ Implemented incremental bounded box framing, transactional fMP4 sample extractio
+ Not complete MSE: missing DOM event/state/object identity integration, native decoder bridge, source-buffer attachment/delivery, full coded-frame processing semantics (sequence mode, discontinuity detection, multiplexed-track range intersection, eviction), edit-list support, brand compatibility, WebM, and full parser security/resource review. Unsupported edits/DRM are rejected. Do not advertise codecs based solely on this parser.
+ 
+ Host evidence: existing57 tests plus18 new checks (13 unit +5 fixture integration) pass. Fixture is a locally generated32x32 blue AVC fMP4 with2 frames, no user media. It demonstrates parsing, not codec playback. Generated using ffmpeg lavfi color blue/2fps/1s, libx264 ultrafast/g1, empty_moov+frag_keyframe+default_base_moof. Primary requirements: https://www.w3.org/TR/mse-byte-stream-format-isobmff/ and https://developer.android.com/reference/android/media/MediaCodec (CSD section).
++
++064 adds append-stream buffering/EOS/abort, codec-input bridge, bounded retained packet delivery and dormant NDK configure/start/queue adapter. Native adapter is compiled but has NO production call site or output-pump integration. It requires a borrowed video surface, rejects unsupported formats/config changes rather than resetting live decoders, and checks track identity/input capacity. Negative PTS currently rejected at delivery, pending spec-correct preroll/time mapping. AAC extensions remain unsupported by the narrow dependency helper.84 host tests pass (73unit+11fixture), NOT native runtime evidence.
+diff --git a/components/media/backends/android/mse_demux/append.rs b/components/media/backends/android/mse_demux/append.rs
+new file mode 100644
+index 000000000..f8749b999
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/append.rs
+@@ -0,0 +1,139 @@
++//! Incremental append-to-access-unit processing. The final segment is emitted
++//! at the next segment boundary or explicit end-of-stream, not append-call end.
++//! A JS append is not a media segment boundary.
++use super::{AccessUnit, BoxFramer, Demux, Error};
++pub struct AppendStream {
++    framer: BoxFramer,
++    demux: Demux,
++    init: Vec<u8>,
++    media: Vec<u8>,
++    initialized: bool,
++    has_moof: bool,
++    has_mdat: bool,
++    limit: usize,
++    failed: bool,
++}
++impl AppendStream {
++    pub fn new(limit: usize, max_samples: usize) -> Self {
++        Self {
++            framer: BoxFramer::new(limit),
++            demux: Demux::new(limit, max_samples),
++            init: vec![],
++            media: vec![],
++            initialized: false,
++            has_moof: false,
++            has_mdat: false,
++            limit,
++            failed: false,
++        }
++    }
++    pub fn append(&mut self, data: &[u8]) -> Result<Vec<AccessUnit>, Error> {
++        if self.failed {
++            return Err(Error::InvalidBox);
++        }
++        let result = self.consume(data);
++        if result.is_err() {
++            self.failed = true;
++        }
++        result
++    }
++    fn consume(&mut self, data: &[u8]) -> Result<Vec<AccessUnit>, Error> {
++        self.framer.append(data)?;
++        let mut output = vec![];
++        while let Some(b) = self.framer.pop_box()? {
++            match &b[4..8] {
++                b"ftyp" => {
++                    self.flush(&mut output)?;
++                    self.init = b;
++                    self.initialized = false;
++                },
++                b"moov" => {
++                    if self.init.is_empty() {
++                        return Err(Error::InvalidBox);
++                    }
++                    self.extend_init(&b)?;
++                    self.demux.init(&self.init)?;
++                    self.initialized = true;
++                    self.init.clear();
++                },
++                b"moof" => {
++                    self.flush(&mut output)?;
++                    if !self.initialized {
++                        return Err(Error::InvalidBox);
++                    }
++                    self.media = b;
++                    self.has_moof = true;
++                },
++                b"mdat" => {
++                    if !self.has_moof {
++                        return Err(Error::InvalidBox);
++                    }
++                    self.extend_media(&b)?;
++                    self.has_mdat = true;
++                },
++                _ => {
++                    if self.has_moof {
++                        self.extend_media(&b)?;
++                    } else if !self.init.is_empty() {
++                        self.extend_init(&b)?;
++                    }
++                },
++            }
++        }
++        Ok(output)
++    }
++    fn extend_media(&mut self, b: &[u8]) -> Result<(), Error> {
++        if self.media.len().checked_add(b.len()).ok_or(Error::Quota)? > self.limit {
++            return Err(Error::Quota);
++        }
++        self.media.extend_from_slice(b);
++        Ok(())
++    }
++    fn extend_init(&mut self, b: &[u8]) -> Result<(), Error> {
++        if self.init.len().checked_add(b.len()).ok_or(Error::Quota)?
++            > self.limit.min(2 * 1024 * 1024)
++        {
++            return Err(Error::Quota);
++        }
++        self.init.extend_from_slice(b);
++        Ok(())
++    }
++    fn flush(&mut self, output: &mut Vec<AccessUnit>) -> Result<(), Error> {
++        if self.has_moof {
++            if !self.has_mdat {
++                return Err(Error::Truncated);
++            }
++            output.extend(self.demux.media(&self.media)?);
++            self.media.clear();
++            self.has_moof = false;
++            self.has_mdat = false;
++        }
++        Ok(())
++    }
++    pub fn end_of_stream(&mut self) -> Result<Vec<AccessUnit>, Error> {
++        if self.failed {
++            return Err(Error::InvalidBox);
++        }
++        let result = (|| {
++            self.framer.finish()?;
++            if !self.init.is_empty() {
++                return Err(Error::Truncated);
++            }
++            let mut out = vec![];
++            self.flush(&mut out)?;
++            Ok(out)
++        })();
++        if result.is_err() {
++            self.failed = true;
++        }
++        result
++    }
++    pub fn abort(&mut self) {
++        self.framer.reset();
++        self.media.clear();
++        self.init.clear();
++        self.has_moof = false;
++        self.has_mdat = false;
++        self.failed = false;
++    }
++}
+diff --git a/components/media/backends/android/mse_demux/bridge.rs b/components/media/backends/android/mse_demux/bridge.rs
+new file mode 100644
+index 000000000..bc0c36660
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/bridge.rs
+@@ -0,0 +1,151 @@
++//! Codec input preparation, not codec execution. This stages the demux-to-NDK
++//! boundary without exposing unfinished DOM APIs or instantiating a decoder.
++use super::{
++    AccessUnit,
++    avc::{AvcConfig, AvcError},
++};
++use std::collections::BTreeMap;
++#[derive(Debug, PartialEq, Eq)]
++pub enum BridgeError {
++    MissingConfiguration,
++    UnsupportedConfiguration,
++    InvalidSample,
++    Quota,
++}
++#[derive(Clone)]
++pub struct DecoderConfig {
++    pub track_id: u32,
++    pub mime: &'static str,
++    pub width: u16,
++    pub height: u16,
++    pub sample_rate: u32,
++    pub channels: u16,
++    pub csd0: Vec<u8>,
++    pub csd1: Vec<u8>,
++}
++pub struct DecoderPacket {
++    pub track_id: u32,
++    pub pts_us: i64,
++    pub keyframe: bool,
++    pub bytes: Vec<u8>,
++    pub config: Option<DecoderConfig>,
++}
++pub struct DecoderBridge {
++    avc: BTreeMap<u32, AvcConfig>,
++    aac: BTreeMap<u32, DecoderConfig>,
++    limit: usize,
++}
++impl DecoderBridge {
++    pub fn new(limit: usize) -> Self {
++        Self {
++            avc: BTreeMap::new(),
++            aac: BTreeMap::new(),
++            limit,
++        }
++    }
++    pub fn reset(&mut self) {
++        self.avc.clear();
++        self.aac.clear();
++    }
++    pub fn prepare(&mut self, unit: AccessUnit) -> Result<DecoderPacket, BridgeError> {
++        if matches!(
++            unit.codec_config,
++            Some(shiguredo_mp4::boxes::SampleEntry::Mp4a(_))
++        ) || (unit.codec_config.is_none() && self.aac.contains_key(&unit.track_id))
++        {
++            return self.prepare_aac(unit);
++        }
++        let replacement = unit
++            .codec_config
++            .as_ref()
++            .map(|e| AvcConfig::from_entry(e, self.limit))
++            .transpose()
++            .map_err(|e| match e {
++                AvcError::Quota => BridgeError::Quota,
++                _ => BridgeError::UnsupportedConfiguration,
++            })?;
++        let config = replacement
++            .as_ref()
++            .or_else(|| self.avc.get(&unit.track_id))
++            .ok_or(BridgeError::MissingConfiguration)?;
++        let bytes = config
++            .annex_b(&unit.data, self.limit)
++            .map_err(|e| match e {
++                AvcError::Quota => BridgeError::Quota,
++                _ => BridgeError::InvalidSample,
++            })?;
++        let update = replacement.as_ref().map(|c| DecoderConfig {
++            track_id: unit.track_id,
++            mime: "video/avc",
++            width: c.width,
++            height: c.height,
++            sample_rate: 0,
++            channels: 0,
++            csd0: c.csd0.clone(),
++            csd1: c.csd1.clone(),
++        });
++        // Commit new configuration only after the associated sample validates.
++        if let Some(c) = replacement {
++            self.aac.remove(&unit.track_id);
++            self.avc.insert(unit.track_id, c);
++        }
++        Ok(DecoderPacket {
++            track_id: unit.track_id,
++            pts_us: unit.pts_us,
++            keyframe: unit.keyframe,
++            bytes,
++            config: update,
++        })
++    }
++    fn prepare_aac(&mut self, unit: AccessUnit) -> Result<DecoderPacket, BridgeError> {
++        use shiguredo_mp4::{bitstream::aac::parse_audio_specific_config, boxes::SampleEntry};
++        if unit.data.is_empty() {
++            return Err(BridgeError::InvalidSample);
++        }
++        if unit.data.len() > self.limit {
++            return Err(BridgeError::Quota);
++        }
++        let replacement = if let Some(SampleEntry::Mp4a(entry)) = unit.codec_config {
++            let desc = &entry.esds_box.es.dec_config_descr;
++            if desc.object_type_indication != 0x40 {
++                return Err(BridgeError::UnsupportedConfiguration);
++            }
++            let asc = &desc
++                .dec_specific_info
++                .as_ref()
++                .ok_or(BridgeError::UnsupportedConfiguration)?
++                .payload;
++            if asc.len() > self.limit {
++                return Err(BridgeError::Quota);
++            }
++            let parsed = parse_audio_specific_config(asc)
++                .map_err(|_| BridgeError::UnsupportedConfiguration)?;
++            Some(DecoderConfig {
++                track_id: unit.track_id,
++                mime: "audio/mp4a-latm",
++                width: 0,
++                height: 0,
++                sample_rate: parsed.sampling_frequency.hz(),
++                channels: parsed.channel_configuration.channel_count(),
++                csd0: asc.clone(),
++                csd1: vec![],
++            })
++        } else {
++            None
++        };
++        if replacement.is_none() && !self.aac.contains_key(&unit.track_id) {
++            return Err(BridgeError::MissingConfiguration);
++        }
++        if let Some(ref c) = replacement {
++            self.aac.insert(unit.track_id, c.clone());
++            self.avc.remove(&unit.track_id);
++        }
++        Ok(DecoderPacket {
++            track_id: unit.track_id,
++            pts_us: unit.pts_us,
++            keyframe: unit.keyframe,
++            bytes: unit.data,
++            config: replacement,
++        })
++    }
++}
+diff --git a/components/media/backends/android/mse_demux/delivery.rs b/components/media/backends/android/mse_demux/delivery.rs
+new file mode 100644
+index 000000000..9af1753fd
+--- /dev/null
++++ b/components/media/backends/android/mse_demux/delivery.rs
+@@ -0,0 +1,192 @@
++//! Bounded retained packet delivery. Zero-capacity codec input yields instead
++//! of dropping data. Configuration is applied once per retained packet.
++use super::bridge::{DecoderConfig, DecoderPacket};
++use std::collections::VecDeque;
++#[derive(Debug, PartialEq, Eq)]
++pub enum DeliveryError {
++    Quota,
++    Decoder,
++    InvalidTimestamp,
++    Poisoned,
++}
++pub trait CodecInput {
++    fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()>;
++    /// true only when the entire packet was accepted; false is retry-later.
++    fn submit(&mut self, track_id: u32, bytes: &[u8], pts_us: i64) -> Result<bool, ()>;
++}
++struct Pending {
++    packet: DecoderPacket,
++    configured: bool,
++}
++pub struct Delivery {
++    packets: VecDeque<Pending>,
++    bytes: usize,
++    limit: usize,
++    poisoned: bool,
++}
++impl Delivery {
++    pub fn new(limit: usize) -> Self {
++        Self {
++            packets: VecDeque::new(),
++            bytes: 0,
++            limit,
++            poisoned: false,
++        }
++    }
++    pub fn push(&mut self, packet: DecoderPacket) -> Result<(), DeliveryError> {
++        if self.poisoned {
++            return Err(DeliveryError::Poisoned);
++        }
++        if packet.pts_us < 0 {
++            return Err(DeliveryError::InvalidTimestamp);
++        }
++        let config_bytes = packet
++            .config
++            .as_ref()
++            .map(|c| c.csd0.len().saturating_add(c.csd1.len()))
++            .unwrap_or(0);
++        if self
++            .bytes
++            .checked_add(packet.bytes.len())
++            .and_then(|n| n.checked_add(config_bytes))
++            .ok_or(DeliveryError::Quota)?
++            > self.limit
++        {
++            return Err(DeliveryError::Quota);
++        }
++        self.bytes += packet.bytes.len() + config_bytes;
++        self.packets.push_back(Pending {
++            packet,
++            configured: false,
++        });
++        Ok(())
++    }
++    pub fn pump(&mut self, sink: &mut impl CodecInput) -> Result<bool, DeliveryError> {
++        if self.poisoned {
++            return Err(DeliveryError::Poisoned);
++        }
++        let Some(front) = self.packets.front_mut() else {
++            return Ok(false);
++        };
++        if !front.configured {
++            if let Some(c) = front.packet.config.as_ref() {
++                if sink.configure(c).is_err() {
++                    self.poisoned = true;
++                    return Err(DeliveryError::Decoder);
++                }
++            }
++            front.configured = true;
++        }
++        match sink.submit(
++            front.packet.track_id,
++            &front.packet.bytes,
++            front.packet.pts_us,
++        ) {
++            Ok(false) => Ok(false),
++            Err(()) => {
++                self.poisoned = true;
++                Err(DeliveryError::Decoder)
++            },
++            Ok(true) => {
++                let f = self.packets.pop_front().unwrap();
++                self.bytes -= f.packet.bytes.len()
++                    + f.packet
++                        .config
++                        .as_ref()
++                        .map(|c| c.csd0.len() + c.csd1.len())
++                        .unwrap_or(0);
++                Ok(true)
++            },
++        }
++    }
++    pub fn is_empty(&self) -> bool {
++        self.packets.is_empty()
++    }
++    pub fn reset(&mut self) {
++        self.packets.clear();
++        self.bytes = 0;
++        self.poisoned = false;
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn packet() -> DecoderPacket {
++        DecoderPacket {
++            track_id: 1,
++            pts_us: 3,
++            keyframe: true,
++            bytes: vec![1, 2],
++            config: Some(DecoderConfig {
++                track_id: 1,
++                mime: "video/avc",
++                width: 32,
++                height: 32,
++                sample_rate: 0,
++                channels: 0,
++                csd0: vec![1],
++                csd1: vec![2],
++            }),
++        }
++    }
++    struct Fake {
++        configs: usize,
++        calls: usize,
++        ready: bool,
++        fail: bool,
++    }
++    impl CodecInput for Fake {
++        fn configure(&mut self, _: &DecoderConfig) -> Result<(), ()> {
++            self.configs += 1;
++            Ok(())
++        }
++        fn submit(&mut self, track_id: u32, b: &[u8], p: i64) -> Result<bool, ()> {
++            assert_eq!(track_id, 1);
++            self.calls += 1;
++            assert_eq!(b, &[1, 2]);
++            assert_eq!(p, 3);
++            if self.fail { Err(()) } else { Ok(self.ready) }
++        }
++    }
++    #[test]
++    fn retry_keeps_packet_and_does_not_reconfigure() {
++        let mut d = Delivery::new(16);
++        d.push(packet()).unwrap();
++        let mut s = Fake {
++            configs: 0,
++            calls: 0,
++            ready: false,
++            fail: false,
++        };
++        assert_eq!(d.pump(&mut s), Ok(false));
++        assert!(!d.is_empty());
++        s.ready = true;
++        assert_eq!(d.pump(&mut s), Ok(true));
++        assert!(d.is_empty());
++        assert_eq!((s.configs, s.calls), (1, 2));
++    }
++    #[test]
++    fn errors_poison_until_reset() {
++        let mut d = Delivery::new(16);
++        d.push(packet()).unwrap();
++        let mut s = Fake {
++            configs: 0,
++            calls: 0,
++            ready: true,
++            fail: true,
++        };
++        assert_eq!(d.pump(&mut s), Err(DeliveryError::Decoder));
++        assert_eq!(d.pump(&mut s), Err(DeliveryError::Poisoned));
++        d.reset();
++        assert!(d.is_empty());
++        assert!(d.push(packet()).is_ok());
++    }
++    #[test]
++    fn quota_includes_config_and_negative_pts_is_rejected() {
++        let mut d = Delivery::new(3);
++        assert_eq!(d.push(packet()), Err(DeliveryError::Quota));
++        let mut p = packet();
++        p.pts_us = -1;
++        assert_eq!(d.push(p), Err(DeliveryError::InvalidTimestamp));
++    }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+index de5688537..d18532dcf 100644
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -377,3 +377,7 @@ mod tests {
+ pub mod timeline;
+ 
+ pub mod avc;
++
++pub mod bridge;
++pub mod append;
++pub mod delivery;
+-- 
+2.34.1
+
