@@ -34,7 +34,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -93,13 +92,12 @@ fun ArgonCommandBar(
                 .imePadding()
                 .padding(horizontal = 12.dp, vertical = 10.dp)
                 .height(56.dp)
-                .shadow(14.dp, RoundedCornerShape(28.dp), ambientColor = Color.Black, spotColor = Color.Black)
                 .clip(RoundedCornerShape(28.dp))
                 .background(ArgonColors.SurfaceHigh)
                 .border(
                     1.dp,
                     if (borderAlpha > 0.01f) ArgonColors.Accent.copy(alpha = borderAlpha)
-                    else ArgonColors.Hairline,
+                    else ArgonColors.HairlineStrong,
                     RoundedCornerShape(28.dp),
                 ),
     ) {

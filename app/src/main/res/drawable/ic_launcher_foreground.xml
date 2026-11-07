@@ -4,11 +4,11 @@
     <!-- Argon arc: quiet ring, one excited spark -->
     <path
         android:pathData="M 54 30 A 24 24 0 1 1 53.9 30"
-        android:strokeColor="#8B7CF6"
+        android:strokeColor="#7AA7FF"
         android:strokeWidth="4.5"
         android:strokeLineCap="round"
         android:fillColor="#00000000" />
     <path
         android:pathData="M 79.5 44 m-3.4 0 a 3.4 3.4 0 1 1 6.8 0 a 3.4 3.4 0 1 1 -6.8 0"
-        android:fillColor="#8B7CF6" />
+        android:fillColor="#7AA7FF" />
 </vector>

@@ -9,23 +9,33 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+/**
+ * Argon design tokens - "quiet instrument" direction.
+ *
+ * World: argon the element - dark lab, machined graphite, one cool discharge
+ * glow. All chrome comes from one cool-tinted neutral ramp; the azure accent
+ * is reserved for selection, focus, links and the loading track. Depth comes
+ * from surface steps and hairlines, never heavy shadows or hue gradients.
+ * (Direction record: DESIGN-DIRECTION.md. Unslop by Damir Sokolovsky, CC BY 4.0.)
+ */
 object ArgonColors {
-    val Bg = Color(0xFF050507)
-    val Surface = Color(0xFF101014)
-    val SurfaceHigh = Color(0xFF1C1C23)
-    val Text = Color(0xFFF5F5F7)
-    val Text2 = Color(0xFF9B9BA4)
-    val Text3 = Color(0xFF6E6E78)
-    val Accent = Color(0xFF8B7CF6)
-    val AccentSoft = Color(0x1F8B7CF6)
-    val OnAccent = Color(0xFF0B0B10)
-    val Danger = Color(0xFFFF6E64)
-    val Hairline = Color(0x14FFFFFF)
+    val Bg = Color(0xFF08090C)
+    val Surface = Color(0xFF101318)
+    val SurfaceHigh = Color(0xFF181C23)
+    val Text = Color(0xFFF2F4F8)
+    val Text2 = Color(0xFF9AA1AD)
+    val Text3 = Color(0xFF626A76)
+    val Accent = Color(0xFF7AA7FF)
+    val AccentSoft = Color(0x1F7AA7FF)
+    val OnAccent = Color(0xFF0A0D14)
+    val Danger = Color(0xFFFF7A70)
+    val Hairline = Color(0x12FFFFFF)
+    val HairlineStrong = Color(0x1FFFFFFF)
 }
 
 // Shared type scale (macOS/Deepin direction: quiet hierarchy, restrained weights).
 object ArgonType {
-    val Hero = TextStyle(fontSize = 30.sp, fontWeight = FontWeight.Bold, lineHeight = 36.sp)
+    val Hero = TextStyle(fontSize = 30.sp, fontWeight = FontWeight.SemiBold, lineHeight = 36.sp)
     val Title = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, lineHeight = 26.sp)
     val Heading = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.SemiBold, lineHeight = 22.sp)
     val Body = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Normal, lineHeight = 22.sp)
@@ -47,6 +57,13 @@ object ArgonSpacing {
     val Xl = 20.dp
     val Xxl = 24.dp
     val Xxxl = 32.dp
+}
+
+// Nested radii: controls 10, cards 14-16, the command capsule stays a capsule.
+object ArgonRadii {
+    val Control = 10.dp
+    val Card = 14.dp
+    val Panel = 16.dp
 }
 
 @Composable
