@@ -556,7 +556,7 @@ index c7572fad3..04610a0cc 100644
                          }
                      }
 diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
-index 2c7b24993..b4103d48f 100644
+index 2c7b24993..dcdca9024 100644
 --- a/components/script/dom/mse/sourcebuffer.rs
 +++ b/components/script/dom/mse/sourcebuffer.rs
 @@ -161,7 +161,11 @@ impl SourceBuffer {
@@ -595,7 +595,7 @@ index 2c7b24993..b4103d48f 100644
 +                .task_manager()
 +                .media_element_task_source()
 +                .queue(task!(append_abort_ended:move|cx|{
-+                    this.root().upcast::<EventTarget>().fire_event(cx,atom!("updateend"));
++                    this.root().upcast::<EventTarget>().fire_event(cx,stylo_atoms::Atom::from("updateend"));
 +                }));
 +        }
 +        Ok(())
