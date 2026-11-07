@@ -31,13 +31,14 @@ private class LoadedStore<T>(val entries: List<T>, val quarantineFailed: Boolean
 
 /** Shared background-save machinery for the JSON stores. save() callers hold
  * immutable List snapshots, so queueing is latest-wins: a superseded snapshot
- * is dropped unwritten, and flushSaves() drains the newest snapshot
- * synchronously (called on onPause) so backgrounding never loses queued
- * writes. The write lock also makes flush wait out an in-flight background
- * write. (Perf audit 1.0.17: history.add runs on the main thread from
- * onLoadEnded; JSON-encoding up to 500 entries + file IO mid-navigation
- * janked the page-transition frame.) */
-private class SaveQueue {
+ * is dropped unwritten. flushSaves() is a best-effort BOUNDED drain at
+ * onPause (waits out one in-flight write up to 750ms, then writes the newest
+ * snapshot): it narrows, but does not eliminate, loss on process kill -
+ * unflushed tail changes are lost if the process dies first. The write lock
+ * serializes flush against the background writer. (Perf audit 1.0.17:
+ * history.add runs on the main thread from onLoadEnded; JSON-encoding up to
+ * 500 entries + file IO mid-navigation janked the page-transition frame.) */
+internal class SaveQueue {
     private val executor =
         java.util.concurrent.Executors.newSingleThreadExecutor { r ->
             Thread(r, "argon-store-save").apply { isDaemon = true }
@@ -48,11 +49,15 @@ private class SaveQueue {
     fun enqueue(write: () -> Unit) {
         pending.set(write)
         executor.execute {
-            val task = pending.get()
-            if (task !== write) return@execute // superseded by a newer snapshot
-            pending.compareAndSet(write, null)
+            // Claim and write under the same lock acquisition: flush() can
+            // then guarantee that when it returns true, every save enqueued
+            // before the flush call is on disk (an un-lucked claim can never
+            // leave a claimed-but-unwritten task behind a returning flush).
             writeLock.lock()
             try {
+                val task = pending.get()
+                if (task !== write) return@execute // superseded by a newer snapshot
+                pending.compareAndSet(write, null)
                 write()
             } finally {
                 writeLock.unlock()
@@ -60,11 +65,18 @@ private class SaveQueue {
         }
     }
 
-    fun flush() {
-        val task = pending.getAndSet(null)
-        writeLock.lock()
+    /** Best-effort bounded drain: waits at most [maxWaitMs] for an in-flight
+     * write, then drains the newest pending snapshot under the write lock.
+     * Returns false when the bound was hit (an in-flight write overran); the
+     * pending snapshot is kept and a later flush retries. NOT a durability
+     * guarantee - a process kill before a successful flush still loses
+     * unflushed saves. */
+    fun flush(maxWaitMs: Long = 750): Boolean {
+        val acquired = writeLock.tryLock(maxWaitMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        if (!acquired) return false
         try {
-            task?.invoke()
+            pending.getAndSet(null)?.invoke()
+            return true
         } finally {
             writeLock.unlock()
         }
@@ -76,6 +88,17 @@ private class SaveQueue {
  * AtomicFile's own backup until finishWrite syncs the replacement, so a
  * crash or failure mid-write leaves the last good store recoverable. The
  * target is never deleted to make room for a save. */
+/** Compose-visible health flags are written from the main thread only: the
+ * background save worker must never poke snapshot state off-main. */
+internal fun setStoreHealthFlag(flag: androidx.compose.runtime.MutableState<Boolean>) {
+    val main = android.os.Looper.getMainLooper()
+    if (main != null && android.os.Looper.myLooper() != main) {
+        android.os.Handler(main).post { flag.value = true }
+    } else {
+        flag.value = true
+    }
+}
+
 private fun writeStore(file: File, payload: String): Boolean {
     val af = AtomicFile(file)
     var out: java.io.FileOutputStream? = null
@@ -87,7 +110,7 @@ private fun writeStore(file: File, payload: String): Boolean {
         true
     } catch (t: Throwable) {
         af.failWrite(out)
-        StoreHealth.writeError.value = true
+        setStoreHealthFlag(StoreHealth.writeError)
         false
     }
 }
@@ -118,7 +141,7 @@ private inline fun <reified T> loadStore(file: File): LoadedStore<T> {
         return if (moved) {
             LoadedStore(emptyList(), quarantineFailed = false)
         } else {
-            StoreHealth.corruptPreserveError.value = true
+            setStoreHealthFlag(StoreHealth.corruptPreserveError)
             LoadedStore(emptyList(), quarantineFailed = true)
         }
     }
@@ -175,7 +198,7 @@ class HistoryStore(context: Context) {
             // keeps working for the session), the disk bytes stay untouched,
             // and the error surfaces on every blocked save so the state is
             // never silently divergent.
-            StoreHealth.corruptPreserveError.value = true
+            setStoreHealthFlag(StoreHealth.corruptPreserveError)
             return
         }
         val snapshot = entries
@@ -232,7 +255,7 @@ class BookmarkStore(context: Context) {
             // keeps working for the session), the disk bytes stay untouched,
             // and the error surfaces on every blocked save so the state is
             // never silently divergent.
-            StoreHealth.corruptPreserveError.value = true
+            setStoreHealthFlag(StoreHealth.corruptPreserveError)
             return
         }
         val snapshot = entries
