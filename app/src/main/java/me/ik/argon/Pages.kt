@@ -1,6 +1,8 @@
 package me.ik.argon
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.border
 import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.clickable
@@ -761,7 +763,7 @@ internal fun MenuSheetContent(
     onAbout: () -> Unit,
     onExit: () -> Unit,
 ) {
-    Column(Modifier.padding(bottom = 40.dp)) {
+    Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 40.dp)) {
             // Context header: what page these actions apply to.
             Row(
                 verticalAlignment = Alignment.CenterVertically,

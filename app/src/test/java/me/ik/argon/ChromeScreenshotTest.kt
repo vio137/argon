@@ -321,4 +321,54 @@ class ChromeScreenshotTest {
             }
         }
     }
+
+    @Test
+    fun onboardingPrivacyPage() {
+        paparazzi.snapshot {
+            Box(Modifier.fillMaxSize().background(ArgonColors.Bg)) {
+                PrivacyPage(adblock = true, onAdblockChange = {})
+            }
+        }
+    }
+
+    @Test
+    fun onboardingEnginePage() {
+        paparazzi.snapshot {
+            Box(Modifier.fillMaxSize().background(ArgonColors.Bg)) {
+                EnginePage(searchEngine = SearchEngine.entries.first(), onEngineChange = {})
+            }
+        }
+    }
+
+    /** Narrow (~291dp) + 1.3x font: the sheet body scrolls (verticalScroll);
+     *  a static render can only show the top of the scroll region. */
+    @Test
+    fun menuSheetContentNarrow() {
+        paparazzi.unsafeUpdateConfig(
+            deviceConfig = DeviceConfig.PIXEL_6.copy(screenWidth = 800, fontScale = 1.3f),
+        )
+        paparazzi.snapshot {
+            Box(Modifier.background(ArgonColors.Bg)) {
+                MenuSheetContent(
+                    canGoForward = true,
+                    shareEnabled = true,
+                    onShare = {},
+                    onFind = {},
+                    onCopyLink = {},
+                    onOpenIn = {},
+                    onBookmarks = {},
+                    currentHost = "servo.org",
+                    onForward = {},
+                    startPaged = false,
+                    startToggleEnabled = true,
+                    onAddToStart = {},
+                    onHistory = {},
+                    onSettings = {},
+                    onWax = {},
+                    onAbout = {},
+                    onExit = {},
+                )
+            }
+        }
+    }
 }

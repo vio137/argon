@@ -173,7 +173,7 @@ private fun PageHeader(title: String, body: String) {
 }
 
 @Composable
-private fun WelcomePage() {
+internal fun WelcomePage() {
     Column {
         androidx.compose.foundation.Image(
             painterResource(R.drawable.ic_launcher_foreground),
@@ -182,14 +182,14 @@ private fun WelcomePage() {
         )
         Spacer(Modifier.height(24.dp))
         PageHeader(
-            "A quieter,\nfaster browser.",
-            "Argon runs on the Servo engine, blocks ads and trackers by default, and keeps the controls out of your way. Three quick choices and you're in.",
+            "A quieter\nweb browser.",
+            "Argon runs on the Servo engine and blocks ads and trackers by default. Three quick choices and you're in.",
         )
         FeatureLine("Ad and tracker blocking", "On by default, no account needed.")
         Spacer(Modifier.height(20.dp))
         FeatureLine("Your search, your choice", "Pick Google, DuckDuckGo, Brave or Bing, and switch anytime.")
         Spacer(Modifier.height(20.dp))
-        FeatureLine("Your data stays here", "History and bookmarks never leave the device.")
+        FeatureLine("Your data, on this device", "History and bookmarks are stored locally; export or clear them in Settings.")
     }
 }
 
@@ -203,10 +203,10 @@ private fun FeatureLine(title: String, subtitle: String) {
 }
 
 @Composable
-private fun PrivacyPage(adblock: Boolean, onAdblockChange: (Boolean) -> Unit) {
+internal fun PrivacyPage(adblock: Boolean, onAdblockChange: (Boolean) -> Unit) {
     Column {
         PageHeader(
-            "Private by default.",
+            "Blocking, on by default.",
             "Blocking happens on the device against a bundled list. Nothing you browse is sent to us - there is no us.",
         )
         Row(
@@ -238,7 +238,7 @@ private fun PrivacyPage(adblock: Boolean, onAdblockChange: (Boolean) -> Unit) {
 }
 
 @Composable
-private fun EnginePage(searchEngine: SearchEngine, onEngineChange: (SearchEngine) -> Unit) {
+internal fun EnginePage(searchEngine: SearchEngine, onEngineChange: (SearchEngine) -> Unit) {
     Column {
         PageHeader(
             "Pick your search.",
