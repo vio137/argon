@@ -1,0 +1,423 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 5a19341f1..6d25cff31 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -385,6 +385,10 @@ pub struct AppendPlayback {
+     rendered_frames: u64,
+     video_done: bool,
+     audio_done: bool,
++    seek_target: Option<i64>,
++    video_seek_floor: Option<i64>,
++    seek_ready: bool,
++    seek_started: Option<Instant>,
+ }
+ impl AppendPlayback {
+     pub fn new(renderer: Arc<Mutex<dyn VideoFrameRenderer>>) -> Self {
+@@ -418,6 +422,10 @@ impl AppendPlayback {
+             rendered_frames: 0,
+             video_done: false,
+             audio_done: false,
++            seek_target: None,
++            video_seek_floor: None,
++            seek_ready: false,
++            seek_started: None,
+         }
+     }
+     fn checked<T>(&mut self, result: Result<T, ()>) -> Result<T, ()> {
+@@ -524,6 +532,11 @@ impl AppendPlayback {
+             .iter()
+             .map(|(id, s)| Ok((*id, s.stage_seek(target_us).map_err(|_| ())?)))
+             .collect::<Result<Vec<_>, ()>>()?;
++        let video_floor = self
++            .sessions
++            .values()
++            .filter_map(|s| s.video_frame_at(target_us))
++            .max();
+         self.audio.close();
+         self.audio.pending = None;
+         self.decoders.reset_epoch();
+@@ -538,12 +551,19 @@ impl AppendPlayback {
+         self.clock.pause();
+         self.clock_started = true;
+         self.playing = false;
++        self.seek_target = Some(target_us);
++        self.video_seek_floor = video_floor;
++        self.seek_ready = false;
++        self.seek_started = Some(Instant::now());
+         focus::set_counted(&mut self.focus_counted, false);
+         for (id, plan) in plans {
+             self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
+         }
+         Ok(())
+     }
++    pub fn take_seek_ready(&mut self) -> bool {
++        std::mem::take(&mut self.seek_ready)
++    }
+     pub fn end_input(&mut self) -> Result<(), ()> {
+         if self.failed {
+             return Err(());
+@@ -597,7 +617,10 @@ impl AppendPlayback {
+             .buffered()
+             .iter()
+             .any(|r| r.start <= position && position < r.end);
+-        let playing = self.page_playing && self.focus.hold == Hold::None && buffered;
++        let playing = self.page_playing
++            && self.focus.hold == Hold::None
++            && buffered
++            && self.seek_target.is_none();
+         if playing != self.playing {
+             self.audio.set_running(playing)?;
+             self.playing = playing;
+@@ -652,6 +675,39 @@ impl AppendPlayback {
+                 .collect(),
+         })
+     }
++    fn finish_seek_if_ready(&mut self) -> Result<(), ()> {
++        if self.seek_target.is_some() {
++            let has_video = self
++                .sessions
++                .values()
++                .any(|s| s.descriptions().iter().any(|t| t.mime == "video/avc"));
++            let has_audio = self
++                .sessions
++                .values()
++                .any(|s| s.descriptions().iter().any(|t| t.mime == "audio/mp4a-latm"));
++            if (has_video
++                && self.video_done
++                && self.rendered_frames == 0
++                && self.video_pending.is_none())
++                || (has_audio && self.audio_done && self.audio.pending.is_none())
++                || self
++                    .seek_started
++                    .is_some_and(|started| started.elapsed() > Duration::from_secs(5))
++            {
++                return Err(());
++            }
++            if (!has_video || self.rendered_frames > 0)
++                && (!has_audio || self.audio.pending.is_some())
++            {
++                self.seek_target = None;
++                self.video_seek_floor = None;
++                self.seek_ready = true;
++                self.seek_started = None;
++                self.focus_tick()?;
++            }
++        }
++        Ok(())
++    }
+     fn pump_inner(&mut self) -> Result<bool, ()> {
+         // Fair packet-level pumping keeps a blocked video decoder from
+         // starving an independently appended audio SourceBuffer.
+@@ -719,10 +775,21 @@ impl AppendPlayback {
+                         pts_us,
+                         eos,
+                     } => {
+-                        self.audio.pending = Some(
++                        let queue = if let Some(target) = self.seek_target {
++                            AudioQueue::new_after(
++                                samples,
++                                self.audio.channels as usize,
++                                pts_us,
++                                self.audio.rate as u32,
++                                target,
++                            )
++                        } else {
+                             AudioQueue::new(samples, self.audio.channels as usize, pts_us)
+-                                .ok_or(())?,
+-                        );
++                        }
++                        .ok_or(())?;
++                        if queue.frames() > 0 {
++                            self.audio.pending = Some(queue);
++                        }
+                         self.audio_done = eos;
+                     },
+                     MseOutput::EndOfStream => self.audio_done = true,
+@@ -752,10 +819,13 @@ impl AppendPlayback {
+         }
+         if self.video_pending.is_none() && !self.video_done {
+             if let Some((_, codec)) = &mut self.decoders.video {
+-                match codec.poll_output_at(
+-                    self.clock.now_us(),
++                match codec.poll_output_after(
++                    self.clock
++                        .now_us()
++                        .max(self.video_seek_floor.unwrap_or(i64::MIN)),
+                     (self.page_playing && self.focus.hold == Hold::None)
+                         || self.rendered_frames == 0,
++                    self.video_seek_floor,
+                 )? {
+                     MseOutput::SurfaceReleased { eos, .. } => {
+                         self.video_pending = Some(Instant::now());
+@@ -774,6 +844,7 @@ impl AppendPlayback {
+                 }
+             }
+         }
++        self.finish_seek_if_ready()?;
+         let decoder_done = self.input_exhausted()
+             && (self.decoders.video.is_none() || self.video_done)
+             && (self.decoders.audio.is_none() || self.audio_done)
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index b43638ba3..4a156ede3 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -518,3 +518,82 @@ fn a_seek_missing_any_source_buffer_preserves_the_existing_epoch() {
+         [0..1_000_000]
+     );
+ }
++
++#[test]
++fn seek_completion_waits_for_video_acquisition_and_trimmed_audio_without_advancing_clock() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.add_buffer(2).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.append(
++        2,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4"),
++    )
++    .unwrap();
++    p.reset_seek_epoch(50_000).unwrap();
++    assert_eq!(p.video_seek_floor, Some(0));
++    p.page_playing = true;
++    p.focus_tick().unwrap();
++    assert!(!p.playing);
++    assert_eq!(p.clock.now_us(), 50_000);
++    p.finish_seek_if_ready().unwrap();
++    assert!(!p.take_seek_ready());
++    p.rendered_frames = 1;
++    p.finish_seek_if_ready().unwrap();
++    assert!(!p.take_seek_ready());
++    // This represents already-trimmed decoder output, not real decoded audio.
++    p.audio.pending =
++        Some(AudioQueue::new_after(vec![1, 2, 3, 4], 2, 49_980, 48000, 50_000).unwrap());
++    p.page_playing = false;
++    p.finish_seek_if_ready().unwrap();
++    assert!(p.take_seek_ready());
++    assert!(!p.take_seek_ready());
++    assert!(p.seek_target.is_none());
++    assert!(p.video_seek_floor.is_none());
++    assert!(!p.playing);
++    assert_eq!(p.clock.now_us(), 50_000);
++}
++#[test]
++fn a_new_seek_invalidates_the_old_ready_signal() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.reset_seek_epoch(750_000).unwrap();
++    p.rendered_frames = 1;
++    p.finish_seek_if_ready().unwrap();
++    assert!(p.seek_ready);
++    p.reset_seek_epoch(250_000).unwrap();
++    assert!(!p.take_seek_ready());
++    assert_eq!(p.video_seek_floor, Some(0));
++    assert_eq!(p.clock.now_us(), 250_000);
++}
++
++#[test]
++fn seek_missing_output_never_becomes_ready_or_waits_without_a_bound() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.reset_seek_epoch(750_000).unwrap();
++    p.video_done = true;
++    assert!(p.finish_seek_if_ready().is_err());
++    assert!(!p.take_seek_ready());
++    p.video_done = false;
++    p.seek_started = Some(Instant::now() - Duration::from_secs(6));
++    assert!(p.finish_seek_if_ready().is_err());
++    assert!(!p.take_seek_ready());
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 4f442af32..43aa3b93e 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -88,6 +88,9 @@ impl AndroidAppendPlayer {
+                     }
+                 };
+                 match event {
++                    // Real Player seek will own these only after its state/
++                    // generation and HTML completion routing is implemented.
++                    Event::SeekReady { .. } | Event::SeekRejected(_) => (),
+                     Event::AppendStarted(id, operation) => {
+                         let callback = shared
+                             .lock()
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index ee66986a6..7d2bdeb9d 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -18,6 +18,10 @@ use std::{
+ 
+ pub enum Command {
+     AddBuffer(u32),
++    Seek {
++        operation: u64,
++        target_us: i64,
++    },
+     AbortAppend(u32),
+     Append {
+         buffer_id: u32,
+@@ -44,6 +48,7 @@ pub enum SendError {
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Applied {
+     BufferAdded(u32),
++    SeekStarted(u64),
+     AppendAborted(u32),
+     Appended(u32, u64),
+     Options(u32),
+@@ -53,6 +58,11 @@ pub enum Applied {
+ }
+ pub enum Event {
+     AppendStarted(u32, u64),
++    SeekReady {
++        operation: u64,
++        target_us: i64,
++    },
++    SeekRejected(u64),
+     /// Identifies command acceptance/processing, not audible or visible output.
+     CommandApplied(Applied),
+     Status(PumpStatus),
+@@ -87,6 +97,7 @@ impl Worker {
+                     let mut previous_audio = false;
+                     let mut previous_playing = false;
+                     let mut last_status = Instant::now();
++                    let mut pending_seek = None;
+                     loop {
+                         if cancelled.load(Ordering::Acquire) {
+                             break;
+@@ -95,6 +106,9 @@ impl Worker {
+                         match rx.recv_timeout(Duration::from_millis(5)) {
+                             Ok(command) => {
+                                 let ack = match &command {
++                                    Command::Seek { operation, .. } => {
++                                        Applied::SeekStarted(*operation)
++                                    },
+                                     Command::Options { buffer_id, .. } => {
+                                         Applied::Options(*buffer_id)
+                                     },
+@@ -110,6 +124,17 @@ impl Worker {
+                                     Command::Volume { .. } => Applied::Volume,
+                                 };
+                                 let applied = match command {
++                                    Command::Seek {
++                                        operation,
++                                        target_us,
++                                    } => {
++                                        if playback.reset_seek_epoch(target_us).is_err() {
++                                            event(Event::SeekRejected(operation));
++                                            continue;
++                                        }
++                                        pending_seek = Some((operation, target_us));
++                                        Ok(())
++                                    },
+                                     Command::Options {
+                                         buffer_id,
+                                         offset_us,
+@@ -174,6 +199,14 @@ impl Worker {
+                         if let Some(ack) = applied_ack {
+                             event(Event::CommandApplied(ack));
+                         }
++                        if playback.take_seek_ready() {
++                            if let Some((operation, target_us)) = pending_seek.take() {
++                                event(Event::SeekReady {
++                                    operation,
++                                    target_us,
++                                });
++                            }
++                        }
+                         if status.finished {
+                             playback.set_playing(false)?;
+                             break;
+@@ -371,4 +404,40 @@ mod tests {
+             }
+         }
+     }
++    #[test]
++    fn invalid_seek_rejection_is_not_a_decoder_failure_or_completion() {
++        let (tx, rx) = mpsc::channel();
++        let worker = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |e| {
++                let _ = tx.send(e);
++            }),
++        )
++        .unwrap();
++        assert!(
++            worker
++                .try_command(Command::Seek {
++                    operation: 91,
++                    target_us: 0
++                })
++                .is_ok()
++        );
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::SeekRejected(91) => break,
++                Event::Error | Event::SeekReady { .. } => {
++                    panic!("invalid seek became completion or fatal failure")
++                },
++                _ => (),
++            }
++        }
++        assert!(worker.try_command(Command::Playing(false)).is_ok());
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::CommandApplied(Applied::Playing) => break,
++                Event::Error => panic!("worker poisoned by unbuffered target"),
++                _ => (),
++            }
++        }
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index 91955603b..264504683 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -542,3 +542,11 @@ fn a_known_empty_track_prevents_false_muxed_buffer_coverage() {
+     let plan=s.stage_seek(750_000).unwrap();s.commit_seek(plan);
+     let mut sink=Sink(vec![]);while s.pump_input(&mut sink).unwrap(){}assert_eq!(sink.0,[500_000]);
+ }
++
++#[test] fn video_seek_selects_the_frame_covering_target_instead_of_dropping_it_as_preroll() {
++    use servo_media_android_hosttest::mse_demux::session::AppendSession;
++    let mut s=AppendSession::new(1<<20,128);s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();
++    assert_eq!(s.video_frame_at(0),Some(0));assert_eq!(s.video_frame_at(499_999),Some(0));
++    assert_eq!(s.video_frame_at(500_000),Some(500_000));assert_eq!(s.video_frame_at(750_000),Some(500_000));
++    assert_eq!(s.video_frame_at(1_000_000),None);assert_eq!(s.video_frame_at(-1),None);
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index 39a3888c7..d41b6afde 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -127,6 +127,15 @@ impl AppendSession {
+     /// Stage a seek without touching native codecs. The caller must reset
+     /// decoder/output epochs and suppress preroll before pumping these packets.
+     /// Failure leaves the old delivery cursor intact.
++    pub fn video_frame_at(&self, target: i64) -> Option<i64> {
++        self.descriptions()
++            .iter()
++            .filter(|t| t.mime == "video/avc")
++            .flat_map(|t| self.store.frames(t.id))
++            .filter(|f| f.pts_us <= target && target < f.pts_us.saturating_add(f.duration_us))
++            .map(|f| f.pts_us)
++            .max()
++    }
+     pub fn stage_seek(&self, target_us: i64) -> Result<SeekPlan, SessionError> {
+         if self.failed {
+             return Err(SessionError::Failed);
