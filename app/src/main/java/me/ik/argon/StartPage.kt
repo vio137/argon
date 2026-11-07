@@ -51,6 +51,17 @@ input::placeholder{color:var(--text3)}
 .rtext{display:flex;flex-direction:column;min-width:0}
 .rtitle{color:var(--text);font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rhost{color:var(--text3);font-size:12px}
+@media (prefers-reduced-motion:no-preference){
+.brand,form{animation:rise .3s cubic-bezier(.2,.7,.3,1) backwards}
+.tile{animation:rise .3s cubic-bezier(.2,.7,.3,1) backwards}
+.tile:nth-child(2){animation-delay:.03s}.tile:nth-child(3){animation-delay:.06s}
+.tile:nth-child(4){animation-delay:.09s}.tile:nth-child(5){animation-delay:.12s}.tile:nth-child(6){animation-delay:.15s}
+.tile:nth-child(7){animation-delay:.18s}.tile:nth-child(8){animation-delay:.21s}
+.rows .row{animation:rise .3s cubic-bezier(.2,.7,.3,1) backwards}
+.rows .row:nth-child(2){animation-delay:.05s}.rows .row:nth-child(3){animation-delay:.1s}
+.rows .row:nth-child(4){animation-delay:.15s}.rows .row:nth-child(5){animation-delay:.2s}.rows .row:nth-child(6){animation-delay:.25s}
+}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}}
 </style></head><body>
 <div class="wrap">
 <div class="brand"><svg class="mark" viewBox="0 0 108 108" fill="none"><circle cx="54" cy="54" r="24" stroke="#7AA7FF" stroke-width="4.5" stroke-linecap="round"/><circle cx="79.5" cy="44" r="3.4" fill="#7AA7FF"/></svg><span class="word">Argon</span></div>

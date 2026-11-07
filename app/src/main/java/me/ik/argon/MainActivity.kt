@@ -332,6 +332,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     }
                     when (screen) {
                         Screen.History -> {
+                            PageEntrance {
                             HistoryPage(
                                 history = history,
                                 onOpen = {
@@ -341,9 +342,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 onBack = { screen = Screen.Browser },
                                 onCleared = { refreshStartPage() },
                             )
+                            }
                             BackHandler { screen = Screen.Browser }
                         }
                         Screen.Bookmarks -> {
+                            PageEntrance {
                             BookmarksPage(
                                 bookmarks = bookmarks,
                                 onOpen = {
@@ -355,12 +358,13 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                     screen = Screen.Browser
                                 },
                             )
+                            }
                             BackHandler {
                                 refreshStartPage()
                                 screen = Screen.Browser
                             }
                         }
-                        Screen.Settings -> SettingsPage()
+                        Screen.Settings -> PageEntrance { SettingsPage() }
                         Screen.Browser -> {}
                     }
                     if (showOnboarding) {

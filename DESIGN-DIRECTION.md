@@ -21,6 +21,9 @@
 - apple-design-skill @ ff4ebdd https://github.com/dickwu/apple-design-skill (HIG reference set)
 - mobile-app-ui-design @ 0ad61f0 https://github.com/ceorkm/mobile-app-ui-design
 - ponytail @ 96608e0 https://github.com/dietrichgebert/ponytail MIT
+- compose-animations (chrisbanes/skills) https://github.com/chrisbanes/skills Apache-2.0 (animation API selection)
+- android-compose-design @ NI3singh https://github.com/NI3singh/android-compose-design-skill MIT (anti-generic Android UI; motion.md entrance choreography)
+Note: rock3r/android-ux-skills (animate-compose) 404s as of 2026-11-07 - not installable.
 Reinstall: git clone --depth 1 <url> for each into the agent workspace.
 
 ## Revamp scope status (branch exp-ui-revamp, tip green on CI lint)
@@ -45,3 +48,13 @@ Reinstall: git clone --depth 1 <url> for each into the agent workspace.
 
 ## User-directed exclusions (2026-11-07, user's own words)
 - Reader view and View DOM: user tried them on the delivered candidate, said they do not work and "I don't want those features". Both removed from the next build: menu rows, overlays, ReaderMode.kt, ViewDom.kt, readability.js asset, icons, About credit, serif article type styles. The engine's evaluateScript bridge stays in the servo package (it is engine API, unused features cost nothing).
+
+## Motion rules (from compose-animations + android-compose-design, applied)
+- Springs for spatial motion, one 160ms effects tween; both in Motion.kt (ArgonMotion).
+- One orchestrated moment per surface: secondary pages rise-and-fade once on
+  entry (PageEntrance), the start page staggers tiles/rows via CSS, onboarding
+  steps slide. Nothing loops; no bounce.
+- Reduced motion honored: PageEntrance reads the system transition-animation
+  scale and jumps to end state; the start page gates its CSS on
+  prefers-reduced-motion: no-preference.
+- Frame-rate values read inside graphicsLayer blocks, never in composition.
