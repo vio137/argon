@@ -1,0 +1,2478 @@
+From ecfef9cf395504c15e95d164e449815bef580c80 Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sun, 8 Nov 2026 00:42:48 +0530
+Subject: [PATCH] 066 media: connect adaptive worker to renderer and retained
+ AAudio output
+
+---
+ .../backends/android/android_impl/mod.rs      |   2 +
+ .../android/android_impl/mse_codec.rs         | 111 ++-
+ .../android/android_impl/mse_codec_tests.rs   | 168 ++++
+ .../android/android_impl/mse_playback.rs      | 865 ++++++++++++++++++
+ .../android_impl/mse_playback_tests.rs        | 419 +++++++++
+ .../android/android_impl/mse_worker.rs        | 224 +++++
+ .../backends/android/android_impl/sys.rs      |  49 +-
+ .../backends/android/hosttest/Cargo.lock      |  77 ++
+ .../backends/android/hosttest/Cargo.toml      |   5 +
+ .../media/backends/android/hosttest/README.md |  20 +
+ .../backends/android/hosttest/src/lib.rs      |   8 +
+ .../backends/android/hosttest/src/native.rs   |  11 +
+ .../android/hosttest/src/video_api.rs         |  86 ++
+ .../backends/android/mse_demux/README.md      |  18 +
+ components/media/backends/android/yuv_pack.rs |  93 +-
+ 15 files changed, 2116 insertions(+), 40 deletions(-)
+ create mode 100644 components/media/backends/android/android_impl/mse_codec_tests.rs
+ create mode 100644 components/media/backends/android/android_impl/mse_playback.rs
+ create mode 100644 components/media/backends/android/android_impl/mse_playback_tests.rs
+ create mode 100644 components/media/backends/android/android_impl/mse_worker.rs
+ create mode 100644 components/media/backends/android/hosttest/src/native.rs
+ create mode 100644 components/media/backends/android/hosttest/src/video_api.rs
+
+diff --git a/components/media/backends/android/android_impl/mod.rs b/components/media/backends/android/android_impl/mod.rs
+index d8bba9968..1f71914c1 100644
+--- a/components/media/backends/android/android_impl/mod.rs
++++ b/components/media/backends/android/android_impl/mod.rs
+@@ -5,6 +5,8 @@
+ //! Android-only NDK parts of the backend (compiled only for Android targets).
+ mod player;
+ mod mse_codec;
++mod mse_playback;
++mod mse_worker;
+ mod source;
+ mod sys;
+ 
+diff --git a/components/media/backends/android/android_impl/mse_codec.rs b/components/media/backends/android/android_impl/mse_codec.rs
+index f5c48e6dd..7bfe6f638 100644
+--- a/components/media/backends/android/android_impl/mse_codec.rs
++++ b/components/media/backends/android/android_impl/mse_codec.rs
+@@ -2,23 +2,30 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-//! Dormant NDK input adapter. No DOM/pipeline call site yet. Caller must pump
+-//! decoder output and preserve the borrowed surface lifetime. A format change
++//! Internal NDK codec adapter, driven by the adaptive worker, not the DOM.
++//! The shared surface owner outlives codec teardown. A format change
+ //! requires a new adapter until coordinated output-drain/reconfigure is wired.
+ use super::sys;
+ use crate::mse_demux::{bridge::DecoderConfig, delivery::CodecInput};
+-use std::{ffi::CString, ptr};
++use std::{ffi::CString, ptr, rc::Rc};
+ 
+-pub struct MseCodecInput<'a> {
++/// The safe window reference remains valid for the lifetime of this owner.
++pub trait CodecSurface {
++    fn window(&self) -> &sys::ANativeWindow;
++}
++
++pub struct MseCodecInput {
+     codec: *mut sys::AMediaCodec,
+-    surface: Option<&'a sys::ANativeWindow>,
++    surface: Option<Rc<dyn CodecSurface>>,
+     track: Option<u32>,
+     video: bool,
+     output_channels: i32,
+     output_pcm_encoding: i32,
++    held_output: Option<(usize, sys::AMediaCodecBufferInfo)>,
++    eos_queued: bool,
+ }
+-impl<'a> MseCodecInput<'a> {
+-    pub fn new(surface: Option<&'a sys::ANativeWindow>) -> Self {
++impl MseCodecInput {
++    pub fn new(surface: Option<Rc<dyn CodecSurface>>) -> Self {
+         Self {
+             codec: ptr::null_mut(),
+             surface,
+@@ -26,15 +33,12 @@ impl<'a> MseCodecInput<'a> {
+             video: false,
+             output_channels: 0,
+             output_pcm_encoding: 2,
++            held_output: None,
++            eos_queued: false,
+         }
+     }
+-    /// A borrowed handle, never transfer ownership. The output-pump integration
+-    /// must release each dequeued output buffer before dropping this adapter.
+-    pub fn codec(&self) -> *mut sys::AMediaCodec {
+-        self.codec
+-    }
+ }
+-impl CodecInput for MseCodecInput<'_> {
++impl CodecInput for MseCodecInput {
+     fn configure(&mut self, c: &DecoderConfig) -> Result<(), ()> {
+         if !self.codec.is_null() {
+             return Err(());
+@@ -94,7 +98,8 @@ impl CodecInput for MseCodecInput<'_> {
+             }
+             let surface = if video {
+                 self.surface
+-                    .map(|p| p as *const sys::ANativeWindow as *mut std::ffi::c_void)
++                    .as_ref()
++                    .map(|p| p.window() as *const sys::ANativeWindow as *mut std::ffi::c_void)
+                     .unwrap_or(ptr::null_mut())
+             } else {
+                 ptr::null_mut()
+@@ -119,6 +124,7 @@ impl CodecInput for MseCodecInput<'_> {
+     fn submit(&mut self, track_id: u32, bytes: &[u8], pts_us: i64) -> Result<bool, ()> {
+         if self.track != Some(track_id)
+             || self.codec.is_null()
++            || self.eos_queued
+             || pts_us < 0
+             || bytes.is_empty()
+             || bytes.len() > 8 * 1024 * 1024
+@@ -154,10 +160,13 @@ impl CodecInput for MseCodecInput<'_> {
+         Ok(true)
+     }
+ }
+-impl Drop for MseCodecInput<'_> {
++impl Drop for MseCodecInput {
+     fn drop(&mut self) {
+         if !self.codec.is_null() {
+             unsafe {
++                if let Some((index, _)) = self.held_output.take() {
++                    sys::AMediaCodec_releaseOutputBuffer(self.codec, index, false);
++                }
+                 sys::AMediaCodec_stop(self.codec);
+                 sys::AMediaCodec_delete(self.codec);
+             }
+@@ -174,6 +183,8 @@ pub enum MseOutput {
+         pcm_encoding: i32,
+         width: i32,
+         height: i32,
++        color_standard: Option<i32>,
++        color_range: Option<i32>,
+     },
+     SurfaceReleased {
+         pts_us: i64,
+@@ -215,13 +226,50 @@ impl Drop for OutputLease {
+         }
+     }
+ }
+-impl MseCodecInput<'_> {
+-    pub fn poll_output(&mut self) -> Result<MseOutput, ()> {
++impl MseCodecInput {
++    pub fn queue_eos(&mut self) -> Result<bool, ()> {
++        if self.codec.is_null() {
++            return Err(());
++        }
++        if self.eos_queued {
++            return Ok(true);
++        }
++        let idx = unsafe { sys::AMediaCodec_dequeueInputBuffer(self.codec, 0) };
++        if idx == sys::AMEDIACODEC_INFO_TRY_AGAIN_LATER {
++            return Ok(false);
++        }
++        if idx < 0 {
++            return Err(());
++        }
++        if unsafe {
++            sys::AMediaCodec_queueInputBuffer(
++                self.codec,
++                idx as usize,
++                0,
++                0,
++                0,
++                sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM,
++            )
++        } != sys::AMEDIA_OK
++        {
++            return Err(());
++        }
++        self.eos_queued = true;
++        Ok(true)
++    }
++    /// Video output is held at the codec until due. Pausing never queues a frame
++    /// to the surface. Audio output remains available for bounded preroll.
++    pub fn poll_output_at(&mut self, media_us: i64, playing: bool) -> Result<MseOutput, ()> {
+         if self.codec.is_null() {
+             return Err(());
+         }
+-        let mut info = sys::AMediaCodecBufferInfo::default();
+-        let idx = unsafe { sys::AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0) };
++        let (idx, info) = if let Some((idx, info)) = self.held_output.take() {
++            (idx as isize, info)
++        } else {
++            let mut info = sys::AMediaCodecBufferInfo::default();
++            let idx = unsafe { sys::AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0) };
++            (idx, info)
++        };
+         if idx == sys::AMEDIACODEC_INFO_TRY_AGAIN_LATER
+             || idx == sys::AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED
+         {
+@@ -242,6 +290,8 @@ impl MseCodecInput<'_> {
+             let encoding = get(c"pcm-encoding", 2);
+             let width = get(c"width", 0);
+             let height = get(c"height", 0);
++            let standard = get(c"color-standard", 0);
++            let range = get(c"color-range", 0);
+             unsafe { sys::AMediaFormat_delete(format) };
+             self.output_channels = channels;
+             self.output_pcm_encoding = encoding;
+@@ -251,11 +301,22 @@ impl MseCodecInput<'_> {
+                 pcm_encoding: encoding,
+                 width,
+                 height,
++                color_standard: if standard == 0 { None } else { Some(standard) },
++                color_range: if range == 0 { None } else { Some(range) },
+             });
+         }
+         if idx < 0 {
+             return Err(());
+         }
++        if self.video
++            && info.flags & 2 == 0
++            && !(info.flags & sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM != 0 && info.size == 0)
++        {
++            if !playing || info.presentation_time_us > media_us.saturating_add(15_000) {
++                self.held_output = Some((idx as usize, info));
++                return Ok(MseOutput::Retry);
++            }
++        }
+         let mut lease = OutputLease {
+             codec: self.codec,
+             index: idx as usize,
+@@ -273,6 +334,14 @@ impl MseCodecInput<'_> {
+         if self.video {
+             // Surface release only queues rendering. This is not a displayed
+             // frame acknowledgment. Caller must acquire/render AImage separately.
++            if info.presentation_time_us < media_us.saturating_sub(250_000) {
++                lease.release(false)?;
++                return Ok(if eos {
++                    MseOutput::EndOfStream
++                } else {
++                    MseOutput::Retry
++                });
++            }
+             lease.release(true)?;
+             return Ok(MseOutput::SurfaceReleased {
+                 pts_us: info.presentation_time_us,
+@@ -307,3 +376,7 @@ impl MseCodecInput<'_> {
+         })
+     }
+ }
++
++#[cfg(all(test, not(target_os = "android")))]
++#[path = "mse_codec_tests.rs"]
++mod tests;
+diff --git a/components/media/backends/android/android_impl/mse_codec_tests.rs b/components/media/backends/android/android_impl/mse_codec_tests.rs
+new file mode 100644
+index 000000000..e8a53da79
+--- /dev/null
++++ b/components/media/backends/android/android_impl/mse_codec_tests.rs
+@@ -0,0 +1,168 @@
++use super::*;
++use std::cell::RefCell;
++#[derive(Default)]
++struct Mock {
++    dequeues: usize,
++    releases: Vec<bool>,
++    inputs: usize,
++    eos: usize,
++    flags: u32,
++    size: i32,
++    pts: i64,
++}
++thread_local! { static MOCK: RefCell<Mock> = RefCell::new(Mock::default()); }
++fn codec() -> MseCodecInput {
++    MOCK.with(|m| {
++        *m.borrow_mut() = Mock {
++            size: 4,
++            pts: 100_000,
++            ..Mock::default()
++        }
++    });
++    let mut c = MseCodecInput::new(None);
++    c.codec = ptr::dangling_mut();
++    c.video = true;
++    c
++}
++#[test]
++fn video_holds_one_native_buffer_until_playing_and_due() {
++    let mut c = codec();
++    assert!(matches!(c.poll_output_at(0, true), Ok(MseOutput::Retry)));
++    assert!(matches!(
++        c.poll_output_at(100_000, false),
++        Ok(MseOutput::Retry)
++    ));
++    assert!(matches!(
++        c.poll_output_at(90_000, true),
++        Ok(MseOutput::SurfaceReleased {
++            pts_us: 100_000,
++            ..
++        })
++    ));
++    MOCK.with(|m| {
++        let m = m.borrow();
++        assert_eq!(m.dequeues, 1);
++        assert_eq!(m.releases, [true]);
++    });
++}
++#[test]
++fn teardown_releases_a_held_frame_without_rendering() {
++    let mut c = codec();
++    c.poll_output_at(0, false).unwrap();
++    drop(c);
++    MOCK.with(|m| assert_eq!(m.borrow().releases, [false]));
++}
++#[test]
++fn late_frame_is_discarded_not_surface_queued() {
++    let mut c = codec();
++    assert!(matches!(
++        c.poll_output_at(500_001, true),
++        Ok(MseOutput::Retry)
++    ));
++    MOCK.with(|m| assert_eq!(m.borrow().releases, [false]));
++}
++#[test]
++fn empty_eos_does_not_require_play_or_surface_render() {
++    let mut c = codec();
++    MOCK.with(|m| {
++        m.borrow_mut().flags = 4;
++        m.borrow_mut().size = 0;
++    });
++    assert!(matches!(
++        c.poll_output_at(0, false),
++        Ok(MseOutput::EndOfStream)
++    ));
++    MOCK.with(|m| assert_eq!(m.borrow().releases, [false]));
++}
++#[test]
++fn eos_input_is_queued_only_once() {
++    let mut c = codec();
++    assert_eq!(c.queue_eos(), Ok(true));
++    assert_eq!(c.queue_eos(), Ok(true));
++    MOCK.with(|m| {
++        assert_eq!(m.borrow().inputs, 1);
++        assert_eq!(m.borrow().eos, 1);
++    });
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_dequeueOutputBuffer(
++    _: *mut sys::AMediaCodec,
++    info: *mut sys::AMediaCodecBufferInfo,
++    _: i64,
++) -> isize {
++    MOCK.with(|m| {
++        let mut m = m.borrow_mut();
++        m.dequeues += 1;
++        unsafe {
++            *info = sys::AMediaCodecBufferInfo {
++                offset: 0,
++                size: m.size,
++                presentation_time_us: m.pts,
++                flags: m.flags,
++            };
++        }
++    });
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_releaseOutputBuffer(
++    _: *mut sys::AMediaCodec,
++    _: usize,
++    render: bool,
++) -> i32 {
++    MOCK.with(|m| m.borrow_mut().releases.push(render));
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_stop(_: *mut sys::AMediaCodec) -> i32 {
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_delete(_: *mut sys::AMediaCodec) -> i32 {
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_dequeueInputBuffer(_: *mut sys::AMediaCodec, _: i64) -> isize {
++    MOCK.with(|m| m.borrow_mut().inputs += 1);
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_queueInputBuffer(
++    _: *mut sys::AMediaCodec,
++    _: usize,
++    _: i64,
++    _: usize,
++    _: u64,
++    flags: u32,
++) -> i32 {
++    if flags == 4 {
++        MOCK.with(|m| m.borrow_mut().eos += 1);
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_getOutputFormat(
++    _: *mut sys::AMediaCodec,
++) -> *mut sys::AMediaFormat {
++    ptr::null_mut()
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaFormat_getInt32(
++    _: *mut sys::AMediaFormat,
++    _: *const std::ffi::c_char,
++    _: *mut i32,
++) -> bool {
++    false
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaFormat_delete(_: *mut sys::AMediaFormat) -> i32 {
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_getOutputBuffer(
++    _: *mut sys::AMediaCodec,
++    _: usize,
++    _: *mut usize,
++) -> *mut u8 {
++    ptr::null_mut()
++}
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+new file mode 100644
+index 000000000..3198dd1bc
+--- /dev/null
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -0,0 +1,865 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! Worker-owned adaptive output bridge. No DOM exposure. The caller owns the
++//! shared surface owner so every codec stops before reader destruction.
++//! pump() does bounded work and must be called between commands.
++use super::{
++    mse_codec::{CodecSurface, MseCodecInput, MseOutput},
++    sys,
++};
++use crate::{
++    audio_queue::AudioQueue,
++    clock::MasterClock,
++    color::{self, Matrix as ColorMatrix, Range as ColorRange},
++    focus::{self, FocusTracker, Hold},
++    mse_demux::{bridge::DecoderConfig, delivery::CodecInput, session::AppendSession},
++    yuv_pack::{Planes, crop_i420, pack_i420},
++};
++use servo_media_player::video::{Buffer, VideoFrame, VideoFrameData, VideoFrameRenderer};
++use std::{
++    collections::BTreeMap,
++    ptr,
++    rc::Rc,
++    sync::{Arc, Mutex},
++    time::{Duration, Instant},
++};
++use yuv::{YuvPlanarImage, YuvRange, YuvStandardMatrix, yuv420_to_bgra};
++
++pub struct VideoSurface {
++    reader: *mut sys::AImageReader,
++    window: *mut sys::ANativeWindow,
++}
++impl VideoSurface {
++    pub fn new(width: i32, height: i32) -> Result<Self, ()> {
++        if width <= 0 || height <= 0 || width > 4096 || height > 4096 {
++            return Err(());
++        }
++        let mut s = Self {
++            reader: ptr::null_mut(),
++            window: ptr::null_mut(),
++        };
++        unsafe {
++            if sys::AImageReader_new(
++                width,
++                height,
++                sys::AIMAGE_FORMAT_YUV_420_888,
++                4,
++                &mut s.reader,
++            ) != sys::AMEDIA_OK
++                || s.reader.is_null()
++            {
++                return Err(());
++            }
++            if sys::AImageReader_getWindow(s.reader, &mut s.window) != sys::AMEDIA_OK
++                || s.window.is_null()
++            {
++                return Err(());
++            }
++        }
++        Ok(s)
++    }
++    /// Acquisition is retried on later worker ticks, not assumed synchronous
++    /// with releaseOutputBuffer. Exactly one surface frame is outstanding.
++    fn acquire(&self, standard: Option<i32>, range: Option<i32>) -> Result<Option<VideoFrame>, ()> {
++        let mut image = ptr::null_mut();
++        let status = unsafe { sys::AImageReader_acquireLatestImage(self.reader, &mut image) };
++        if status == sys::AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE {
++            return Ok(None);
++        }
++        if status != sys::AMEDIA_OK || image.is_null() {
++            return Err(());
++        }
++        struct Image(*mut sys::AImage);
++        impl Drop for Image {
++            fn drop(&mut self) {
++                unsafe {
++                    sys::AImage_delete(self.0);
++                }
++            }
++        }
++        let image = Image(image);
++        let mut width = 0;
++        let mut height = 0;
++        unsafe {
++            if sys::AImage_getWidth(image.0, &mut width) != sys::AMEDIA_OK
++                || sys::AImage_getHeight(image.0, &mut height) != sys::AMEDIA_OK
++            {
++                return Err(());
++            }
++        }
++        if width <= 0
++            || height <= 0
++            || width > 4096
++            || height > 4096
++            || width % 2 != 0
++            || height % 2 != 0
++        {
++            return Err(());
++        }
++        let mut data = [ptr::null_mut(); 3];
++        let mut len = [0; 3];
++        let mut row = [0; 3];
++        let mut pixel = [0; 3];
++        for p in 0..3 {
++            unsafe {
++                if sys::AImage_getPlaneData(image.0, p as i32, &mut data[p], &mut len[p])
++                    != sys::AMEDIA_OK
++                    || sys::AImage_getPlaneRowStride(image.0, p as i32, &mut row[p])
++                        != sys::AMEDIA_OK
++                    || sys::AImage_getPlanePixelStride(image.0, p as i32, &mut pixel[p])
++                        != sys::AMEDIA_OK
++                {
++                    return Err(());
++                }
++            }
++            if data[p].is_null()
++                || len[p] <= 0
++                || len[p] > 64 * 1024 * 1024
++                || row[p] <= 0
++                || row[p] > 1024 * 1024
++                || pixel[p] <= 0
++                || pixel[p] > 16
++            {
++                return Err(());
++            }
++        }
++        if pixel[0] != 1 {
++            return Err(());
++        }
++        let (w, h) = (width as usize, height as usize);
++        let packed = unsafe {
++            pack_i420(&Planes {
++                width: w,
++                height: h,
++                y: std::slice::from_raw_parts(data[0], len[0] as usize),
++                y_row_stride: row[0] as usize,
++                u: std::slice::from_raw_parts(data[1], len[1] as usize),
++                u_row_stride: row[1] as usize,
++                u_pixel_stride: pixel[1] as usize,
++                v: std::slice::from_raw_parts(data[2], len[2] as usize),
++                v_row_stride: row[2] as usize,
++                v_pixel_stride: pixel[2] as usize,
++            })
++        }
++        .ok_or(())?;
++        let mut crop = sys::AImageCropRect::default();
++        if unsafe { sys::AImage_getCropRect(image.0, &mut crop) } != sys::AMEDIA_OK
++            || crop.left < 0
++            || crop.top < 0
++            || crop.right < 0
++            || crop.bottom < 0
++        {
++            return Err(());
++        }
++        let packed = crop_i420(
++            &packed,
++            w,
++            h,
++            [
++                crop.left as usize,
++                crop.top as usize,
++                crop.right as usize,
++                crop.bottom as usize,
++            ],
++        )
++        .ok_or(())?;
++        let (width, height) = (crop.right - crop.left, crop.bottom - crop.top);
++        let (w, h) = (width as usize, height as usize);
++        let (cw, ch) = (w / 2, h / 2);
++        let planar = YuvPlanarImage {
++            width: width as u32,
++            height: height as u32,
++            y_stride: width as u32,
++            u_stride: cw as u32,
++            v_stride: cw as u32,
++            y_plane: &packed[..w * h],
++            u_plane: &packed[w * h..w * h + cw * ch],
++            v_plane: &packed[w * h + cw * ch..],
++        };
++        let mut bgra = vec![0; w * h * 4];
++        let (matrix, range) = color::select(height, standard, range);
++        yuv420_to_bgra(
++            &planar,
++            &mut bgra,
++            width as u32 * 4,
++            match range {
++                ColorRange::Full => YuvRange::Full,
++                ColorRange::Limited => YuvRange::Limited,
++            },
++            match matrix {
++                ColorMatrix::Bt601 => YuvStandardMatrix::Bt601,
++                ColorMatrix::Bt709 => YuvStandardMatrix::Bt709,
++            },
++        )
++        .map_err(|_| ())?;
++        VideoFrame::new(width, height, Arc::new(RawFrame(Arc::new(bgra))))
++            .ok_or(())
++            .map(Some)
++    }
++}
++impl CodecSurface for VideoSurface {
++    fn window(&self) -> &sys::ANativeWindow {
++        unsafe { &*self.window }
++    }
++}
++impl Drop for VideoSurface {
++    fn drop(&mut self) {
++        if !self.reader.is_null() {
++            unsafe {
++                sys::AImageReader_delete(self.reader);
++            }
++        }
++    }
++}
++struct RawFrame(Arc<Vec<u8>>);
++impl Buffer for RawFrame {
++    fn to_vec(&self) -> Option<VideoFrameData> {
++        Some(VideoFrameData::Raw(self.0.clone()))
++    }
++}
++
++struct Decoders {
++    track_ids: BTreeMap<(u32, u32), u32>,
++    next_track: u32,
++    configs: BTreeMap<u32, DecoderConfig>,
++    surface: Option<Rc<VideoSurface>>,
++    video_size: Option<(u16, u16)>,
++    video: Option<(u32, MseCodecInput)>,
++    audio: Option<(u32, MseCodecInput)>,
++    first_pts: Option<i64>,
++}
++impl CodecInput for Decoders {
++    fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()> {
++        if let Some(old) = self.configs.get(&config.track_id) {
++            return if old.mime == config.mime
++                && old.width == config.width
++                && old.height == config.height
++                && old.sample_rate == config.sample_rate
++                && old.channels == config.channels
++                && old.csd0 == config.csd0
++                && old.csd1 == config.csd1
++            {
++                Ok(())
++            } else {
++                Err(())
++            };
++        }
++        if self
++            .video
++            .as_ref()
++            .is_some_and(|(id, _)| *id == config.track_id)
++            || self
++                .audio
++                .as_ref()
++                .is_some_and(|(id, _)| *id == config.track_id)
++        {
++            return Err(());
++        }
++        let slot = if config.mime == "video/avc" {
++            &mut self.video
++        } else if config.mime == "audio/mp4a-latm" {
++            &mut self.audio
++        } else {
++            return Err(());
++        };
++        if slot.is_some() {
++            return Err(());
++        }
++        let mut codec = MseCodecInput::new(if config.mime == "video/avc" {
++            let surface = Rc::new(VideoSurface::new(
++                i32::from(config.width),
++                i32::from(config.height),
++            )?);
++            self.surface = Some(surface.clone());
++            self.video_size = Some((config.width, config.height));
++            Some(surface)
++        } else {
++            None
++        });
++        codec.configure(config)?;
++        *slot = Some((config.track_id, codec));
++        self.configs.insert(config.track_id, config.clone());
++        Ok(())
++    }
++    fn submit(&mut self, track_id: u32, bytes: &[u8], pts_us: i64) -> Result<bool, ()> {
++        if self.first_pts.is_none() {
++            self.first_pts = Some(pts_us);
++        }
++        if let Some((id, c)) = &mut self.video {
++            if *id == track_id {
++                return c.submit(track_id, bytes, pts_us);
++            }
++        }
++        if let Some((id, c)) = &mut self.audio {
++            if *id == track_id {
++                return c.submit(track_id, bytes, pts_us);
++            }
++        }
++        Err(())
++    }
++}
++
++/// Independent initialization segments often both number their only track1.
++/// Namespace those IDs before they reach the shared audio/video decoder set.
++struct ScopedDecoder<'a> {
++    buffer_id: u32,
++    decoders: &'a mut Decoders,
++}
++impl CodecInput for ScopedDecoder<'_> {
++    fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()> {
++        let key = (self.buffer_id, config.track_id);
++        let mapped = if let Some(id) = self.decoders.track_ids.get(&key) {
++            *id
++        } else {
++            self.decoders.next_track
++        };
++        let mut config = config.clone();
++        config.track_id = mapped;
++        self.decoders.configure(&config)?;
++        if !self.decoders.track_ids.contains_key(&key) {
++            self.decoders.track_ids.insert(key, mapped);
++            self.decoders.next_track = self.decoders.next_track.checked_add(1).ok_or(())?;
++        }
++        Ok(())
++    }
++    fn submit(&mut self, track_id: u32, bytes: &[u8], pts_us: i64) -> Result<bool, ()> {
++        let mapped = *self
++            .decoders
++            .track_ids
++            .get(&(self.buffer_id, track_id))
++            .ok_or(())?;
++        self.decoders.submit(mapped, bytes, pts_us)
++    }
++}
++
++/// A caller-driven worker core, not yet the Player/DOM attachment. Native
++/// handles never cross threads. An error poisons all subsequent operations.
++#[derive(Clone, Copy, Debug)]
++pub struct PumpStatus {
++    pub finished: bool,
++    pub playing: bool,
++    pub position_us: i64,
++    pub rendered_frames: u64,
++    pub video_size: Option<(u16, u16)>,
++    pub has_audio: bool,
++}
++
++pub struct AppendPlayback {
++    sessions: BTreeMap<u32, AppendSession>,
++    input_ended: bool,
++    decoders: Decoders,
++    renderer: Arc<Mutex<dyn VideoFrameRenderer>>,
++    audio: AudioOutput,
++    clock: MasterClock,
++    playing: bool,
++    page_playing: bool,
++    volume: f32,
++    muted: bool,
++    focus: FocusTracker,
++    focus_counted: bool,
++    failed: bool,
++    video_pending: Option<Instant>,
++    video_color: (Option<i32>, Option<i32>),
++    drain_wait: Option<(Instant, i64)>,
++    clock_started: bool,
++    rendered_frames: u64,
++    video_done: bool,
++    audio_done: bool,
++}
++impl AppendPlayback {
++    pub fn new(renderer: Arc<Mutex<dyn VideoFrameRenderer>>) -> Self {
++        Self {
++            sessions: BTreeMap::new(),
++            input_ended: false,
++            decoders: Decoders {
++                track_ids: BTreeMap::new(),
++                next_track: 1,
++                configs: BTreeMap::new(),
++                first_pts: None,
++                surface: None,
++                video_size: None,
++                video: None,
++                audio: None,
++            },
++            renderer,
++            audio: AudioOutput::new(),
++            clock: MasterClock::new(),
++            playing: false,
++            page_playing: false,
++            volume: 1.0,
++            muted: false,
++            focus: FocusTracker::new(focus::noisy_epoch()),
++            focus_counted: false,
++            failed: false,
++            video_pending: None,
++            video_color: (None, None),
++            drain_wait: None,
++            clock_started: false,
++            rendered_frames: 0,
++            video_done: false,
++            audio_done: false,
++        }
++    }
++    fn checked<T>(&mut self, result: Result<T, ()>) -> Result<T, ()> {
++        if result.is_err() {
++            self.failed = true;
++            self.audio.close();
++            focus::set_counted(&mut self.focus_counted, false);
++        }
++        result
++    }
++    pub fn add_buffer(&mut self, id: u32) -> Result<(), ()> {
++        if self.failed
++            || self.input_ended
++            || self.sessions.len() >= 2
++            || self.sessions.contains_key(&id)
++        {
++            return Err(());
++        }
++        self.sessions
++            .insert(id, AppendSession::new(16 * 1024 * 1024, 8192));
++        Ok(())
++    }
++    fn input_exhausted(&self) -> bool {
++        self.input_ended && self.sessions.values().all(AppendSession::input_exhausted)
++    }
++    pub fn append(&mut self, id: u32, bytes: &[u8]) -> Result<(), ()> {
++        if self.failed {
++            return Err(());
++        }
++        let r = self
++            .sessions
++            .get_mut(&id)
++            .ok_or(())?
++            .append(bytes)
++            .map_err(|_| ());
++        self.checked(r)
++    }
++    pub fn end_input(&mut self) -> Result<(), ()> {
++        if self.failed {
++            return Err(());
++        }
++        if self.input_ended {
++            return Err(());
++        }
++        let result = self
++            .sessions
++            .values_mut()
++            .try_for_each(|s| s.end_of_stream().map_err(|_| ()));
++        self.checked(result)?;
++        self.input_ended = true;
++        Ok(())
++    }
++    pub fn set_playing(&mut self, playing: bool) -> Result<(), ()> {
++        if self.failed {
++            return Err(());
++        }
++        self.page_playing = playing;
++        self.focus.page_command();
++        let result = self.focus_tick();
++        self.checked(result)
++    }
++    pub fn set_volume(&mut self, volume: f32, muted: bool) -> Result<(), ()> {
++        if self.failed || !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
++            return Err(());
++        }
++        self.volume = volume;
++        self.muted = muted;
++        let result = self.focus_tick();
++        self.checked(result)
++    }
++    fn focus_tick(&mut self) -> Result<(), ()> {
++        let has_audio = self.decoders.audio.is_some();
++        let silent = self.muted || self.volume == 0.0;
++        let effective = if has_audio && !silent {
++            focus::focus()
++        } else {
++            focus::FOCUS_GRANTED
++        };
++        self.focus
++            .step(!self.page_playing, effective, focus::noisy_epoch());
++        focus::set_counted(
++            &mut self.focus_counted,
++            self.focus
++                .wants_focus(!self.page_playing, silent, has_audio),
++        );
++        let playing = self.page_playing && self.focus.hold == Hold::None;
++        if playing != self.playing {
++            self.audio.set_running(playing)?;
++            self.playing = playing;
++            if playing {
++                self.clock.resume();
++                self.audio.last_progress = Instant::now();
++                if self.video_pending.is_some() {
++                    self.video_pending = Some(Instant::now());
++                }
++            } else {
++                self.clock.pause();
++            }
++        }
++        Ok(())
++    }
++    /// true only after both decoders drain, the final image is handed to the
++    /// browser renderer, and the audio endpoint consumes all submitted frames.
++    pub fn pump(&mut self) -> Result<PumpStatus, ()> {
++        if self.failed {
++            return Err(());
++        }
++        let result = self.pump_inner();
++        let finished = self.checked(result)?;
++        Ok(PumpStatus {
++            finished,
++            playing: self.playing,
++            position_us: self.clock.now_us(),
++            rendered_frames: self.rendered_frames,
++            video_size: self.decoders.video_size,
++            has_audio: self.decoders.audio.is_some(),
++        })
++    }
++    fn pump_inner(&mut self) -> Result<bool, ()> {
++        // Fair packet-level pumping keeps a blocked video decoder from
++        // starving an independently appended audio SourceBuffer.
++        for _ in 0..4 {
++            let mut progress = false;
++            for (id, session) in &mut self.sessions {
++                let mut sink = ScopedDecoder {
++                    buffer_id: *id,
++                    decoders: &mut self.decoders,
++                };
++                progress |= session.pump_input(&mut sink).map_err(|_| ())?;
++            }
++            if !progress {
++                break;
++            }
++        }
++        if !self.clock_started {
++            if let Some(pts) = self.decoders.first_pts {
++                self.clock.rebase(pts);
++                self.clock_started = true;
++                if !self.playing {
++                    self.clock.pause();
++                }
++            }
++        }
++        if self.input_exhausted() {
++            if let Some((_, c)) = &mut self.decoders.audio {
++                c.queue_eos()?;
++            }
++            if let Some((_, c)) = &mut self.decoders.video {
++                c.queue_eos()?;
++            }
++        }
++        self.focus_tick()?;
++        self.audio.write(
++            self.playing,
++            if self.muted {
++                0.0
++            } else {
++                self.volume * focus::gain()
++            },
++            &mut self.clock,
++        )?;
++        if self.audio.pending.is_none() && !self.audio_done {
++            if let Some((_, codec)) = &mut self.decoders.audio {
++                match codec.poll_output_at(self.clock.now_us(), self.playing)? {
++                    MseOutput::FormatChanged {
++                        sample_rate,
++                        channels,
++                        pcm_encoding,
++                        ..
++                    } => {
++                        if pcm_encoding != 2 {
++                            return Err(());
++                        }
++                        self.audio.configure(
++                            sample_rate,
++                            channels,
++                            self.playing,
++                            &mut self.clock,
++                        )?;
++                    }
++                    MseOutput::Pcm {
++                        samples,
++                        pts_us,
++                        eos,
++                    } => {
++                        self.audio.pending = Some(
++                            AudioQueue::new(samples, self.audio.channels as usize, pts_us)
++                                .ok_or(())?,
++                        );
++                        self.audio_done = eos;
++                    }
++                    MseOutput::EndOfStream => self.audio_done = true,
++                    MseOutput::Retry | MseOutput::CodecConfig => (),
++                    _ => return Err(()),
++                }
++            }
++        }
++        if let Some(started) = self.video_pending {
++            if self.playing {
++                if let Some(frame) = self
++                    .decoders
++                    .surface
++                    .as_ref()
++                    .ok_or(())?
++                    .acquire(self.video_color.0, self.video_color.1)?
++                {
++                    self.decoders.video_size =
++                        Some((frame.get_width() as u16, frame.get_height() as u16));
++                    self.renderer.lock().map_err(|_| ())?.render(frame);
++                    self.rendered_frames = self.rendered_frames.saturating_add(1);
++                    self.video_pending = None;
++                } else if started.elapsed() > Duration::from_secs(2) {
++                    return Err(());
++                }
++            }
++        }
++        if self.video_pending.is_none() && !self.video_done {
++            if let Some((_, codec)) = &mut self.decoders.video {
++                match codec.poll_output_at(self.clock.now_us(), self.playing)? {
++                    MseOutput::SurfaceReleased { eos, .. } => {
++                        self.video_pending = Some(Instant::now());
++                        self.video_done = eos;
++                    }
++                    MseOutput::EndOfStream => self.video_done = true,
++                    MseOutput::FormatChanged {
++                        color_standard,
++                        color_range,
++                        ..
++                    } => {
++                        self.video_color = (color_standard, color_range);
++                    }
++                    MseOutput::Retry | MseOutput::CodecConfig => (),
++                    _ => return Err(()),
++                }
++            }
++        }
++        let decoder_done = self.input_exhausted()
++            && (self.decoders.video.is_none() || self.video_done)
++            && (self.decoders.audio.is_none() || self.audio_done)
++            && self.video_pending.is_none()
++            && self.audio.pending.is_none();
++        if self.playing && decoder_done && !self.clock.audio_drained() {
++            let position = self.clock.now_us();
++            match self.drain_wait {
++                Some((started, last)) if last == position => {
++                    if started.elapsed() > Duration::from_secs(2) {
++                        return Err(());
++                    }
++                }
++                _ => self.drain_wait = Some((Instant::now(), position)),
++            }
++        } else {
++            self.drain_wait = None;
++        }
++        Ok(self.playing && decoder_done && self.clock.audio_drained())
++    }
++}
++
++impl Drop for AppendPlayback {
++    fn drop(&mut self) {
++        focus::set_counted(&mut self.focus_counted, false);
++    }
++}
++
++struct AudioOutput {
++    stream: *mut sys::AAudioStream,
++    rate: i32,
++    channels: i32,
++    pending: Option<AudioQueue>,
++    last_progress: Instant,
++}
++impl AudioOutput {
++    fn new() -> Self {
++        Self {
++            stream: ptr::null_mut(),
++            rate: 0,
++            channels: 0,
++            pending: None,
++            last_progress: Instant::now(),
++        }
++    }
++    fn configure(
++        &mut self,
++        rate: i32,
++        channels: i32,
++        playing: bool,
++        clock: &mut MasterClock,
++    ) -> Result<(), ()> {
++        if rate <= 0 || rate > 192000 || channels <= 0 || channels > 8 {
++            return Err(());
++        }
++        if !self.stream.is_null() {
++            return if (rate, channels) == (self.rate, self.channels) {
++                Ok(())
++            } else {
++                Err(())
++            };
++        }
++        let mut builder = ptr::null_mut();
++        unsafe {
++            if sys::AAudio_createStreamBuilder(&mut builder) != sys::AAUDIO_OK || builder.is_null()
++            {
++                return Err(());
++            }
++            sys::AAudioStreamBuilder_setDirection(builder, sys::AAUDIO_DIRECTION_OUTPUT);
++            sys::AAudioStreamBuilder_setSampleRate(builder, rate);
++            sys::AAudioStreamBuilder_setChannelCount(builder, channels);
++            sys::AAudioStreamBuilder_setFormat(builder, sys::AAUDIO_FORMAT_PCM_I16);
++            sys::AAudioStreamBuilder_setSharingMode(builder, sys::AAUDIO_SHARING_MODE_SHARED);
++            sys::AAudioStreamBuilder_setUsage(builder, sys::AAUDIO_USAGE_MEDIA);
++            sys::AAudioStreamBuilder_setBufferCapacityInFrames(builder, rate / 10);
++            let result = sys::AAudioStreamBuilder_openStream(builder, &mut self.stream);
++            sys::AAudioStreamBuilder_delete(builder);
++            if result != sys::AAUDIO_OK || self.stream.is_null() {
++                return Err(());
++            }
++            if sys::AAudioStream_getSampleRate(self.stream) != rate
++                || sys::AAudioStream_getChannelCount(self.stream) != channels
++                || sys::AAudioStream_getFormat(self.stream) != sys::AAUDIO_FORMAT_PCM_I16
++            {
++                return Err(());
++            }
++            clock.has_audio = true;
++            clock.audio_sample_rate = i64::from(rate);
++            clock.reset_audio_epoch(sys::AAudioStream_getFramesRead(self.stream));
++        }
++        self.rate = rate;
++        self.channels = channels;
++        self.set_running(playing)
++    }
++    fn set_running(&mut self, running: bool) -> Result<(), ()> {
++        if self.stream.is_null() {
++            return Ok(());
++        }
++        let mut transition = Transition {
++            stream: self.stream,
++            deadline: Instant::now() + Duration::from_millis(300),
++        };
++        if running {
++            crate::audio_state::start(&mut transition)
++        } else {
++            crate::audio_state::pause(&mut transition)
++        }
++    }
++    fn write(&mut self, playing: bool, gain: f32, clock: &mut MasterClock) -> Result<(), ()> {
++        if !playing || self.stream.is_null() {
++            return Ok(());
++        }
++        clock.observe_audio_consumed(unsafe { sys::AAudioStream_getFramesRead(self.stream) });
++        let Some(q) = &mut self.pending else {
++            self.last_progress = Instant::now();
++            return Ok(());
++        };
++        if clock.audio_frames_written == 0 {
++            clock.reset_audio_epoch(unsafe { sys::AAudioStream_getFramesRead(self.stream) });
++            clock.anchor_audio_start(q.pts_us);
++        }
++        let adjusted;
++        let samples = if (gain - 1.0).abs() > f32::EPSILON {
++            adjusted = q
++                .remaining()
++                .iter()
++                .map(|v| {
++                    (f32::from(*v) * gain)
++                        .round()
++                        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
++                })
++                .collect::<Vec<_>>();
++            &adjusted[..]
++        } else {
++            q.remaining()
++        };
++        let result = unsafe {
++            sys::AAudioStream_write(
++                self.stream,
++                samples.as_ptr().cast(),
++                q.frames().min(i32::MAX as usize) as i32,
++                0,
++            )
++        };
++        let written = q.accept(result)?;
++        if written > 0 {
++            self.last_progress = Instant::now();
++            clock.audio_frames_written = clock.audio_frames_written.saturating_add(written as u64);
++        } else if self.last_progress.elapsed() > Duration::from_secs(2) {
++            return Err(());
++        }
++        if q.frames() == 0 {
++            self.pending = None;
++        }
++        Ok(())
++    }
++}
++impl AudioOutput {
++    fn close(&mut self) {
++        if !self.stream.is_null() {
++            unsafe {
++                sys::AAudioStream_requestStop(self.stream);
++                sys::AAudioStream_close(self.stream);
++            }
++            self.stream = ptr::null_mut();
++        }
++    }
++}
++impl Drop for AudioOutput {
++    fn drop(&mut self) {
++        self.close();
++    }
++}
++struct Transition {
++    stream: *mut sys::AAudioStream,
++    deadline: Instant,
++}
++impl crate::audio_state::Stream for Transition {
++    fn state(&mut self) -> Result<i32, ()> {
++        let mut state = 1;
++        if unsafe { sys::AAudioStream_waitForStateChange(self.stream, 1, &mut state, 0) }
++            == sys::AAUDIO_OK
++        {
++            Ok(state)
++        } else {
++            Err(())
++        }
++    }
++    fn request(&mut self, request: crate::audio_state::Request) -> Result<(), ()> {
++        let result = unsafe {
++            match request {
++                crate::audio_state::Request::Pause => sys::AAudioStream_requestPause(self.stream),
++                crate::audio_state::Request::Flush => sys::AAudioStream_requestFlush(self.stream),
++                crate::audio_state::Request::Start => sys::AAudioStream_requestStart(self.stream),
++            }
++        };
++        if result == sys::AAUDIO_OK {
++            Ok(())
++        } else {
++            Err(())
++        }
++    }
++    fn wait(&mut self, transient: i32) -> Result<i32, ()> {
++        let left = self
++            .deadline
++            .checked_duration_since(Instant::now())
++            .ok_or(())?;
++        let mut state = transient;
++        if unsafe {
++            sys::AAudioStream_waitForStateChange(
++                self.stream,
++                transient,
++                &mut state,
++                left.as_nanos() as i64,
++            )
++        } == sys::AAUDIO_OK
++        {
++            Ok(state)
++        } else {
++            Err(())
++        }
++    }
++}
++
++#[cfg(all(test, not(target_os = "android")))]
++#[path = "mse_playback_tests.rs"]
++mod tests;
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+new file mode 100644
+index 000000000..4c830568b
+--- /dev/null
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -0,0 +1,419 @@
++use super::*;
++use std::cell::Cell;
++thread_local! { static READY: Cell<bool> = const { Cell::new(false) }; static DELETED: Cell<u32> = const { Cell::new(0) }; }
++static Y: [u8; 32] = [41; 32];
++static U: [u8; 8] = [240; 8];
++static V: [u8; 8] = [110; 8];
++#[test]
++fn image_arrival_retries_then_crops_and_converts_real_yuv() {
++    READY.with(|r| r.set(false));
++    DELETED.with(|r| r.set(0));
++    let surface = VideoSurface::new(8, 4).unwrap();
++    assert!(surface.acquire(None, None).unwrap().is_none());
++    READY.with(|r| r.set(true));
++    let frame = surface.acquire(None, None).unwrap().unwrap();
++    assert_eq!((frame.get_width(), frame.get_height()), (4, 2));
++    let pixels = frame.get_data();
++    assert_eq!(pixels.len(), 32);
++    for pixel in pixels.chunks_exact(4) {
++        assert!(pixel[0] > 240);
++        assert!(pixel[1] < 10);
++        assert!(pixel[2] < 10);
++        assert_eq!(pixel[3], 255);
++    }
++    DELETED.with(|r| assert_eq!(r.get(), 1));
++    // Synthetic conversion fixture only, not a decoded/rendered video.
++    let mut rgb = Vec::new();
++    for pixel in pixels.chunks_exact(4) {
++        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
++    }
++    let mut ppm = b"P6\n4 2\n255\n".to_vec();
++    ppm.extend(rgb);
++    std::fs::write("/tmp/mse066-synthetic-frame.ppm", ppm).unwrap();
++}
++#[test]
++fn surface_geometry_is_bounded_before_native_allocation() {
++    for (w, h) in [(0, 4), (4, -1), (4097, 4), (4, 4097)] {
++        assert!(VideoSurface::new(w, h).is_err());
++    }
++}
++#[test]
++fn identical_init_configuration_is_reused_but_changes_require_drain() {
++    let mut decoders = Decoders {
++        track_ids: BTreeMap::new(),
++        next_track: 1,
++        configs: BTreeMap::new(),
++        first_pts: None,
++        surface: None,
++        video_size: None,
++        video: None,
++        audio: None,
++    };
++    let mut config = DecoderConfig {
++        track_id: 1,
++        mime: "video/avc",
++        width: 8,
++        height: 4,
++        sample_rate: 0,
++        channels: 0,
++        csd0: vec![1],
++        csd1: vec![2],
++    };
++    assert_eq!(decoders.configure(&config), Ok(()));
++    assert_eq!(decoders.configure(&config), Ok(()));
++    config.width = 16;
++    assert_eq!(decoders.configure(&config), Err(()));
++    assert_eq!(decoders.video_size, Some((8, 4)));
++}
++#[test]
++fn independent_audio_and_video_appends_reach_separate_codecs_even_with_track_one() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut playback = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    playback.add_buffer(10).unwrap();
++    playback.add_buffer(20).unwrap();
++    assert!(playback.add_buffer(30).is_err());
++    for bytes in include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4").chunks(7) {
++        playback.append(10, bytes).unwrap();
++    }
++    for bytes in include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4").chunks(11) {
++        playback.append(20, bytes).unwrap();
++    }
++    playback.end_input().unwrap();
++    for _ in 0..100 {
++        let mut progress = false;
++        for (id, session) in &mut playback.sessions {
++            let mut sink = ScopedDecoder {
++                buffer_id: *id,
++                decoders: &mut playback.decoders,
++            };
++            progress |= session.pump_input(&mut sink).unwrap();
++        }
++        if !progress {
++            break;
++        }
++    }
++    assert!(playback.input_exhausted());
++    assert!(playback.decoders.video.is_some());
++    assert!(playback.decoders.audio.is_some());
++    let video = playback.decoders.track_ids.get(&(10, 1)).unwrap();
++    let audio = playback.decoders.track_ids.get(&(20, 1)).unwrap();
++    assert_ne!(video, audio);
++    assert_eq!(playback.decoders.configs[video].mime, "video/avc");
++    assert_eq!(playback.decoders.configs[audio].mime, "audio/mp4a-latm");
++}
++struct Capture(Arc<Mutex<Vec<VideoFrame>>>);
++impl VideoFrameRenderer for Capture {
++    fn render(&mut self, frame: VideoFrame) {
++        self.0.lock().unwrap().push(frame);
++    }
++}
++#[test]
++fn worker_core_hands_only_acquired_images_to_browser_renderer() {
++    READY.with(|r| r.set(false));
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut playback = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames.clone()))));
++    playback.decoders.surface = Some(Rc::new(VideoSurface::new(8, 4).unwrap()));
++    playback.video_pending = Some(Instant::now());
++    playback.set_playing(true).unwrap();
++    assert_eq!(playback.pump().unwrap().rendered_frames, 0);
++    assert!(frames.lock().unwrap().is_empty());
++    READY.with(|r| r.set(true));
++    assert_eq!(playback.pump().unwrap().rendered_frames, 1);
++    assert_eq!(frames.lock().unwrap().len(), 1);
++    assert!(playback.video_pending.is_none());
++}
++thread_local! { static WRITES: std::cell::RefCell<Vec<Vec<i16>>> = const { std::cell::RefCell::new(Vec::new()) }; static WRITE_LIMIT: Cell<i32> = const { Cell::new(1) }; static AUDIO_STATE: Cell<i32> = const { Cell::new(2) }; }
++#[test]
++fn actual_output_adapter_preserves_partial_writes_and_applies_gain_once() {
++    WRITES.with(|w| w.borrow_mut().clear());
++    WRITE_LIMIT.with(|w| w.set(1));
++    AUDIO_STATE.with(|w| w.set(2));
++    let mut audio = AudioOutput::new();
++    let mut clock = MasterClock::new();
++    audio.configure(48000, 2, true, &mut clock).unwrap();
++    audio.pending = Some(AudioQueue::new(vec![100, 200, 300, 400, 500, 600], 2, 900).unwrap());
++    audio.write(true, 0.5, &mut clock).unwrap();
++    assert_eq!(
++        audio.pending.as_ref().unwrap().remaining(),
++        [300, 400, 500, 600]
++    );
++    WRITE_LIMIT.with(|w| w.set(0));
++    audio.write(true, 0.5, &mut clock).unwrap();
++    assert_eq!(audio.pending.as_ref().unwrap().frames(), 2);
++    WRITE_LIMIT.with(|w| w.set(2));
++    audio.write(true, 0.5, &mut clock).unwrap();
++    assert!(audio.pending.is_none());
++    assert_eq!(clock.audio_frames_written, 3);
++    WRITES.with(|w| {
++        let w = w.borrow();
++        assert_eq!(w[0], [50, 100, 150, 200, 250, 300]);
++        assert_eq!(w[1], [150, 200, 250, 300]);
++        assert_eq!(w[2], w[1]);
++    });
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudio_createStreamBuilder(out: *mut *mut sys::AAudioStreamBuilder) -> i32 {
++    unsafe {
++        *out = ptr::dangling_mut();
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStreamBuilder_openStream(
++    _: *mut sys::AAudioStreamBuilder,
++    out: *mut *mut sys::AAudioStream,
++) -> i32 {
++    unsafe {
++        *out = ptr::dangling_mut();
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStreamBuilder_delete(_: *mut sys::AAudioStreamBuilder) -> i32 {
++    0
++}
++macro_rules! set_builder { ($($name:ident),*) => { $(#[unsafe(no_mangle)] unsafe extern "C" fn $name(_: *mut sys::AAudioStreamBuilder,_:i32) {})* }; }
++set_builder!(
++    AAudioStreamBuilder_setDirection,
++    AAudioStreamBuilder_setSampleRate,
++    AAudioStreamBuilder_setChannelCount,
++    AAudioStreamBuilder_setFormat,
++    AAudioStreamBuilder_setSharingMode,
++    AAudioStreamBuilder_setUsage,
++    AAudioStreamBuilder_setBufferCapacityInFrames
++);
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_getSampleRate(_: *mut sys::AAudioStream) -> i32 {
++    48000
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_getChannelCount(_: *mut sys::AAudioStream) -> i32 {
++    2
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_getFormat(_: *mut sys::AAudioStream) -> i32 {
++    1
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_getFramesRead(_: *mut sys::AAudioStream) -> i64 {
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_requestStart(_: *mut sys::AAudioStream) -> i32 {
++    AUDIO_STATE.with(|s| s.set(4));
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_requestPause(_: *mut sys::AAudioStream) -> i32 {
++    AUDIO_STATE.with(|s| s.set(6));
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_requestFlush(_: *mut sys::AAudioStream) -> i32 {
++    AUDIO_STATE.with(|s| s.set(8));
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_requestStop(_: *mut sys::AAudioStream) -> i32 {
++    AUDIO_STATE.with(|s| s.set(10));
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_close(_: *mut sys::AAudioStream) -> i32 {
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_waitForStateChange(
++    _: *mut sys::AAudioStream,
++    _: i32,
++    out: *mut i32,
++    _: i64,
++) -> i32 {
++    unsafe {
++        *out = AUDIO_STATE.with(|s| s.get());
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AAudioStream_write(
++    _: *mut sys::AAudioStream,
++    data: *const std::ffi::c_void,
++    frames: i32,
++    _: i64,
++) -> i32 {
++    WRITES.with(|w| {
++        w.borrow_mut().push(
++            unsafe { std::slice::from_raw_parts(data.cast::<i16>(), frames as usize * 2) }.to_vec(),
++        )
++    });
++    WRITE_LIMIT.with(|w| w.get().min(frames))
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaFormat_new() -> *mut sys::AMediaFormat {
++    ptr::dangling_mut()
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaFormat_setString(
++    _: *mut sys::AMediaFormat,
++    _: *const std::ffi::c_char,
++    _: *const std::ffi::c_char,
++) {
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaFormat_setInt32(
++    _: *mut sys::AMediaFormat,
++    _: *const std::ffi::c_char,
++    _: i32,
++) {
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaFormat_setBuffer(
++    _: *mut sys::AMediaFormat,
++    _: *const std::ffi::c_char,
++    _: *const std::ffi::c_void,
++    _: usize,
++) {
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_createDecoderByType(
++    _: *const std::ffi::c_char,
++) -> *mut sys::AMediaCodec {
++    ptr::dangling_mut()
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_configure(
++    _: *mut sys::AMediaCodec,
++    _: *mut sys::AMediaFormat,
++    _: *mut std::ffi::c_void,
++    _: *mut std::ffi::c_void,
++    _: u32,
++) -> i32 {
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_start(_: *mut sys::AMediaCodec) -> i32 {
++    0
++}
++thread_local! { static INPUT: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0;8*1024*1024]); }
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AMediaCodec_getInputBuffer(
++    _: *mut sys::AMediaCodec,
++    _: usize,
++    capacity: *mut usize,
++) -> *mut u8 {
++    INPUT.with(|bytes| {
++        let mut bytes = bytes.borrow_mut();
++        unsafe {
++            *capacity = bytes.len();
++        }
++        bytes.as_mut_ptr()
++    })
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImageReader_new(
++    _: i32,
++    _: i32,
++    _: i32,
++    _: i32,
++    out: *mut *mut sys::AImageReader,
++) -> i32 {
++    unsafe {
++        *out = ptr::dangling_mut();
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImageReader_getWindow(
++    _: *mut sys::AImageReader,
++    out: *mut *mut sys::ANativeWindow,
++) -> i32 {
++    unsafe {
++        *out = ptr::dangling_mut();
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImageReader_delete(_: *mut sys::AImageReader) {}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImageReader_acquireLatestImage(
++    _: *mut sys::AImageReader,
++    out: *mut *mut sys::AImage,
++) -> i32 {
++    if READY.with(|r| r.get()) {
++        unsafe {
++            *out = ptr::dangling_mut();
++        }
++        0
++    } else {
++        sys::AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE
++    }
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImage_delete(_: *mut sys::AImage) {
++    DELETED.with(|r| r.set(r.get() + 1));
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImage_getWidth(_: *const sys::AImage, out: *mut i32) -> i32 {
++    unsafe {
++        *out = 8;
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImage_getHeight(_: *const sys::AImage, out: *mut i32) -> i32 {
++    unsafe {
++        *out = 4;
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImage_getCropRect(
++    _: *const sys::AImage,
++    out: *mut sys::AImageCropRect,
++) -> i32 {
++    unsafe {
++        *out = sys::AImageCropRect {
++            left: 2,
++            top: 2,
++            right: 6,
++            bottom: 4,
++        };
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImage_getPlaneData(
++    _: *const sys::AImage,
++    p: i32,
++    out: *mut *mut u8,
++    len: *mut i32,
++) -> i32 {
++    let data: &[u8] = match p {
++        0 => &Y,
++        1 => &U,
++        _ => &V,
++    };
++    unsafe {
++        *out = data.as_ptr().cast_mut();
++        *len = data.len() as i32;
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImage_getPlaneRowStride(_: *const sys::AImage, p: i32, out: *mut i32) -> i32 {
++    unsafe {
++        *out = if p == 0 { 8 } else { 4 };
++    }
++    0
++}
++#[unsafe(no_mangle)]
++unsafe extern "C" fn AImage_getPlanePixelStride(
++    _: *const sys::AImage,
++    _: i32,
++    out: *mut i32,
++) -> i32 {
++    unsafe {
++        *out = 1;
++    }
++    0
++}
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+new file mode 100644
+index 000000000..31eae70b6
+--- /dev/null
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -0,0 +1,224 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++//! Bounded adaptive worker controller. Construction happens on the caller;
++//! every native codec, reader and AAudio handle is made/destroyed on the worker.
++//! This is not a DOM attachment and does not change capability reporting.
++use super::mse_playback::{AppendPlayback, PumpStatus};
++use servo_media_player::video::VideoFrameRenderer;
++use std::{
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicBool, Ordering},
++        mpsc::{self, SyncSender, TrySendError},
++    },
++    thread::{self, JoinHandle},
++    time::{Duration, Instant},
++};
++
++pub enum Command {
++    AddBuffer(u32),
++    Append { buffer_id: u32, bytes: Vec<u8> },
++    EndInput,
++    Playing(bool),
++    Volume { volume: f32, muted: bool },
++}
++pub enum SendError {
++    TooLarge(Command),
++    Full(Command),
++    Disconnected(Command),
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Applied {
++    BufferAdded(u32),
++    Appended(u32),
++    InputEnded,
++    Playing,
++    Volume,
++}
++pub enum Event {
++    /// Identifies command acceptance/processing, not audible or visible output.
++    CommandApplied(Applied),
++    Status(PumpStatus),
++    Error,
++}
++pub struct Worker {
++    tx: Option<SyncSender<Command>>,
++    cancel: Arc<AtomicBool>,
++    thread: Option<JoinHandle<()>>,
++}
++impl Worker {
++    pub fn spawn(
++        renderer: Arc<Mutex<dyn VideoFrameRenderer>>,
++        event: Box<dyn Fn(Event) + Send>,
++    ) -> Result<Self, ()> {
++        // At most32MiB of append bytes waiting in this channel, in addition to
++        // the session's independent32MiB quota. The caller retains a rejected
++        // command and decides when to retry; no append is silently discarded.
++        let (tx, rx) = mpsc::sync_channel(8);
++        let cancel = Arc::new(AtomicBool::new(false));
++        let cancelled = cancel.clone();
++        let thread = thread::Builder::new()
++            .name("android-mse-output".to_owned())
++            .spawn(move || {
++                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                    let mut playback = AppendPlayback::new(renderer);
++                    let mut previous_frames = 0;
++                    let mut previous_size = None;
++                    let mut previous_audio = false;
++                    let mut previous_playing = false;
++                    let mut last_status = Instant::now();
++                    loop {
++                        if cancelled.load(Ordering::Acquire) {
++                            break;
++                        }
++                        match rx.recv_timeout(Duration::from_millis(5)) {
++                            Ok(command) => {
++                                let ack = match &command {
++                                    Command::AddBuffer(id) => Applied::BufferAdded(*id),
++                                    Command::Append { buffer_id, .. } => {
++                                        Applied::Appended(*buffer_id)
++                                    }
++                                    Command::EndInput => Applied::InputEnded,
++                                    Command::Playing(_) => Applied::Playing,
++                                    Command::Volume { .. } => Applied::Volume,
++                                };
++                                let applied = match command {
++                                    Command::AddBuffer(id) => playback.add_buffer(id),
++                                    Command::Append { buffer_id, bytes } => {
++                                        playback.append(buffer_id, &bytes)
++                                    }
++                                    Command::EndInput => playback.end_input(),
++                                    Command::Playing(playing) => playback.set_playing(playing),
++                                    Command::Volume { volume, muted } => {
++                                        playback.set_volume(volume, muted)
++                                    }
++                                };
++                                if applied.is_err() {
++                                    event(Event::Error);
++                                    break;
++                                }
++                                event(Event::CommandApplied(ack));
++                            }
++                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
++                            Err(mpsc::RecvTimeoutError::Timeout) => (),
++                        }
++                        if cancelled.load(Ordering::Acquire) {
++                            break;
++                        }
++                        let status = match playback.pump() {
++                            Ok(s) => s,
++                            Err(()) => {
++                                event(Event::Error);
++                                break;
++                            }
++                        };
++                        if status.rendered_frames != previous_frames
++                            || status.video_size != previous_size
++                            || status.has_audio != previous_audio
++                            || status.playing != previous_playing
++                            || status.finished
++                            || (status.playing
++                                && last_status.elapsed() >= Duration::from_millis(250))
++                        {
++                            event(Event::Status(status));
++                            previous_frames = status.rendered_frames;
++                            previous_size = status.video_size;
++                            previous_audio = status.has_audio;
++                            previous_playing = status.playing;
++                            last_status = Instant::now();
++                        }
++                        if status.finished {
++                            playback.set_playing(false)?;
++                            break;
++                        }
++                    }
++                    Ok::<(), ()>(())
++                }));
++                if !matches!(result, Ok(Ok(()))) {
++                    event(Event::Error);
++                }
++            })
++            .map_err(|_| ())?;
++        Ok(Self {
++            tx: Some(tx),
++            cancel,
++            thread: Some(thread),
++        })
++    }
++    pub fn try_command(&self, command: Command) -> Result<(), SendError> {
++        if let Command::Append { bytes, .. } = &command {
++            if bytes.len() > 4 * 1024 * 1024 {
++                return Err(SendError::TooLarge(command));
++            }
++        }
++        match &self.tx {
++            Some(tx) => tx.try_send(command).map_err(|e| match e {
++                TrySendError::Full(command) => SendError::Full(command),
++                TrySendError::Disconnected(command) => SendError::Disconnected(command),
++            }),
++            None => Err(SendError::Disconnected(command)),
++        }
++    }
++}
++impl Drop for Worker {
++    fn drop(&mut self) {
++        self.cancel.store(true, Ordering::Release);
++        self.tx.take();
++        if let Some(thread) = self.thread.take() {
++            if thread.thread().id() != std::thread::current().id() {
++                let _ = thread.join();
++            }
++        }
++    }
++}
++
++#[cfg(all(test, not(target_os = "android")))]
++mod tests {
++    use super::*;
++    use servo_media_player::video::VideoFrame;
++    struct Renderer;
++    impl VideoFrameRenderer for Renderer {
++        fn render(&mut self, _: VideoFrame) {}
++    }
++    #[test]
++    fn command_processing_and_shutdown_do_not_require_native_handles_to_cross_threads() {
++        let (tx, rx) = mpsc::channel();
++        let worker = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |event| {
++                let _ = tx.send(matches!(event, Event::CommandApplied(_)));
++            }),
++        )
++        .unwrap();
++        assert!(worker.try_command(Command::Playing(false)).is_ok());
++        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
++        drop(worker);
++    }
++    #[test]
++    fn queue_pressure_returns_original_append_for_retry() {
++        let (tx, _rx) = mpsc::sync_channel(1);
++        let worker = Worker {
++            tx: Some(tx),
++            cancel: Arc::new(AtomicBool::new(false)),
++            thread: None,
++        };
++        assert!(worker.try_command(Command::Playing(false)).is_ok());
++        match worker.try_command(Command::Append {
++            buffer_id: 1,
++            bytes: vec![1, 2, 3],
++        }) {
++            Err(SendError::Full(Command::Append { bytes, .. })) => assert_eq!(bytes, [1, 2, 3]),
++            _ => panic!("append was lost"),
++        }
++        match worker.try_command(Command::Append {
++            buffer_id: 1,
++            bytes: vec![7; 4 * 1024 * 1024 + 1],
++        }) {
++            Err(SendError::TooLarge(Command::Append { bytes, .. })) => {
++                assert_eq!(bytes.len(), 4 * 1024 * 1024 + 1)
++            }
++            _ => panic!("oversized append accepted"),
++        }
++    }
++}
+diff --git a/components/media/backends/android/android_impl/sys.rs b/components/media/backends/android/android_impl/sys.rs
+index 8f5ecba96..8cfc41096 100644
+--- a/components/media/backends/android/android_impl/sys.rs
++++ b/components/media/backends/android/android_impl/sys.rs
+@@ -17,7 +17,12 @@
+ //! The Argon app targets minSdk 29, so every symbol used here is always
+ //! available at runtime; no runtime symbol gating is required.
+ 
+-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
++#![allow(
++    non_camel_case_types,
++    non_snake_case,
++    non_upper_case_globals,
++    dead_code
++)]
+ 
+ use core::ffi::{c_char, c_void};
+ 
+@@ -61,6 +66,15 @@ pub struct ANativeWindow {
+     _private: [u8; 0],
+ }
+ 
++#[repr(C)]
++#[derive(Default)]
++pub struct AImageCropRect {
++    pub left: i32,
++    pub top: i32,
++    pub right: i32,
++    pub bottom: i32,
++}
++
+ pub type SeekMode = i32;
+ pub const AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC: SeekMode = 0;
+ 
+@@ -127,8 +141,17 @@ unsafe extern "C" {
+ 
+     pub fn AMediaFormat_new() -> *mut AMediaFormat;
+     pub fn AMediaFormat_setInt32(format: *mut AMediaFormat, name: *const c_char, value: i32);
+-    pub fn AMediaFormat_setString(format: *mut AMediaFormat, name: *const c_char, value: *const c_char);
+-    pub fn AMediaFormat_setBuffer(format: *mut AMediaFormat, name: *const c_char, data: *const c_void, size: usize);
++    pub fn AMediaFormat_setString(
++        format: *mut AMediaFormat,
++        name: *const c_char,
++        value: *const c_char,
++    );
++    pub fn AMediaFormat_setBuffer(
++        format: *mut AMediaFormat,
++        name: *const c_char,
++        data: *const c_void,
++        size: usize,
++    );
+     pub fn AMediaFormat_delete(format: *mut AMediaFormat) -> media_status_t;
+     pub fn AMediaFormat_getInt32(
+         format: *mut AMediaFormat,
+@@ -198,10 +221,11 @@ unsafe extern "C" {
+     pub fn AMediaDataSource_setGetSize(ds: *mut AMediaDataSource, cb: AMediaDataSourceGetSize);
+     pub fn AMediaDataSource_setClose(ds: *mut AMediaDataSource, cb: AMediaDataSourceClose);
+ 
+-    pub fn AAudio_createStreamBuilder(
+-        builder: *mut *mut AAudioStreamBuilder,
+-    ) -> aaudio_result_t;
++    pub fn AAudio_createStreamBuilder(builder: *mut *mut AAudioStreamBuilder) -> aaudio_result_t;
+     pub fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
++    pub fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32;
++    pub fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32;
++    pub fn AAudioStream_getFormat(stream: *mut AAudioStream) -> i32;
+     pub fn AAudioStream_getFramesRead(stream: *mut AAudioStream) -> i64;
+     pub fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> aaudio_result_t;
+     pub fn AAudioStreamBuilder_setDirection(builder: *mut AAudioStreamBuilder, direction: i32);
+@@ -211,10 +235,7 @@ unsafe extern "C" {
+         channel_count: i32,
+     );
+     pub fn AAudioStreamBuilder_setFormat(builder: *mut AAudioStreamBuilder, format: i32);
+-    pub fn AAudioStreamBuilder_setSharingMode(
+-        builder: *mut AAudioStreamBuilder,
+-        sharing_mode: i32,
+-    );
++    pub fn AAudioStreamBuilder_setSharingMode(builder: *mut AAudioStreamBuilder, sharing_mode: i32);
+     pub fn AAudioStreamBuilder_setUsage(builder: *mut AAudioStreamBuilder, usage: i32);
+     pub fn AAudioStreamBuilder_setPerformanceMode(
+         builder: *mut AAudioStreamBuilder,
+@@ -233,7 +254,12 @@ unsafe extern "C" {
+     pub fn AAudioStream_requestStop(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_requestPause(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_getState(stream: *mut AAudioStream) -> i32;
+-    pub fn AAudioStream_waitForStateChange(stream: *mut AAudioStream, input_state: i32, next_state: *mut i32, timeout_nanoseconds: i64) -> aaudio_result_t;
++    pub fn AAudioStream_waitForStateChange(
++        stream: *mut AAudioStream,
++        input_state: i32,
++        next_state: *mut i32,
++        timeout_nanoseconds: i64,
++    ) -> aaudio_result_t;
+     /// API 26: discard queued-but-unplayed audio in a stable quiescent state.
+     pub fn AAudioStream_requestFlush(stream: *mut AAudioStream) -> aaudio_result_t;
+     pub fn AAudioStream_write(
+@@ -261,6 +287,7 @@ unsafe extern "C" {
+     ) -> media_status_t;
+ 
+     pub fn AImage_delete(image: *mut AImage);
++    pub fn AImage_getCropRect(image: *const AImage, rect: *mut AImageCropRect) -> media_status_t;
+     pub fn AImage_getWidth(image: *const AImage, width: *mut i32) -> media_status_t;
+     pub fn AImage_getHeight(image: *const AImage, height: *mut i32) -> media_status_t;
+     pub fn AImage_getPlaneData(
+diff --git a/components/media/backends/android/hosttest/Cargo.lock b/components/media/backends/android/hosttest/Cargo.lock
+index bf7223a2a..5dc8a0d4a 100644
+--- a/components/media/backends/android/hosttest/Cargo.lock
++++ b/components/media/backends/android/hosttest/Cargo.lock
+@@ -2,6 +2,43 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "autocfg"
++version = "1.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
++
++[[package]]
++name = "crossbeam-deque"
++version = "0.8.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
++dependencies = [
++ "crossbeam-epoch",
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-epoch"
++version = "0.9.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-utils"
++version = "0.8.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
++
++[[package]]
++name = "either"
++version = "1.19.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
++
+ [[package]]
+ name = "log"
+ version = "0.4.35"
+@@ -14,6 +51,35 @@ version = "0.3.18"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
+ 
++[[package]]
++name = "num-traits"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "rayon"
++version = "1.12.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
++dependencies = [
++ "either",
++ "rayon-core",
++]
++
++[[package]]
++name = "rayon-core"
++version = "1.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
++dependencies = [
++ "crossbeam-deque",
++ "crossbeam-utils",
++]
++
+ [[package]]
+ name = "servo-media-android-hosttest"
+ version = "0.0.0"
+@@ -21,6 +87,7 @@ dependencies = [
+  "log",
+  "mime",
+  "shiguredo_mp4",
++ "yuv",
+ ]
+ 
+ [[package]]
+@@ -28,3 +95,13 @@ name = "shiguredo_mp4"
+ version = "2026.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "82e773aead88d11a806c8b78dbc2577afb3a20fcc80108aafb3724f6dbb9fbe0"
++
++[[package]]
++name = "yuv"
++version = "0.8.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "89c90da4fb561f9750984de2c5e7f0ba01035d2eb29d69a7f375b1caef37fdf4"
++dependencies = [
++ "num-traits",
++ "rayon",
++]
+diff --git a/components/media/backends/android/hosttest/Cargo.toml b/components/media/backends/android/hosttest/Cargo.toml
+index 8c1cd66c6..4ec3d0869 100644
+--- a/components/media/backends/android/hosttest/Cargo.toml
++++ b/components/media/backends/android/hosttest/Cargo.toml
+@@ -13,3 +13,8 @@ publish = false
+ shiguredo_mp4 = "=2026.5.0"
+ log = "0.4"
+ mime = "0.3"
++
++yuv = { version = "=0.8.14", features = ["rayon"], optional = true }
++
++[features]
++native-harness = ["dep:yuv"]
+diff --git a/components/media/backends/android/hosttest/README.md b/components/media/backends/android/hosttest/README.md
+index fe267fedd..492df7012 100644
+--- a/components/media/backends/android/hosttest/README.md
++++ b/components/media/backends/android/hosttest/README.md
+@@ -22,3 +22,23 @@ Covered: SharedBuffer windows/seeks (6), mime_table answers (3),
+ yuv_pack packing incl. row/pixel strides (4). NOT covered (need device
+ evidence): codec format negotiation, crop/rotation/color changes, odd
+ dimensions, ImageReader-decoder compatibility, A/V sync, audio focus/routes.
++
++## Adaptive native mock harness (066)
++
++    CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 cargo test --features native-harness
++
++Includes the exact native adaptive codec/output/worker files and NDK declarations
++on the host, with deterministic native-symbol mocks. The renderer API mirror is
++checked byte-for-byte against the real player/video.rs after removing only heap
++accounting annotations. yuv is the same0.8.14 dependency used by the backend.
++Disabling debug symbols avoids excessive host compiler memory use for yuv.
++
++102checks pass:89unit/native-mock tests and13fMP4 fixture tests. Added cases
++cover due/paused/late output leases, once-only EOS, asynchronous image arrival,
++visible crop and YUV-to-BGRA conversion, core-to-browser-renderer handoff,
++retained audio writes/gain, command pressure/shutdown, identical init reuse,
++and independent audio/video appends both using track1 routed to distinct codecs.
++These are mocks and synthetic media, not Android decoding, audio hardware,
++A/V sync, device, visual browser, or site playback evidence. Android owner-source
++compilation is still required. The synthetic blue-frame fixture checks pixels
++from the real color converter; it does not establish a video played.
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+index 13115b9fc..29196f743 100644
+--- a/components/media/backends/android/hosttest/src/lib.rs
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -27,3 +27,11 @@ pub mod audio_queue;
+ 
+ #[path = "../../mse_demux/mod.rs"]
+ pub mod mse_demux;
++
++#[cfg(feature = "native-harness")]
++extern crate self as servo_media_player;
++#[cfg(feature = "native-harness")]
++#[path = "video_api.rs"]
++pub mod video;
++#[cfg(feature = "native-harness")]
++pub mod native;
+diff --git a/components/media/backends/android/hosttest/src/native.rs b/components/media/backends/android/hosttest/src/native.rs
+new file mode 100644
+index 000000000..f15a87ae5
+--- /dev/null
++++ b/components/media/backends/android/hosttest/src/native.rs
+@@ -0,0 +1,11 @@
++//! Host NDK mocks run exact production adaptive modules. This is not an
++//! Android linker/device test. video_api is the real renderer API with only
++//! heap-accounting derives removed; owner-source Android CI remains required.
++#[path = "../../android_impl/sys.rs"]
++pub mod sys;
++#[path = "../../android_impl/mse_codec.rs"]
++pub mod mse_codec;
++#[path = "../../android_impl/mse_playback.rs"]
++pub mod mse_playback;
++#[path = "../../android_impl/mse_worker.rs"]
++pub mod mse_worker;
+diff --git a/components/media/backends/android/hosttest/src/video_api.rs b/components/media/backends/android/hosttest/src/video_api.rs
+new file mode 100644
+index 000000000..9d58996ad
+--- /dev/null
++++ b/components/media/backends/android/hosttest/src/video_api.rs
+@@ -0,0 +1,86 @@
++//! Renderer API mirror for host-only native mocks. A guard below verifies
++//! it against the owner source, omitting only heap-accounting annotations.
++// BEGIN API COPY
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use std::sync::Arc;
++
++
++
++#[derive(Clone)]
++pub enum VideoFrameData {
++    Raw(Arc<Vec<u8>>),
++    Texture(u32),
++    OESTexture(u32),
++}
++
++pub trait Buffer: Send + Sync {
++    fn to_vec(&self) -> Option<VideoFrameData>;
++}
++
++#[derive(Clone)]
++pub struct VideoFrame {
++    width: i32,
++    height: i32,
++    data: VideoFrameData,
++    _buffer: Arc<dyn Buffer>,
++}
++
++impl VideoFrame {
++    pub fn new(width: i32, height: i32, buffer: Arc<dyn Buffer>) -> Option<Self> {
++        let data = buffer.to_vec()?;
++        Some(VideoFrame {
++            width,
++            height,
++            data,
++            _buffer: buffer,
++        })
++    }
++
++    pub fn get_width(&self) -> i32 {
++        self.width
++    }
++
++    pub fn get_height(&self) -> i32 {
++        self.height
++    }
++
++    pub fn get_data(&self) -> Arc<Vec<u8>> {
++        match self.data {
++            VideoFrameData::Raw(ref data) => data.clone(),
++            _ => unreachable!("invalid raw data request for texture frame"),
++        }
++    }
++
++    pub fn get_texture_id(&self) -> u32 {
++        match self.data {
++            VideoFrameData::Texture(data) | VideoFrameData::OESTexture(data) => data,
++            _ => unreachable!("invalid texture id request for raw data frame"),
++        }
++    }
++
++    pub fn is_gl_texture(&self) -> bool {
++        matches!(
++            self.data,
++            VideoFrameData::Texture(_) | VideoFrameData::OESTexture(_)
++        )
++    }
++
++    pub fn is_external_oes(&self) -> bool {
++        matches!(self.data, VideoFrameData::OESTexture(_))
++    }
++}
++
++pub trait VideoFrameRenderer: Send + 'static {
++    fn render(&mut self, frame: VideoFrame);
++}
++// END API COPY
++
++#[test]
++fn renderer_api_matches_owner_source() {
++    let owner = include_str!("../../../../player/video.rs").replace("use malloc_size_of_derive::MallocSizeOf;", "").replace("Clone, MallocSizeOf", "Clone").replace("#[conditional_malloc_size_of] ", "").replace("    #[ignore_malloc_size_of = \"Difficult\"]\n", "");
++    let mirror = include_str!("video_api.rs").split_once("// BEGIN API COPY\n").unwrap().1.split_once("// END API COPY").unwrap().0;
++    assert_eq!(owner,mirror);
++}
+diff --git a/components/media/backends/android/mse_demux/README.md b/components/media/backends/android/mse_demux/README.md
+index 99c73ac54..fcb2ca2c2 100644
+--- a/components/media/backends/android/mse_demux/README.md
++++ b/components/media/backends/android/mse_demux/README.md
+@@ -13,3 +13,21 @@ Host evidence: existing57 tests plus18 new checks (13 unit +5 fixture integratio
+ 064 adds append-stream buffering/EOS/abort, codec-input bridge, bounded retained packet delivery and dormant NDK configure/start/queue adapter. Native adapter is compiled but has NO production call site or output-pump integration. It requires a borrowed video surface, rejects unsupported formats/config changes rather than resetting live decoders, and checks track identity/input capacity. Negative PTS currently rejected at delivery, pending spec-correct preroll/time mapping. AAC extensions remain unsupported by the narrow dependency helper.84 host tests pass (73unit+11fixture), NOT native runtime evidence.
+ 
+ 065 adds internal AppendSession coordinator (append->demux->packet bridge->retained codec-input delivery), and native output polling with output-buffer ownership leases. SurfaceReleased is queue submission, NOT displayed pixels. PCM output is bounded and copied after metadata validation. Output is still not delivered to the browser's renderer/AAudio; no DOM/HTMLMediaElement call site exists. AAC decoder-specific bytes now pass unchanged, including extension bytes, to native validation instead of being rejected by a narrow AAC-LC parser; host fixture confirms byte identity, not decoding.86host checks(73unit+13fixture) pass including full append-to-mock-codec-boundary and error-poison behavior. NegativePTS/preroll, adaptive format changes, live fragment-boundary latency, brand/edit and full coded-frame semantics remain incomplete.
++
++066 preparation connects AppendSession to a bounded native worker and audio/video
++outputs, still without a Player/DOM caller and with the backend pref unchanged.
++Two independent append sessions remap per-file track IDs before shared decoding,
++including separate audio/video files both using track1. Identical init config is
++reused; adaptive changes still fail until coordinated draining is implemented.
++Video output is held until due, acquired asynchronously with bounded image/crop
++validation, converted through the real yuv dependency and handed to the browser
++renderer. Shared surface ownership prevents reader destruction before codec drop.
++Audio uses bounded transitions, partial nonblocking writes, mute/volume/duck gain
++and the existing audio-focus/noisy policy. Command byte/slot bounds retain rejected
++appends for the caller. Status is renderer handoff/endpoint consumption, not a
++pixel-display or DAC acknowledgment.102host checks(89unit+13fixture) pass with
++native mocks and a renderer API mirror guarded against actual owner-source drift.
++A synthetic cropped blue-frame conversion was visually inspected, not playback.
++Still missing Player/DOM attachment, coded-frame store integration/seek/replay,
++adaptive decoder reconfiguration, full buffer state/events/ranges semantics,
++correct buffering clocks and live fragment boundary latency. Do not advertise MSE.
+diff --git a/components/media/backends/android/yuv_pack.rs b/components/media/backends/android/yuv_pack.rs
+index 6dba694f1..296d1f255 100644
+--- a/components/media/backends/android/yuv_pack.rs
++++ b/components/media/backends/android/yuv_pack.rs
+@@ -44,17 +44,17 @@ pub fn pack_i420(planes: &Planes) -> Option<Vec<u8>> {
+     }
+     let cw = w / 2;
+     let ch = h / 2;
+-    if planes.y_row_stride < w ||
+-        planes.u_row_stride < cw * planes.u_pixel_stride ||
+-        planes.v_row_stride < cw * planes.v_pixel_stride ||
+-        planes.u_pixel_stride == 0 ||
+-        planes.v_pixel_stride == 0
++    if planes.y_row_stride < w
++        || planes.u_row_stride < cw * planes.u_pixel_stride
++        || planes.v_row_stride < cw * planes.v_pixel_stride
++        || planes.u_pixel_stride == 0
++        || planes.v_pixel_stride == 0
+     {
+         return None;
+     }
+-    if plane_len(h, w, planes.y_row_stride, 1) > planes.y.len() ||
+-        plane_len(ch, cw, planes.u_row_stride, planes.u_pixel_stride) > planes.u.len() ||
+-        plane_len(ch, cw, planes.v_row_stride, planes.v_pixel_stride) > planes.v.len()
++    if plane_len(h, w, planes.y_row_stride, 1) > planes.y.len()
++        || plane_len(ch, cw, planes.u_row_stride, planes.u_pixel_stride) > planes.u.len()
++        || plane_len(ch, cw, planes.v_row_stride, planes.v_pixel_stride) > planes.v.len()
+     {
+         return None;
+     }
+@@ -67,8 +67,10 @@ pub fn pack_i420(planes: &Planes) -> Option<Vec<u8>> {
+     }
+     for row in 0..ch {
+         for col in 0..cw {
+-            u_out[row * cw + col] = planes.u[row * planes.u_row_stride + col * planes.u_pixel_stride];
+-            v_out[row * cw + col] = planes.v[row * planes.v_row_stride + col * planes.v_pixel_stride];
++            u_out[row * cw + col] =
++                planes.u[row * planes.u_row_stride + col * planes.u_pixel_stride];
++            v_out[row * cw + col] =
++                planes.v[row * planes.v_row_stride + col * planes.v_pixel_stride];
+         }
+     }
+     Some(out)
+@@ -201,3 +203,74 @@ mod tests {
+         assert!(pack_i420(&odd).is_none());
+     }
+ }
++
++/// Copy an even-aligned visible rectangle out of packed I420. Odd chroma phase
++/// is deliberately rejected instead of silently shifting color samples.
++pub fn crop_i420(data: &[u8], width: usize, height: usize, rect: [usize; 4]) -> Option<Vec<u8>> {
++    let [left, top, right, bottom] = rect;
++    if width == 0
++        || height == 0
++        || width % 2 != 0
++        || height % 2 != 0
++        || left >= right
++        || top >= bottom
++        || right > width
++        || bottom > height
++        || rect.iter().any(|v| v % 2 != 0)
++    {
++        return None;
++    }
++    let area = width.checked_mul(height)?;
++    let total = area.checked_add(area / 2)?;
++    if data.len() != total {
++        return None;
++    }
++    let (w, h) = (right - left, bottom - top);
++    let out_area = w.checked_mul(h)?;
++    let mut out = Vec::with_capacity(out_area.checked_add(out_area / 2)?);
++    for (base, stride, l, t, r, b) in [
++        (0, width, left, top, right, bottom),
++        (area, width / 2, left / 2, top / 2, right / 2, bottom / 2),
++        (
++            area + area / 4,
++            width / 2,
++            left / 2,
++            top / 2,
++            right / 2,
++            bottom / 2,
++        ),
++    ] {
++        for row in t..b {
++            out.extend_from_slice(data.get(base + row * stride + l..base + row * stride + r)?);
++        }
++    }
++    Some(out)
++}
++#[cfg(test)]
++mod crop_tests {
++    use super::*;
++    #[test]
++    fn visible_rectangle_crops_all_three_planes() {
++        let mut src: Vec<u8> = (0..32).collect();
++        src.extend(100..108);
++        src.extend(200..208);
++        assert_eq!(
++            crop_i420(&src, 8, 4, [2, 2, 6, 4]).unwrap(),
++            [18, 19, 20, 21, 26, 27, 28, 29, 105, 106, 205, 206]
++        );
++    }
++    #[test]
++    fn invalid_or_unaligned_crop_is_rejected() {
++        for rect in [
++            [1, 0, 4, 4],
++            [0, 0, 6, 4],
++            [0, 0, 4, 6],
++            [0, 0, 0, 4],
++            [2, 2, 0, 0],
++        ] {
++            assert!(crop_i420(&[0; 24], 4, 4, rect).is_none());
++        }
++        assert!(crop_i420(&[0; 23], 4, 4, [0, 0, 4, 4]).is_none());
++        assert!(crop_i420(&[], usize::MAX - 1, usize::MAX - 1, [0, 0, 2, 2]).is_none());
++    }
++}
+-- 
+2.34.1
+
