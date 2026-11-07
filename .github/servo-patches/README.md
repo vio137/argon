@@ -116,3 +116,11 @@ site-loading and browsing performance before drawing conclusions.
   top-level load's identity so auxiliary failures are matchable like any
   other. Gate: a gen-0 start clears the identity. 19 standalone assertions
   pass.
+- v3.2 (current): compile fix - the v1-v3.1 delegate overrides sat in the
+  wrong impl block (impl PlatformWindow without the trait declaring them;
+  v1 engine run 42352632037 failed with E0407). v3.2 declares
+  notify_load_error/notify_top_level_load_started on the PlatformWindow
+  trait (ports/servoshell/window.rs, default no-ops, mirroring
+  notify_crashed) and forwards WebViewDelegate -> PlatformWindow in
+  RunningAppState (running_app_state.rs). Patch now spans 14 files;
+  apply-checked against pristine base.

@@ -667,3 +667,104 @@ index 89bc803..568f43f 100644
      /// Page title has changed.
      fn on_title_changed(&self, title: Option<String>);
      /// Page URL has changed.
+diff --git a/ports/servoshell/running_app_state.rs b/ports/servoshell/running_app_state.rs
+index 6ea85ea..201a247 100644
+--- a/ports/servoshell/running_app_state.rs
++++ b/ports/servoshell/running_app_state.rs
+@@ -32,7 +32,8 @@ use servo::{
+     AllowOrDenyRequest, AuthenticationRequest, BluetoothDeviceSelectionRequest, CSSPixel,
+     ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntPoint, DeviceIntSize, EmbedderControl,
+     EmbedderControlId, EventLoopWaker, GenericSender, InputEvent, InputEventId, InputEventResult,
+-    JSValue, LoadStatus, PermissionRequest, PrefValue, Preferences, ScreenshotCaptureError, Servo,
++    JSValue, LoadErrorKind, LoadStatus, PermissionRequest, PrefValue, Preferences,
++    ScreenshotCaptureError, Servo,
+     ServoDelegate, ServoError, TraversalId, UserContentManager, WebDriverCommandMsg,
+     WebDriverJSResult, WebDriverLoadStatus, WebDriverScriptCommand, WebDriverSenders, WebView,
+     WebViewDelegate, WebViewId,
+@@ -932,6 +933,39 @@ impl WebViewDelegate for RunningAppState {
+             .notify_crashed(webview, reason, backtrace);
+     }
+ 
++    /// Argon (engine patch 020): forward the load-error signal with its
++    /// request identity to the platform window.
++    fn notify_load_error(
++        &self,
++        webview: WebView,
++        pipeline_id: String,
++        url: Url,
++        kind: LoadErrorKind,
++        reason: String,
++        generation: u64,
++    ) {
++        self.platform_window_for_webview(&webview).notify_load_error(
++            webview,
++            pipeline_id,
++            url,
++            kind,
++            reason,
++            generation,
++        );
++    }
++
++    /// Argon (engine patch 020): forward the top-level load-start identity.
++    fn notify_top_level_load_started(
++        &self,
++        webview: WebView,
++        pipeline_id: String,
++        url: Url,
++        generation: u64,
++    ) {
++        self.platform_window_for_webview(&webview)
++            .notify_top_level_load_started(webview, pipeline_id, url, generation);
++    }
++
+     fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
+         self.platform_window_for_webview(&webview)
+             .show_console_message(level, &message);
+diff --git a/ports/servoshell/window.rs b/ports/servoshell/window.rs
+index 6bb5a9c..01308a1 100644
+--- a/ports/servoshell/window.rs
++++ b/ports/servoshell/window.rs
+@@ -12,8 +12,8 @@ use servo::{
+     AuthenticationRequest, BluetoothDeviceSelectionRequest, ConsoleLogLevel,
+     CreateNewWebViewRequest, Cursor, DeviceIndependentIntRect, DeviceIndependentPixel,
+     DeviceIntPoint, DeviceIntSize, DevicePixel, EmbedderControl, EmbedderControlId, InputEventId,
+-    InputEventResult, PermissionRequest, RenderingContext, ScreenGeometry, WebView, WebViewBuilder,
+-    WebViewId,
++    InputEventResult, LoadErrorKind, PermissionRequest, RenderingContext, ScreenGeometry, WebView,
++    WebViewBuilder, WebViewId,
+ };
+ use url::Url;
+ 
+@@ -477,6 +477,31 @@ pub(crate) trait PlatformWindow {
+     }
+ 
+     fn notify_crashed(&self, _: WebView, _reason: String, _backtrace: Option<String>) {}
++
++    /// Argon (engine patch 020): a top-level load failed, carrying the
++    /// failing load's request identity. Default no-op; platforms that show
++    /// load errors override this.
++    fn notify_load_error(
++        &self,
++        _: WebView,
++        _pipeline_id: String,
++        _url: Url,
++        _kind: LoadErrorKind,
++        _reason: String,
++        _generation: u64,
++    ) {
++    }
++
++    /// Argon (engine patch 020): a top-level load started, carrying its
++    /// request identity. Default no-op.
++    fn notify_top_level_load_started(
++        &self,
++        _: WebView,
++        _pipeline_id: String,
++        _url: Url,
++        _generation: u64,
++    ) {
++    }
+     fn show_console_message(&self, _level: ConsoleLogLevel, _message: &str) {}
+ 
+     #[cfg(not(any(target_os = "android", target_env = "ohos")))]
