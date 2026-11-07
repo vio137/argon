@@ -1,0 +1,335 @@
+From ad38d47ed8a9e443e0d43e319326d55f07511c0e Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sat, 7 Nov 2026 22:53:04 +0530
+Subject: [PATCH] 062 media: retain partial PCM writes and service output
+ without blocking commands
+
+---
+ .../backends/android/android_impl/player.rs   | 94 +++++++++++--------
+ .../media/backends/android/audio_queue.rs     | 68 ++++++++++++++
+ components/media/backends/android/clock.rs    | 15 +++
+ .../backends/android/hosttest/src/lib.rs      |  3 +
+ components/media/backends/android/lib.rs      |  1 +
+ 5 files changed, 143 insertions(+), 38 deletions(-)
+ create mode 100644 components/media/backends/android/audio_queue.rs
+
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
+index 47ca28eee..61e04cdd9 100644
+--- a/components/media/backends/android/android_impl/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
+@@ -53,8 +53,6 @@ use crate::yuv_pack::{Planes, pack_i420};
+ /// Upper bound for one compressed sample staged between the extractor and a
+ /// codec input buffer. Samples larger than this are logged and dropped.
+ const MAX_SAMPLE_SIZE: usize = 8 * 1024 * 1024;
+-/// How long one AAudioStream_write call may block.
+-const AUDIO_WRITE_TIMEOUT_NS: i64 = 100_000_000;
+ /// Cap the AAudio buffer so the audio write-ahead (and with it the audio
+ /// clock's lead over audible output) stays small.
+ const AUDIO_BUFFER_CAPACITY_MS: i32 = 100;
+@@ -488,6 +486,9 @@ struct Pipeline {
+     video: Option<TrackDecoder>,
+     audio: Option<TrackDecoder>,
+     aaudio: *mut sys::AAudioStream,
++    audio_queue: Option<crate::audio_queue::AudioQueue>,
++    audio_last_progress: Instant,
++    audio_eos_pending: bool,
+     clock: MasterClock,
+     staging: Vec<u8>,
+     pending_sample: Option<(usize, usize, i64)>, // (track_index, len, pts); bytes in staging
+@@ -516,6 +517,9 @@ impl Pipeline {
+             video: None,
+             audio: None,
+             aaudio: std::ptr::null_mut(),
++            audio_queue: None,
++            audio_last_progress: Instant::now(),
++            audio_eos_pending: false,
+             clock: MasterClock::new(),
+             staging: vec![0u8; MAX_SAMPLE_SIZE],
+             pending_sample: None,
+@@ -806,6 +810,7 @@ impl Pipeline {
+             did_work |= self.pump_video();
+             did_work |= self.pump_audio();
+             self.update_audio_clock();
++            self.maybe_finish();
+             if !did_work {
+                 std::thread::sleep(Duration::from_millis(4));
+             }
+@@ -850,6 +855,8 @@ impl Pipeline {
+                 send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Paused));
+             },
+             FocusAction::Resume => {
++                self.audio_last_progress = Instant::now();
++                self.audio_eos_pending = false;
+                 if !self.set_audio_running(true) { return; }
+                 self.clock.resume();
+                 send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Playing));
+@@ -869,6 +876,8 @@ impl Pipeline {
+             PipelineCmd::Shutdown => return false,
+             PipelineCmd::Play => {
+                 self.focus.page_command();
++                self.audio_last_progress = Instant::now();
++                self.audio_eos_pending = false;
+                 if !self.set_audio_running(true) { return true; }
+                 self.clock.resume();
+                 send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Playing));
+@@ -894,6 +903,8 @@ impl Pipeline {
+     }
+ 
+     fn audio_transition_failed(&mut self) {
++        self.audio_queue = None;
++        self.audio_eos_pending = false;
+         if !self.aaudio.is_null() {
+             unsafe { sys::AAudioStream_close(self.aaudio) };
+             self.aaudio = std::ptr::null_mut();
+@@ -912,6 +923,8 @@ impl Pipeline {
+     }
+ 
+     fn do_seek(&mut self, time: f64) {
++        self.audio_queue = None;
++        self.audio_eos_pending = false;
+         let target_us = (time * 1e6) as i64;
+         if !self.aaudio.is_null() {
+             let mut stream = AudioTransition::new(self.aaudio);
+@@ -1262,6 +1275,8 @@ impl Pipeline {
+     }
+ 
+     fn pump_audio(&mut self) -> bool {
++        if self.audio_queue.is_some() { return self.write_audio(); }
++        if self.audio.as_ref().map(|a| a.drained).unwrap_or(true) { return false; }
+         let Some(codec) = self.audio.as_ref().map(|a| a.codec) else {
+             return false;
+         };
+@@ -1340,7 +1355,9 @@ impl Pipeline {
+                     pcm.to_vec()
+                 };
+                 unsafe { sys::AMediaCodec_releaseOutputBuffer(codec, idx, false) };
+-                self.write_audio(&samples, info.presentation_time_us);
++                self.audio_queue = crate::audio_queue::AudioQueue::new(samples, self.audio.as_ref().unwrap().channels as usize, info.presentation_time_us);
++                self.audio_last_progress = Instant::now();
++                self.write_audio();
+                 if eos {
+                     self.audio.as_mut().unwrap().drained = true;
+                     self.maybe_finish();
+@@ -1404,55 +1421,56 @@ impl Pipeline {
+         }
+     }
+ 
+-    fn write_audio(&mut self, samples: &[i16], pts_us: i64) {
++    fn write_audio(&mut self) -> bool {
++        if self.shared.get().paused || self.shared.get().shutdown || self.focus.hold != Hold::None { return false; }
+         if self.aaudio.is_null() {
+             self.reopen_audio_stream();
+-            if self.aaudio.is_null() {
+-                return;
+-            }
++            if self.aaudio.is_null() { self.audio_transition_failed(); return false; }
+         }
+-        let channels = self.audio.as_ref().unwrap().channels.max(1) as usize;
+-        if self.clock.audio_frames_written == 0 {
+-            self.clock.anchor_audio_start(pts_us);
++        let Some(queue) = self.audio_queue.as_ref() else { return false; };
++        if self.clock.audio_frames_written == 0 { self.clock.anchor_audio_start(queue.pts_us); }
++        // At most one nonblocking call per pipeline iteration. Commands, focus,
++        // shutdown and video pumping are serviced before the next attempt.
++        let frames = queue.frames().min(i32::MAX as usize);
++        let result = unsafe { sys::AAudioStream_write(self.aaudio, queue.remaining().as_ptr() as *const std::ffi::c_void, frames as i32, 0) };
++        let accepted = self.audio_queue.as_mut().unwrap().accept(result);
++        let Ok(written) = accepted else { self.audio_transition_failed(); return false; };
++        if written == 0 && self.audio_last_progress.elapsed() > Duration::from_secs(2) {
++            self.audio_transition_failed();
++            return false;
+         }
+-        let mut frames_left = samples.len() / channels;
+-        let mut offset_frames = 0usize;
+-        while frames_left > 0 {
+-            if self.shared.get().shutdown {
+-                return;
+-            }
+-            let written = unsafe {
+-                sys::AAudioStream_write(
+-                    self.aaudio,
+-                    samples[offset_frames * channels..].as_ptr() as *const std::ffi::c_void,
+-                    frames_left as i32,
+-                    AUDIO_WRITE_TIMEOUT_NS,
+-                )
+-            };
+-            if written < 0 {
+-                warn!("android media backend: AAudio write failed: {written}");
+-                return;
+-            }
+-            let written = written as usize;
++        if written > 0 {
++            self.audio_last_progress = Instant::now();
+             self.clock.audio_frames_written = self.clock.audio_frames_written.saturating_add(written as u64);
+             self.update_audio_clock();
+-            offset_frames += written;
+-            frames_left -= written;
+-            if written == 0 {
+-                // Stream is full and not draining fast enough; avoid a hot
+-                // loop but keep writing (audio drives the clock).
+-                std::thread::sleep(Duration::from_millis(2));
+-            }
+         }
++        if self.audio_queue.as_ref().unwrap().frames() == 0 { self.audio_queue = None; }
++        written > 0
+     }
+ 
+     fn maybe_finish(&mut self) {
++        if self.shared.get().paused || self.focus.hold != Hold::None { return; }
+         let video_done = self.video.as_ref().map(|v| v.drained).unwrap_or(true);
+         let audio_done = self.audio.as_ref().map(|a| a.drained).unwrap_or(true);
+-        if video_done && audio_done {
++        if video_done && audio_done && self.audio_queue.is_none() {
++            // Decoder EOS is not audible completion. Keep servicing commands
++            // while the endpoint consumes submitted frames, then wait for STOPPED.
++            if !self.aaudio.is_null() && !self.audio_eos_pending {
++                let result = unsafe { sys::AAudioStream_requestStop(self.aaudio) };
++                if result != sys::AAUDIO_OK { self.audio_transition_failed(); return; }
++                self.audio_eos_pending = true;
++                self.audio_last_progress = Instant::now();
++            }
+             if !self.aaudio.is_null() {
+-                unsafe { sys::AAudioStream_requestStop(self.aaudio) };
++                let mut state = 1;
++                let result = unsafe { sys::AAudioStream_waitForStateChange(self.aaudio, 1, &mut state, 0) };
++                if result != sys::AAUDIO_OK { self.audio_transition_failed(); return; }
++                if state != crate::audio_state::STOPPED || !self.clock.audio_drained() {
++                    if self.audio_last_progress.elapsed() > Duration::from_secs(2) { self.audio_transition_failed(); }
++                    return;
++                }
+             }
++            self.clock.pause();
+             self.shared.update(|st| st.paused = true);
+             send_event(&self.sender, PlayerEvent::EndOfStream);
+             send_event(&self.sender, PlayerEvent::StateChanged(PlaybackState::Paused));
+diff --git a/components/media/backends/android/audio_queue.rs b/components/media/backends/android/audio_queue.rs
+new file mode 100644
+index 000000000..7af75c41b
+--- /dev/null
++++ b/components/media/backends/android/audio_queue.rs
+@@ -0,0 +1,68 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! One retained decoded PCM buffer. Partial/zero writes preserve samples so
++//! the pipeline can service commands between nonblocking write attempts.
++pub struct AudioQueue {
++    samples: Vec<i16>,
++    channels: usize,
++    offset_frames: usize,
++    pub pts_us: i64,
++}
++impl AudioQueue {
++    pub fn new(samples: Vec<i16>, channels: usize, pts_us: i64) -> Option<Self> {
++        if channels == 0 || samples.len() % channels != 0 {
++            return None;
++        }
++        Some(Self {
++            samples,
++            channels,
++            offset_frames: 0,
++            pts_us,
++        })
++    }
++    pub fn remaining(&self) -> &[i16] {
++        &self.samples[self.offset_frames * self.channels..]
++    }
++    pub fn frames(&self) -> usize {
++        self.remaining().len() / self.channels
++    }
++    pub fn accept(&mut self, result: i32) -> Result<usize, ()> {
++        let written = usize::try_from(result).map_err(|_| ())?;
++        if written > self.frames() {
++            return Err(());
++        }
++        self.offset_frames += written;
++        Ok(written)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn partial_and_zero_writes_preserve_exact_remaining_samples() {
++        let mut q = AudioQueue::new(vec![1, 2, 3, 4, 5, 6], 2, 900).unwrap();
++        assert_eq!(q.accept(1), Ok(1));
++        assert_eq!(q.remaining(), &[3, 4, 5, 6]);
++        assert_eq!(q.accept(0), Ok(0));
++        assert_eq!(q.remaining(), &[3, 4, 5, 6]);
++        assert_eq!(q.accept(2), Ok(2));
++        assert_eq!(q.frames(), 0);
++        assert_eq!(q.pts_us, 900);
++    }
++    #[test]
++    fn invalid_results_do_not_advance() {
++        let mut q = AudioQueue::new(vec![1, 2], 2, 0).unwrap();
++        assert_eq!(q.accept(-1), Err(()));
++        assert_eq!(q.accept(2), Err(()));
++        assert_eq!(q.frames(), 1);
++    }
++    #[test]
++    fn invalid_geometry_rejected_and_empty_queue_allowed() {
++        assert!(AudioQueue::new(vec![1], 2, 0).is_none());
++        assert!(AudioQueue::new(vec![], 0, 0).is_none());
++        assert_eq!(AudioQueue::new(vec![], 2, 0).unwrap().frames(), 0);
++    }
++}
+diff --git a/components/media/backends/android/clock.rs b/components/media/backends/android/clock.rs
+index 111ff604e..a296a3fc8 100644
+--- a/components/media/backends/android/clock.rs
++++ b/components/media/backends/android/clock.rs
+@@ -79,6 +79,10 @@ impl MasterClock {
+         }
+     }
+ 
++    pub fn audio_drained(&self) -> bool {
++        self.audio_frames_consumed >= self.audio_frames_written
++    }
++
+     pub fn now_us(&self) -> i64 {
+         if self.has_audio && self.audio_sample_rate > 0 {
+             let elapsed =
+@@ -199,4 +203,15 @@ mod tests {
+         c.observe_audio_consumed(i64::MAX);
+         assert_eq!(c.now_us(), i64::MAX);
+     }
++    #[test]
++    fn eos_requires_endpoint_consumption_not_submission() {
++        let mut c = MasterClock::new();
++        c.reset_audio_epoch(100);
++        c.audio_frames_written = 8;
++        assert!(!c.audio_drained());
++        c.observe_audio_consumed(107);
++        assert!(!c.audio_drained());
++        c.observe_audio_consumed(108);
++        assert!(c.audio_drained());
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/src/lib.rs b/components/media/backends/android/hosttest/src/lib.rs
+index 3963e9d29..5e5a02c2f 100644
+--- a/components/media/backends/android/hosttest/src/lib.rs
++++ b/components/media/backends/android/hosttest/src/lib.rs
+@@ -21,3 +21,6 @@ pub mod pcm;
+ 
+ #[path = "../../audio_state.rs"]
+ pub mod audio_state;
++
++#[path = "../../audio_queue.rs"]
++pub mod audio_queue;
+diff --git a/components/media/backends/android/lib.rs b/components/media/backends/android/lib.rs
+index af848587a..edc8e454d 100644
+--- a/components/media/backends/android/lib.rs
++++ b/components/media/backends/android/lib.rs
+@@ -21,6 +21,7 @@ pub mod focus;
+ pub mod rotate;
+ mod pcm;
+ mod audio_state;
++mod audio_queue;
+ mod buffer;
+ mod mime_table;
+ mod yuv_pack;
+-- 
+2.34.1
+
