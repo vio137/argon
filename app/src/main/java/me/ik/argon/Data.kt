@@ -69,14 +69,9 @@ class BookmarkStore(context: Context) {
             runCatching {
                     storeJson.decodeFromString<List<Bookmark>>(file.readText())
                 }
-                .getOrDefault(
-                    listOf(
-                        Bookmark("YouTube", "https://www.youtube.com"),
-                        Bookmark("Wikipedia", "https://www.wikipedia.org"),
-                        Bookmark("GitHub", "https://github.com"),
-                        Bookmark("Reddit", "https://www.reddit.com"),
-                    )
-                )
+                // No shipped bookmarks: the start page must only ever show
+                // pages the user actually starred (same rule as history).
+                .getOrDefault(emptyList())
     }
 
     @Synchronized
@@ -89,6 +84,15 @@ class BookmarkStore(context: Context) {
     @Synchronized
     fun remove(bookmark: Bookmark) {
         entries = entries - bookmark
+        save()
+    }
+
+    /** Renames [bookmark]; a blank title keeps the current one. */
+    @Synchronized
+    fun rename(bookmark: Bookmark, newTitle: String) {
+        val title = newTitle.trim()
+        if (title.isEmpty()) return
+        entries = entries.map { if (it == bookmark) it.copy(title = title) else it }
         save()
     }
 

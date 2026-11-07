@@ -249,6 +249,8 @@ private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) 
 
 @Composable
 fun BookmarksPage(bookmarks: BookmarkStore, onOpen: (String) -> Unit, onBack: () -> Unit) {
+    var renaming by remember { mutableStateOf<Bookmark?>(null) }
+    var renameText by remember { mutableStateOf("") }
     Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
         Column(Modifier.fillMaxSize()) {
             PageTopBar("Bookmarks", onBack)
@@ -278,6 +280,12 @@ fun BookmarksPage(bookmarks: BookmarkStore, onOpen: (String) -> Unit, onBack: ()
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
+                            IconButton(onClick = {
+                                renaming = entry
+                                renameText = entry.title
+                            }) {
+                                Icon(painterResource(R.drawable.ic_edit), contentDescription = "Rename", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                            }
                             IconButton(onClick = { bookmarks.remove(entry) }) {
                                 Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
                             }
@@ -286,6 +294,41 @@ fun BookmarksPage(bookmarks: BookmarkStore, onOpen: (String) -> Unit, onBack: ()
                 }
             }
         }
+    }
+    renaming?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renaming = null },
+            title = { Text("Rename bookmark") },
+            text = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(ArgonRadii.Control))
+                            .background(ArgonColors.Surface)
+                            .padding(horizontal = 14.dp),
+                ) {
+                    androidx.compose.foundation.text.BasicTextField(
+                        value = renameText,
+                        onValueChange = { renameText = it },
+                        singleLine = true,
+                        textStyle = ArgonType.Body.copy(color = ArgonColors.Text),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        bookmarks.rename(target, renameText)
+                        renaming = null
+                    }
+                ) {
+                    Text("Save", color = ArgonColors.Accent)
+                }
+            },
+            dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } },
+        )
     }
 }
 
