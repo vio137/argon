@@ -37,14 +37,18 @@ private fun suggest(query: String, history: List<HistoryEntry>, bookmarks: List<
     if (q.length < 2) return emptyList()
     val seen = HashSet<String>()
     val matches = ArrayList<Match>()
-    for (b in bookmarks.asReversed()) {
+    // Only web pages are suggested: file:// (the start page), data:, about:
+    // and every non-web scheme stay out of the omnibox.
+    val webHistory = history.filter { it.url.startsWith("https://") || it.url.startsWith("http://") }
+    val webBookmarks = bookmarks.filter { it.url.startsWith("https://") || it.url.startsWith("http://") }
+    for (b in webBookmarks.asReversed()) {
         val host = hostOf(b.url).lowercase()
         val title = b.title.lowercase()
         if ((host.contains(q) || title.contains(q)) && seen.add(b.url)) {
             matches.add(Match(b.title.ifBlank { hostOf(b.url) }, b.url, bookmark = true, hostPrefix = host.startsWith(q)))
         }
     }
-    for (h in history.asReversed()) {
+    for (h in webHistory.asReversed()) {
         val host = hostOf(h.url).lowercase()
         val title = h.title.lowercase()
         if ((host.contains(q) || title.contains(q)) && seen.add(h.url)) {

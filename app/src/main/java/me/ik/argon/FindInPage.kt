@@ -58,12 +58,20 @@ function highlight(q) {
   var ql = q.toLowerCase();
   var walker = document.createTreeWalker(document.body, 4, { acceptNode: function(n) {
     if (!n.nodeValue || n.nodeValue.toLowerCase().indexOf(ql) === -1) return 2;
-    var t = n.parentNode && n.parentNode.tagName;
+    var el = n.parentNode;
+    if (!el || !el.tagName) return 2;
+    var t = el.tagName;
     if (t === "SCRIPT" || t === "STYLE" || t === "NOSCRIPT" || t === "TEXTAREA" || t === "INPUT") return 2;
+    // Never mutate editable regions, hidden/inert subtrees or template
+    // content: rewriting a text node under a contenteditable would fight the
+    // page's own editing state.
+    if (el.closest && el.closest("[contenteditable],[hidden],[inert],template")) return 2;
     return 1;
   }});
   var nodes = [], n;
-  while ((n = walker.nextNode())) nodes.push(n);
+  // Bound traversal, not just marks: a huge page must not walk its whole
+  // DOM for one query.
+  while ((n = walker.nextNode()) && nodes.length < 2000) nodes.push(n);
   for (var k = 0; k < nodes.length && marks.length < 500; k++) {
     var node = nodes[k];
     if (!node.parentNode) continue;
