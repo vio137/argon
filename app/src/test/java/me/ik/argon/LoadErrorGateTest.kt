@@ -59,9 +59,16 @@ fun main() {
     run {
         val g = LoadErrorGate()
         check(!g.shouldShowError("wv1", "pX", 0), "gen0 with no identity dropped")
-        g.onTopLevelLoad("wv1", "pX", 0)
-        check(g.current == null, "gen0 start does not set identity")
         check(!g.shouldShowError("wv1", "pX", 0), "gen0 error dropped")
+    }
+    // 7b. gen0 start (fail-closed overflow) clears a previous identity
+    run {
+        val g = LoadErrorGate()
+        g.onTopLevelLoad("wv1", "p1", 1)
+        g.onTopLevelLoad("wv1", "p2", 0)
+        check(g.current == null, "gen0 start clears identity")
+        check(!g.shouldShowError("wv1", "p1", 1), "pre-overflow error dropped after gen0 start")
+        check(!g.shouldShowError("wv1", "p2", 0), "overflow load error never shows")
     }
     // 8. lifecycle: invalidation then fresh start
     run {

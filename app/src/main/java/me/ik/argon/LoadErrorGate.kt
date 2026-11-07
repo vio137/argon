@@ -21,10 +21,11 @@ class LoadErrorGate {
     var current: Identity? = null
         private set
 
-    /** Engine: a top-level load started; adopt its identity. */
+    /** Engine: a top-level load started; adopt its identity. Generation 0
+     * marks an untracked load (fail-closed overflow policy); it clears the
+     * identity rather than adopting one, so no error can match. */
     fun onTopLevelLoad(webviewId: String, pipelineId: String, generation: Long) {
-        if (generation == 0L) return
-        current = Identity(webviewId, pipelineId, generation)
+        current = if (generation == 0L) null else Identity(webviewId, pipelineId, generation)
     }
 
     /** App: the user just initiated any navigation; drop the old identity now. */

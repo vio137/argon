@@ -109,3 +109,10 @@ site-loading and browsing performance before drawing conclusions.
   superseded pending load, out-of-order delivery, untracked gen, lifecycle
   reset) - compiled and run with the standalone kotlinc recipe, all pass;
   the full Gradle unit-test task remains unrun.
+- v3.1 (current): generation overflow is fail-closed (checked_add; on
+  exhaustion the start is announced with generation 0, which never matches
+  app-side, instead of reusing a saturated max generation), and auxiliary
+  webview creation (handle_script_new_auxiliary) announces its initial
+  top-level load's identity so auxiliary failures are matchable like any
+  other. Gate: a gen-0 start clears the identity. 19 standalone assertions
+  pass.
