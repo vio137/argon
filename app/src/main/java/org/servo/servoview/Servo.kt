@@ -57,7 +57,6 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 
-@Composable
 /**
  * Engine patch 052 clock basis: the engine gets ONE monotonic clock basis -
  * the SystemClock.uptimeMillis() base at nanosecond precision - for both
@@ -82,6 +81,7 @@ private fun frameTsToUptimeNanos(frameTs: Long): Long {
     return frameTs - nanoToUptimeOffset
 }
 
+@Composable
 fun Servo(
     experimentalModeEnabled: Boolean,
     args: String?,
