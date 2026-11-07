@@ -46,7 +46,33 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private val timeFormat = SimpleDateFormat("MMM d, h:mm a", Locale.getDefault())
+private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
+private val dayFormat = SimpleDateFormat("EEE, MMM d", Locale.getDefault())
+private val dayYearFormat = SimpleDateFormat("EEE, MMM d, yyyy", Locale.getDefault())
+
+/** Start of the local day containing [time], used as the grouping key. */
+private fun dayStartMs(time: Long): Long {
+    val cal = Calendar.getInstance()
+    cal.timeInMillis = time
+    cal.set(Calendar.HOUR_OF_DAY, 0)
+    cal.set(Calendar.MINUTE, 0)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    return cal.timeInMillis
+}
+
+private fun dayLabel(dayStart: Long, now: Long = System.currentTimeMillis()): String {
+    val today = dayStartMs(now)
+    return when (dayStart) {
+        today -> "Today"
+        dayStartMs(now - 86_400_000L) -> "Yesterday"
+        else -> {
+            val thisYear = Calendar.getInstance().apply { timeInMillis = now }.get(Calendar.YEAR)
+            val thatYear = Calendar.getInstance().apply { timeInMillis = dayStart }.get(Calendar.YEAR)
+            (if (thatYear == thisYear) dayFormat else dayYearFormat).format(Date(dayStart))
+        }
+    }
+}
 
 @Composable
 private fun PageTopBar(
@@ -125,7 +151,16 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                 }
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
-                    items(shown, key = { it.url + it.time }) { entry ->
+                    shown.groupBy { dayStartMs(it.time) }.forEach { (dayStart, dayEntries) ->
+                        item(key = "day-$dayStart") {
+                            Text(
+                                dayLabel(dayStart),
+                                color = ArgonColors.Text3,
+                                style = ArgonType.Caption,
+                                modifier = Modifier.padding(start = 20.dp, top = 14.dp, bottom = 2.dp),
+                            )
+                        }
+                        items(dayEntries, key = { it.url + it.time }) { entry ->
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier =
@@ -151,6 +186,7 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                             }) {
                                 Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
                             }
+                        }
                         }
                     }
                 }
