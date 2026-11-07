@@ -207,7 +207,7 @@ internal fun PrivacyPage(adblock: Boolean, onAdblockChange: (Boolean) -> Unit) {
     Column {
         PageHeader(
             "Blocking, on by default.",
-            "Blocking happens on the device against a bundled list. Nothing you browse is sent to us - there is no us.",
+            "Blocking happens on this device against a bundled list. No account or sign-up needed.",
         )
         Row(
             verticalAlignment = Alignment.CenterVertically,
