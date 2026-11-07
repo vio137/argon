@@ -87,6 +87,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.preference.PreferenceManager
 import me.ik.argon.R
+import me.ik.argon.wax.FreshWaxImport
+import me.ik.argon.wax.FreshWaxIntent
+import me.ik.argon.wax.FreshWaxManagedStore
+import me.ik.argon.wax.FreshWaxManagementDialog
+import me.ik.argon.wax.FreshWaxSession
+import me.ik.argon.wax.WaxConnection
+import me.ik.argon.wax.WaxEffect
+import me.ik.argon.wax.WaxIntentReader
+import me.ik.argon.wax.WaxManagement
+import me.ik.argon.wax.WaxManagementState
+import me.ik.argon.wax.WaxSessionFactory
+import me.ik.argon.wax.WaxStartup
+import me.ik.argon.wax.WaxStartupPlan
+import me.ik.argon.wax.WaxStoredIntent
 import org.servo.servoview.Servo
 import org.servo.servoview.ServoNavigator
 import org.servo.servoview.ServoHolder
@@ -196,6 +210,25 @@ class MainActivity : ComponentActivity(), Servo.Client {
                     else "Bookmark import failed - not a recognized bookmarks file."
             }
         }
+
+    private val waxProfileLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                val ok =
+                    runCatching {
+                            val bytes = FreshWaxImport.read(this, uri)
+                            try {
+                                waxStore.saveProfile(bytes)
+                            } finally {
+                                bytes.fill(0)
+                            }
+                            true
+                        }
+                        .getOrElse { false }
+                alertMessage = if (ok) "waX profile stored privately." else "waX profile import failed."
+                refreshWaxState()
+            }
+        }
     private var experimental by mutableStateOf(false)
 
     companion object {
@@ -239,6 +272,15 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var searchEngine by mutableStateOf(SearchEngine.GOOGLE)
     private var omniboxFocused by mutableStateOf(false)
     private var restartDialog by mutableStateOf(false)
+    // waX integration (in progress - not a verified native feature). Startup gate
+    // runs BEFORE engine init and only appends proxy prefs for a live blocked
+    // session; Stop never falls back to direct networking. OFF is the default.
+    private lateinit var waxStore: FreshWaxManagedStore
+    private lateinit var waxIntent: FreshWaxIntent
+    private var waxSession: FreshWaxSession? = null
+    private var waxConnection = WaxConnection.OFF
+    private var waxPlanPrefs: List<String> = emptyList()
+    private var waxStopReason by mutableStateOf<WaxStartupPlan.Reason?>(null)
 
     private lateinit var prefs: SharedPreferences
     private lateinit var history: HistoryStore
@@ -307,10 +349,28 @@ class MainActivity : ComponentActivity(), Servo.Client {
         // bench variant (e.g. layout_threads=(cores/2).coerceIn(3,6)) must be an
         // explicit opt-in build via ENGINE_PREFS and win on measured scroll
         // metrics before it can ship - no unmeasured tuning in the default build.
+        waxStore = FreshWaxManagedStore(this)
+        waxIntent = FreshWaxIntent(this)
+        val waxStartup =
+            WaxStartup(
+                WaxIntentReader { waxIntent.read() },
+                WaxSessionFactory { FreshWaxSession.createBlocked().also { waxSession = it } },
+            )
+        when (val waxPlan = waxStartup.beforeEngineInit()) {
+            is WaxStartupPlan.Stop -> waxStopReason = waxPlan.reason
+            is WaxStartupPlan.Enabled -> {
+                waxPlanPrefs = waxPlan.additionalPrefValues()
+                waxConnection = WaxConnection.BLOCKED
+            }
+            WaxStartupPlan.Stock -> {}
+        }
         val engineArgs =
             org.json.JSONArray().apply {
                 put("--user-agent"); put(ENGINE_UA)
                 putAll(ENGINE_PREFS)
+                for (kv in waxPlanPrefs) {
+                    put("--pref"); put(kv)
+                }
             }.toString()
         // Redact credentials before logging: engine args may carry URIs
         // (e.g. proxy prefs) with embedded user:pass - never log secrets.
@@ -358,6 +418,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 val focusManager = LocalFocusManager.current
                 uiScope = rememberCoroutineScope()
                 Box(Modifier.fillMaxSize().background(ArgonColors.Bg)) {
+                    if (waxStopReason == null) {
                     Servo(
                         experimentalModeEnabled = experimental,
                         // Engine init args (JSON array, parsed by servoshell's CLI).
@@ -381,6 +442,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 .imePadding()
                                 .focusRequester(servoFocusRequester),
                     )
+                    }
                     LaunchedEffect(Unit) { servoFocusRequester.requestFocus() }
                     loadError?.let { err ->
                         me.ik.argon.ui.LoadErrorCard(
@@ -568,6 +630,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             onSettings = {
                                 showMenu = false
                                 screen = Screen.Settings
+                            },
+                            onWax = {
+                                showMenu = false
+                                showWaxManager()
                             },
                             onAbout = {
                                 showMenu = false
@@ -764,6 +830,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 }
             }
         }
+        waxStopReason?.let { showWaxStopDialog(it) }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -816,6 +883,93 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         startActivity(launch)
         Runtime.getRuntime().exit(0)
+    }
+
+    private fun refreshWaxState(): WaxManagementState {
+        val wanted = waxIntent.read() == WaxStoredIntent.Enabled
+        val processEnabled = waxSession != null
+        return WaxManagementState(
+            connection = waxConnection,
+            consentAccepted = waxStore.consented(),
+            hasProfile = waxStore.hasProfile(),
+            processEnabled = processEnabled,
+            wantedEnabled = wanted,
+            restartRequired = wanted != processEnabled,
+        )
+    }
+
+    private fun showWaxManager() {
+        FreshWaxManagementDialog.show(this, refreshWaxState()) { action ->
+            handleWaxEffect(WaxManagement.effect(refreshWaxState(), action))
+        }
+    }
+
+    private fun handleWaxEffect(effect: WaxEffect) {
+        when (effect) {
+            WaxEffect.SHOW_NOTICE ->
+                FreshWaxManagementDialog.showNotice(this) {
+                    waxIntent.acceptNoticeOff()
+                }
+            WaxEffect.OPEN_DOCUMENT_PICKER -> waxProfileLauncher.launch(arrayOf("*/*"))
+            WaxEffect.PERSIST_ENABLE_THEN_CLOSE -> {
+                waxStore.saveMode(true)
+                restartApp()
+            }
+            WaxEffect.PERSIST_DISABLE_THEN_CLOSE -> {
+                waxStore.saveMode(false)
+                restartApp()
+            }
+            WaxEffect.CONNECT_EXISTING_SESSION -> {
+                val session = waxSession ?: return
+                waxConnection = WaxConnection.CONNECTING
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val profile = waxStore.load()
+                    val code = if (profile != null) session.connect(profile) else -1
+                    profile?.fill(0)
+                    waxConnection =
+                        if (code == 0) WaxConnection.PEER_CONNECTED else WaxConnection.BLOCKED
+                }
+            }
+            WaxEffect.BLOCK_EXISTING_SESSION -> {
+                waxSession?.block()
+                waxConnection = if (waxSession != null) WaxConnection.BLOCKED else WaxConnection.OFF
+            }
+            WaxEffect.CONFIRM_DELETE_THEN_BLOCK_AND_DELETE -> {
+                waxSession?.block()
+                if (waxSession != null) waxConnection = WaxConnection.BLOCKED
+                waxStore.deleteProfile()
+            }
+            WaxEffect.EXPLAIN_PROVISIONING_UNAVAILABLE ->
+                FreshWaxManagementDialog.explainRegistration(this)
+            WaxEffect.NO_OP -> {}
+        }
+    }
+
+    private fun showWaxStopDialog(reason: WaxStartupPlan.Reason) {
+        val detail =
+            when (reason) {
+                WaxStartupPlan.Reason.INVALID_INTENT -> "The stored waX preference is unreadable."
+                WaxStartupPlan.Reason.INTENT_READ_FAILED ->
+                    "The stored waX preference could not be read."
+                WaxStartupPlan.Reason.NATIVE_UNAVAILABLE ->
+                    "The waX native library is not available in this build."
+                WaxStartupPlan.Reason.INVALID_LISTENER ->
+                    "waX could not open a safe local listener."
+                WaxStartupPlan.Reason.PROCESS_STATE_CHANGED ->
+                    "waX state changed while Argon was running."
+            }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("waX can't start")
+            .setMessage(
+                "$detail Argon did not fall back to ordinary direct browsing. Turn waX off to continue."
+            )
+            .setCancelable(false)
+            .setPositiveButton("Turn waX off and restart") { _, _ ->
+                waxStore.saveMode(false)
+                restartApp()
+            }
+            .setNegativeButton("Close Argon") { _, _ -> finishAndRemoveTask() }
+            .show()
     }
 
     /** Reads tabStripVersion + tabManager inside its own composition scope so

@@ -516,6 +516,7 @@ fun MenuSheet(
     onAddToStart: () -> Unit,
     onHistory: () -> Unit,
     onSettings: () -> Unit,
+    onWax: () -> Unit,
     onAbout: () -> Unit,
     onExit: () -> Unit,
 ) {
@@ -555,6 +556,7 @@ fun MenuSheet(
             SheetRow(R.drawable.ic_star, "Bookmarks", true, onBookmarks)
             SheetRow(R.drawable.ic_history, "History", true, onHistory)
             SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
+            SheetRow(R.drawable.ic_shield, "waX", true, onWax)
             SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
             SheetRow(R.drawable.ic_exit, "Quit Argon", true, onExit)
         }
