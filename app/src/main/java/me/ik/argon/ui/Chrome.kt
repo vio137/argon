@@ -212,20 +212,15 @@ fun ArgonCommandBar(
                     } else {
                         ChromeGlyph(leadingGlyphRes(focused), null, ArgonColors.Text3)
                     }
-                    Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                        if (urlState.text.isEmpty()) {
-                            androidx.compose.material3.Text(
-                                "Search or enter address",
-                                color = ArgonColors.Text3,
-                                style = ArgonType.BodySmall,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
+                    Box(Modifier.weight(1f).padding(horizontal = 10.dp), contentAlignment = Alignment.CenterStart) {
                         BasicTextField(
                             state = urlState,
                             lineLimits = TextFieldLineLimits.SingleLine,
-                            textStyle = ArgonType.BodySmall.copy(color = ArgonColors.Text),
+                            // Idle text is painted by the ellipsizing overlay
+                            // below; the field's own text is visible only while
+                            // editing, where horizontal scroll is the correct
+                            // affordance for the full URL.
+                            textStyle = ArgonType.BodySmall.copy(color = if (focused) ArgonColors.Text else Color.Transparent),
                             cursorBrush = SolidColor(ArgonColors.Accent),
                             keyboardOptions =
                                 KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
@@ -245,6 +240,19 @@ fun ArgonCommandBar(
                                     }
                                     .onFocusChanged { onFocusChange(it.isFocused) },
                         )
+                        if (!focused) {
+                            // Idle display: always ellipsized, never silently
+                            // clipped. The overlay carries no pointer handler,
+                            // so taps fall through to the field beneath.
+                            androidx.compose.material3.Text(
+                                urlState.text.toString().ifEmpty { "Search or enter address" },
+                                color = if (urlState.text.isEmpty()) ArgonColors.Text3 else ArgonColors.Text,
+                                style = ArgonType.BodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
                     }
                     AnimatedVisibility(visible = urlState.text.isNotEmpty() && focused) {
                         ChromeIconButton(
@@ -350,3 +358,4 @@ private fun ChromeGlyph(res: Int, description: String?, tint: Color) {
         modifier = Modifier.size(20.dp),
     )
 }
+

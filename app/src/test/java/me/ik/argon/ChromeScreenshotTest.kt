@@ -1,12 +1,20 @@
 package me.ik.argon
 
+import androidx.activity.OnBackPressedDispatcher
+import androidx.activity.OnBackPressedDispatcherOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import java.io.File
 import me.ik.argon.ui.ArgonTabStrip
 import me.ik.argon.ui.TabStripData
 import app.cash.paparazzi.DeviceConfig
@@ -215,6 +223,102 @@ class ChromeScreenshotTest {
                 onMenu = {},
                 loadingArc = {},
             )
+        }
+    }
+
+    private fun tempStoreFile(name: String) =
+        File(System.getProperty("java.io.tmpdir"), "argon-$name-${System.nanoTime()}.json")
+
+    @Test
+    fun historyPage() {
+        val history = HistoryStore(tempStoreFile("history"))
+        history.add("https://servo.org/docs", "Servo documentation")
+        history.add("https://github.com/servo/servo", "servo/servo: the Servo browser engine")
+        history.add("https://developer.mozilla.org/en-US/docs/Web", "MDN Web Docs")
+        val closed = RecentlyClosedStore(tempStoreFile("closed"))
+        closed.add("https://news.ycombinator.com", "Hacker News")
+        paparazzi.snapshot {
+            HistoryPage(
+                history = history,
+                onOpen = {},
+                onBack = {},
+                recentlyClosed = closed,
+                onReopenClosed = {},
+            )
+        }
+    }
+
+    @Test
+    fun bookmarksPage() {
+        val bookmarks = BookmarkStore(tempStoreFile("bookmarks"))
+        bookmarks.add("Servo", "https://servo.org")
+        bookmarks.add("GitHub", "https://github.com")
+        bookmarks.add("MDN Web Docs", "https://developer.mozilla.org")
+        bookmarks.add("A bookmark with a particularly long title to check row ellipsis behavior", "https://example.com/long")
+        paparazzi.snapshot {
+            BookmarksPage(bookmarks = bookmarks, onOpen = {}, onBack = {})
+        }
+    }
+
+    @Test
+    fun libraryPage() {
+        val bookmarks = BookmarkStore(tempStoreFile("lib-bm"))
+        bookmarks.add("Servo", "https://servo.org")
+        val history = HistoryStore(tempStoreFile("lib-hist"))
+        history.add("https://servo.org/docs", "Servo documentation")
+        paparazzi.snapshot {
+            LibraryPage(bookmarks = bookmarks, history = history, onOpen = {}, onBack = {})
+        }
+    }
+
+    /** Sheet content pixels only: modal lifecycle and sheet insets are not
+     *  covered by this harness (ModalBottomSheet hangs layoutlib). */
+    @Test
+    fun menuSheetContent() {
+        paparazzi.snapshot {
+            Box(Modifier.background(ArgonColors.Bg)) {
+                MenuSheetContent(
+                    canGoForward = true,
+                    shareEnabled = true,
+                    onShare = {},
+                    onFind = {},
+                    onCopyLink = {},
+                    onOpenIn = {},
+                    onBookmarks = {},
+                    currentHost = "servo.org",
+                    onForward = {},
+                    startPaged = false,
+                    startToggleEnabled = true,
+                    onAddToStart = {},
+                    onHistory = {},
+                    onSettings = {},
+                    onWax = {},
+                    onAbout = {},
+                    onExit = {},
+                )
+            }
+        }
+    }
+
+    @Test
+    fun onboardingWelcome() {
+        val owner =
+            object : OnBackPressedDispatcherOwner, LifecycleOwner {
+                private val registry = LifecycleRegistry(this)
+                override val onBackPressedDispatcher = OnBackPressedDispatcher()
+                override val lifecycle: Lifecycle
+                    get() = registry
+            }
+        paparazzi.snapshot {
+            CompositionLocalProvider(LocalOnBackPressedDispatcherOwner provides owner) {
+                OnboardingScreen(
+                    adblock = true,
+                    searchEngine = SearchEngine.entries.first(),
+                    onAdblockChange = {},
+                    onEngineChange = {},
+                    onDone = {},
+                )
+            }
         }
     }
 }

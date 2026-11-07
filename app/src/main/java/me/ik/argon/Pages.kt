@@ -2,6 +2,7 @@ package me.ik.argon
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -153,35 +154,32 @@ fun HistoryPage(
             }
             val closedShown = recentlyClosed?.entries.orEmpty()
             if (closedShown.isNotEmpty()) {
-                Text(
-                    "Recently closed tabs",
-                    color = ArgonColors.Text3,
-                    style = ArgonType.Caption,
-                    modifier = Modifier.padding(start = 20.dp, top = 14.dp, bottom = 2.dp),
-                )
-                closedShown.take(10).forEach { entry ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier =
-                            Modifier.fillMaxWidth()
-                                .clickable { onReopenClosed(entry) }
-                                .padding(horizontal = 20.dp, vertical = 10.dp),
-                    ) {
-                        HostGlyph(hostOf(entry.url))
-                        Spacer(Modifier.width(14.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(
-                                hostOf(entry.url),
-                                color = ArgonColors.Text3,
-                                style = ArgonType.Caption,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                SectionLabel("Recently closed tabs")
+                ListCard {
+                    closedShown.take(10).forEachIndexed { i, entry ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .clickable { onReopenClosed(entry) }
+                                    .padding(horizontal = 16.dp, vertical = 11.dp),
+                        ) {
+                            HostGlyph(hostOf(entry.url))
+                            Spacer(Modifier.width(14.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    hostOf(entry.url),
+                                    color = ArgonColors.Text3,
+                                    style = ArgonType.Caption,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
                         }
+                        if (i < closedShown.take(10).size - 1) ListDivider()
                     }
                 }
-                Spacer(Modifier.height(6.dp))
             }
             if (history.entries.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -194,41 +192,39 @@ fun HistoryPage(
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
                     shown.groupBy { dayStartMs(it.time) }.forEach { (dayStart, dayEntries) ->
-                        item(key = "day-$dayStart") {
-                            Text(
-                                dayLabel(dayStart),
-                                color = ArgonColors.Text3,
-                                style = ArgonType.Caption,
-                                modifier = Modifier.padding(start = 20.dp, top = 14.dp, bottom = 2.dp),
-                            )
-                        }
-                        items(dayEntries, key = { it.url + it.time }) { entry ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier =
-                                Modifier.fillMaxWidth()
-                                    .clickable { onOpen(entry.url) }
-                                    .padding(horizontal = 20.dp, vertical = 10.dp),
-                        ) {
-                            HostGlyph(hostOf(entry.url))
-                            Spacer(Modifier.width(14.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(
-                                    "${hostOf(entry.url)} · ${timeFormat.format(Date(entry.time))}",
-                                    color = ArgonColors.Text3,
-                                    style = ArgonType.Caption,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
+                        item(key = "day-$dayStart") { SectionLabel(dayLabel(dayStart)) }
+                        item(key = "card-$dayStart") {
+                            ListCard {
+                                dayEntries.forEachIndexed { i, entry ->
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier =
+                                            Modifier.fillMaxWidth()
+                                                .clickable { onOpen(entry.url) }
+                                                .padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
+                                    ) {
+                                        HostGlyph(hostOf(entry.url))
+                                        Spacer(Modifier.width(14.dp))
+                                        Column(Modifier.weight(1f)) {
+                                            Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Text(
+                                                "${hostOf(entry.url)} · ${timeFormat.format(Date(entry.time))}",
+                                                color = ArgonColors.Text3,
+                                                style = ArgonType.Caption,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        IconButton(onClick = {
+                                            history.remove(entry)
+                                            onCleared() // same refresh path as clear: start page Recent must not keep it
+                                        }) {
+                                            Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+                                    if (i < dayEntries.size - 1) ListDivider()
+                                }
                             }
-                            IconButton(onClick = {
-                                history.remove(entry)
-                                onCleared() // same refresh path as clear: start page Recent must not keep it
-                            }) {
-                                Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
-                            }
-                        }
                         }
                     }
                 }
@@ -288,22 +284,29 @@ fun LibraryPage(
     Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
         Column(Modifier.fillMaxSize()) {
             PageTopBar("Library", onBack)
+            // Segmented control: one hairline track, accent segment active.
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+                modifier =
+                    Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                        .clip(RoundedCornerShape(ArgonRadii.Control))
+                        .background(ArgonColors.BgRaise)
+                        .border(1.dp, ArgonColors.Hairline, RoundedCornerShape(ArgonRadii.Control))
+                        .padding(3.dp),
             ) {
                 listOf("Bookmarks", "History").forEachIndexed { index, label ->
                     val active = tab == index
-                    Surface(
-                        color = if (active) ArgonColors.Accent else ArgonColors.Surface,
-                        shape = RoundedCornerShape(999.dp),
-                        modifier = Modifier.clickable { tab = index },
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier =
+                            Modifier.clip(RoundedCornerShape(13.dp))
+                                .background(if (active) ArgonColors.Accent else Color.Transparent)
+                                .clickable { tab = index },
                     ) {
                         Text(
                             label,
                             color = if (active) ArgonColors.OnAccent else ArgonColors.Text2,
                             style = ArgonType.BodySmall,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 7.dp),
                         )
                     }
                 }
@@ -366,34 +369,39 @@ fun BookmarksPage(bookmarks: BookmarkStore, onOpen: (String) -> Unit, onBack: ()
                 }
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
-                    items(bookmarks.entries, key = { it.url }) { entry ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier =
-                                Modifier.fillMaxWidth()
-                                    .clickable { onOpen(entry.url) }
-                                    .padding(horizontal = 20.dp, vertical = 10.dp),
-                        ) {
-                            HostGlyph(hostOf(entry.url))
-                            Spacer(Modifier.width(14.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(
-                                    hostOf(entry.url),
-                                    color = ArgonColors.Text3,
-                                    style = ArgonType.Caption,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            IconButton(onClick = {
-                                renaming = entry
-                                renameText = entry.title
-                            }) {
-                                Icon(painterResource(R.drawable.ic_edit), contentDescription = "Rename", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
-                            }
-                            IconButton(onClick = { bookmarks.remove(entry) }) {
-                                Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                    item(key = "bookmarks-card") {
+                        ListCard {
+                            bookmarks.entries.forEachIndexed { i, entry ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier =
+                                        Modifier.fillMaxWidth()
+                                            .clickable { onOpen(entry.url) }
+                                            .padding(start = 16.dp, top = 4.dp, bottom = 4.dp),
+                                ) {
+                                    HostGlyph(hostOf(entry.url))
+                                    Spacer(Modifier.width(14.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(
+                                            hostOf(entry.url),
+                                            color = ArgonColors.Text3,
+                                            style = ArgonType.Caption,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                    IconButton(onClick = {
+                                        renaming = entry
+                                        renameText = entry.title
+                                    }) {
+                                        Icon(painterResource(R.drawable.ic_edit), contentDescription = "Rename", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                                    }
+                                    IconButton(onClick = { bookmarks.remove(entry) }) {
+                                        Icon(painterResource(R.drawable.ic_close), contentDescription = "Remove", tint = ArgonColors.Text3, modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                                if (i < bookmarks.entries.size - 1) ListDivider()
                             }
                         }
                     }
@@ -628,6 +636,37 @@ fun SettingsScreen(
     }
 }
 
+/** v2 section label (uppercase micro-heading) shared by pages. */
+@Composable
+private fun SectionLabel(label: String) {
+    Text(
+        label.uppercase(),
+        color = ArgonColors.Text3,
+        style = ArgonType.Section,
+        modifier = Modifier.padding(start = 20.dp, top = 18.dp, bottom = 8.dp),
+    )
+}
+
+/** v2 list card: hairline-outlined raised surface grouping related rows. */
+@Composable
+private fun ListCard(content: @Composable () -> Unit) {
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .clip(RoundedCornerShape(ArgonRadii.Card))
+                .background(ArgonColors.BgRaise)
+                .border(1.dp, ArgonColors.Hairline, RoundedCornerShape(ArgonRadii.Card)),
+    ) {
+        content()
+    }
+}
+
+@Composable
+private fun ListDivider() {
+    Box(Modifier.fillMaxWidth().height(1.dp).background(ArgonColors.Hairline))
+}
+
 @Composable
 private fun SettingsLabel(label: String) {
     Text(
@@ -703,6 +742,84 @@ private fun SettingClick(title: String, subtitle: String?, danger: Boolean = fal
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
+internal fun MenuSheetContent(
+    canGoForward: Boolean,
+    shareEnabled: Boolean,
+    onShare: () -> Unit,
+    onFind: () -> Unit,
+    onCopyLink: () -> Unit,
+    onOpenIn: () -> Unit,
+    onBookmarks: () -> Unit,
+    currentHost: String,
+    onForward: () -> Unit,
+    startPaged: Boolean,
+    startToggleEnabled: Boolean,
+    onAddToStart: () -> Unit,
+    onHistory: () -> Unit,
+    onSettings: () -> Unit,
+    onWax: () -> Unit,
+    onAbout: () -> Unit,
+    onExit: () -> Unit,
+) {
+    Column(Modifier.padding(bottom = 40.dp)) {
+            // Context header: what page these actions apply to.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
+            ) {
+                HostGlyph(currentHost)
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        currentHost.ifEmpty { "Argon" },
+                        color = ArgonColors.Text,
+                        style = ArgonType.Heading,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text("Page actions", color = ArgonColors.Text3, style = ArgonType.Caption)
+                }
+            }
+            SheetLabel("This page")
+            ListCard {
+                SheetRow(R.drawable.ic_search, "Find in page", shareEnabled, onFind)
+                ListDivider()
+                SheetRow(R.drawable.ic_share, "Share page", shareEnabled, onShare)
+                ListDivider()
+                SheetRow(R.drawable.ic_copy, "Copy link", shareEnabled, onCopyLink)
+                ListDivider()
+                SheetRow(R.drawable.ic_open_in, "Open in another app", shareEnabled, onOpenIn)
+                ListDivider()
+                SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
+                ListDivider()
+                SheetRow(
+                    R.drawable.ic_star,
+                    if (startPaged) "Remove from start page" else "Add to start page",
+                    startToggleEnabled,
+                    onAddToStart,
+                )
+            }
+            SheetLabel("App")
+            ListCard {
+                SheetRow(R.drawable.ic_star, "Bookmarks", true, onBookmarks)
+                ListDivider()
+                SheetRow(R.drawable.ic_history, "History", true, onHistory)
+                ListDivider()
+                SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
+                ListDivider()
+                SheetRow(R.drawable.ic_shield, "waX", true, onWax)
+                ListDivider()
+                SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
+                ListDivider()
+                SheetRow(R.drawable.ic_exit, "Quit Argon", true, onExit)
+            }
+        }
+}
+
+/** Modal host for the sheet. The host-render lane snapshots [MenuSheetContent]
+ *  directly: content pixels only - modal lifecycle and sheet insets excluded. */
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun MenuSheet(
     canGoForward: Boolean,
     shareEnabled: Boolean,
@@ -723,46 +840,12 @@ fun MenuSheet(
     onAbout: () -> Unit,
     onExit: () -> Unit,
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = ArgonColors.Surface) {
-        Column(Modifier.padding(bottom = 40.dp)) {
-            // Context header: what page these actions apply to.
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
-            ) {
-                HostGlyph(currentHost)
-                Spacer(Modifier.width(14.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        currentHost.ifEmpty { "Argon" },
-                        color = ArgonColors.Text,
-                        style = ArgonType.Heading,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text("Page actions", color = ArgonColors.Text3, style = ArgonType.Caption)
-                }
-            }
-            SheetLabel("This page")
-            SheetRow(R.drawable.ic_search, "Find in page", shareEnabled, onFind)
-            SheetRow(R.drawable.ic_share, "Share page", shareEnabled, onShare)
-            SheetRow(R.drawable.ic_copy, "Copy link", shareEnabled, onCopyLink)
-            SheetRow(R.drawable.ic_open_in, "Open in another app", shareEnabled, onOpenIn)
-            SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
-            SheetRow(
-                R.drawable.ic_star,
-                if (startPaged) "Remove from start page" else "Add to start page",
-                startToggleEnabled,
-                onAddToStart,
-            )
-            SheetLabel("App")
-            SheetRow(R.drawable.ic_star, "Bookmarks", true, onBookmarks)
-            SheetRow(R.drawable.ic_history, "History", true, onHistory)
-            SheetRow(R.drawable.ic_settings, "Settings", true, onSettings)
-            SheetRow(R.drawable.ic_shield, "waX", true, onWax)
-            SheetRow(R.drawable.ic_info, "About Argon", true, onAbout)
-            SheetRow(R.drawable.ic_exit, "Quit Argon", true, onExit)
-        }
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = ArgonColors.Bg) {
+        MenuSheetContent(
+            canGoForward, shareEnabled, onShare, onFind, onCopyLink, onOpenIn,
+            onBookmarks, currentHost, onForward, startPaged, startToggleEnabled,
+            onAddToStart, onHistory, onSettings, onWax, onAbout, onExit,
+        )
     }
 }
 
@@ -783,10 +866,10 @@ private fun HostGlyph(host: String) {
 @Composable
 private fun SheetLabel(label: String) {
     Text(
-        label,
+        label.uppercase(),
         color = ArgonColors.Text3,
-        style = ArgonType.Caption,
-        modifier = Modifier.padding(start = 24.dp, top = 16.dp, bottom = 4.dp),
+        style = ArgonType.Section,
+        modifier = Modifier.padding(start = 20.dp, top = 16.dp, bottom = 8.dp),
     )
 }
 
@@ -798,7 +881,7 @@ private fun SheetRow(icon: Int, label: String, enabled: Boolean, onClick: () -> 
             Modifier.fillMaxWidth()
                 .alpha(if (enabled) 1f else 0.38f)
                 .clickable(enabled = enabled, onClick = onClick)
-                .padding(horizontal = 24.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 11.dp),
     ) {
         Box(
             contentAlignment = Alignment.Center,
@@ -832,3 +915,4 @@ fun AboutDialog(onDismiss: () -> Unit) {
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
     )
 }
+

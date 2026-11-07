@@ -160,8 +160,8 @@ private inline fun <reified T> loadStore(file: File): LoadedStore<T> {
     }
 }
 
-class HistoryStore(context: Context) {
-    private val file = File(context.filesDir, "history.json")
+class HistoryStore internal constructor(private val file: File) {
+    constructor(context: Context) : this(File(context.filesDir, "history.json"))
 
     var entries: List<HistoryEntry> = emptyList()
         private set
@@ -230,8 +230,8 @@ class HistoryStore(context: Context) {
 /** Tabs the user or engine closed most recently, for "reopen closed tab".
  * Same durability semantics as HistoryStore: corrupt originals are preserved,
  * never overwritten; in-memory session state keeps working on save failure. */
-class RecentlyClosedStore(context: Context) {
-    private val file = File(context.filesDir, "recently_closed.json")
+class RecentlyClosedStore internal constructor(private val file: File) {
+    constructor(context: Context) : this(File(context.filesDir, "recently_closed.json"))
 
     var entries: List<HistoryEntry> = emptyList()
         private set
@@ -274,8 +274,8 @@ class RecentlyClosedStore(context: Context) {
     internal fun flushSaves(): SaveQueue.FlushResult = saveQueue.flush()
 }
 
-class BookmarkStore(context: Context) {
-    private val file = File(context.filesDir, "bookmarks.json")
+class BookmarkStore internal constructor(private val file: File) {
+    constructor(context: Context) : this(File(context.filesDir, "bookmarks.json"))
 
     var entries: List<Bookmark> = emptyList()
         private set

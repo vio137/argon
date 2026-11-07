@@ -8,6 +8,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -145,7 +146,7 @@ private fun OnboardingButton(label: String, primary: Boolean, onClick: () -> Uni
             Modifier
                 .height(48.dp)
                 .clip(RoundedCornerShape(24.dp))
-                .background(if (primary) ArgonColors.Text else ArgonColors.SurfaceHigh)
+                .background(if (primary) ArgonColors.Accent else ArgonColors.SurfaceHigh)
                 .padding(horizontal = 24.dp)
                 .selectable(selected = false, enabled = true, role = Role.Button, onClick = onClick)
                 .semantics { contentDescription = label },
@@ -213,8 +214,9 @@ private fun PrivacyPage(adblock: Boolean, onAdblockChange: (Boolean) -> Unit) {
             modifier =
                 Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(ArgonColors.Surface)
+                    .clip(RoundedCornerShape(ArgonRadii.Card))
+                    .background(ArgonColors.BgRaise)
+                    .border(1.dp, ArgonColors.Hairline, RoundedCornerShape(ArgonRadii.Card))
                     .padding(horizontal = 20.dp, vertical = 16.dp),
         ) {
             Column(Modifier.weight(1f)) {
@@ -281,3 +283,4 @@ private fun EnginePage(searchEngine: SearchEngine, onEngineChange: (SearchEngine
         }
     }
 }
+
