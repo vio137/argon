@@ -7,7 +7,10 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -92,32 +95,30 @@ fun ArgonTabStrip(
                     // site (site monogram placeholder until a favicon pipeline
                     // lands); close only on the active chip so background chips
                     // stay tap targets.
-                    Text(
-                        label.firstOrNull()?.uppercase() ?: "?",
-                        color = if (selected) ArgonColors.Accent else siteTint(label),
-                        style = ArgonType.Caption,
-                        modifier =
-                            Modifier.padding(
-                                start = 14.dp,
-                                top = 10.dp,
-                                bottom = 10.dp,
-                                end = if (selected) 2.dp else 14.dp,
-                            ),
-                    )
-                    if (selected) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.height(48.dp)) {
                         Text(
-                            "×",
-                            color = ArgonColors.Text3,
-                            fontSize = 15.sp,
+                            label.firstOrNull()?.uppercase() ?: "?",
+                            color = if (selected) ArgonColors.Accent else siteTint(label),
+                            style = ArgonType.Caption,
                             modifier =
-                                Modifier.clickable { onClose(id) }
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                Modifier.padding(
+                                    start = 16.dp,
+                                    end = if (selected) 2.dp else 16.dp,
+                                ),
                         )
+                    }
+                    if (selected) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.size(48.dp).clickable { onClose(id) },
+                        ) {
+                            Text("×", color = ArgonColors.Text3, fontSize = 15.sp)
+                        }
                     }
                 } else {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 2.dp),
+                    modifier = Modifier.height(48.dp).padding(start = 12.dp),
                 ) {
                     Text(
                         label,
@@ -128,25 +129,22 @@ fun ArgonTabStrip(
                         modifier = Modifier.widthIn(max = 120.dp),
                     )
                     if (selected || showCloseOnBackground) {
-                    Text(
-                        "×",
-                        color = ArgonColors.Text3,
-                        fontSize = 15.sp,
-                        modifier =
-                            Modifier.clickable { onClose(id) }
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                    )
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.size(48.dp).clickable { onClose(id) },
+                    ) {
+                        Text("×", color = ArgonColors.Text3, fontSize = 15.sp)
+                    }
                     }
                 }
                 }
             }
         }
-        Text(
-            "+",
-            color = ArgonColors.Text2,
-            style = ArgonType.Heading,
-            modifier =
-                Modifier.clickable { onNew() }.padding(horizontal = 14.dp, vertical = 10.dp),
-        )
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.size(48.dp).clickable { onNew() },
+        ) {
+            Text("+", color = ArgonColors.Text2, style = ArgonType.Heading)
+        }
     }
 }

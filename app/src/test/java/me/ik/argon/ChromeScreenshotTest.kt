@@ -24,6 +24,7 @@ class ChromeScreenshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_6)
 
+
     @Test
     fun commandDeckIdle() {
         paparazzi.snapshot {
@@ -160,6 +161,59 @@ class ChromeScreenshotTest {
                 onClose = {},
                 onNew = {},
                 onLongPress = {},
+            )
+        }
+    }
+
+    @Test
+    fun settingsScreen() {
+        paparazzi.snapshot {
+            SettingsScreen(
+                adblock = true,
+                onAdblock = {},
+                searchEngine = SearchEngine.entries.first(),
+                onSearchEngine = {},
+                experimental = false,
+                onExperimental = {},
+                httpsOnly = true,
+                onHttpsOnly = {},
+                clearOnExit = false,
+                onClearOnExit = {},
+                omniboxShortcut = OmniboxShortcut.NONE,
+                onOmniboxShortcut = {},
+                compactTabs = false,
+                onCompactTabs = {},
+                closeButtonsBackgroundTabs = true,
+                onCloseButtonsBackgroundTabs = {},
+                onExportBookmarks = {},
+                onImportBookmarks = {},
+                onClearHistory = {},
+                onBack = {},
+            )
+        }
+    }
+
+    @Test
+    fun commandDeckNarrowLargeFont() {
+        // Small-phone width (~291dp at 2.75 density) with 1.3x font scale.
+        paparazzi.unsafeUpdateConfig(
+            deviceConfig = DeviceConfig.PIXEL_6.copy(screenWidth = 800, fontScale = 1.3f),
+        )
+        paparazzi.snapshot {
+            ArgonCommandBar(
+                urlState = TextFieldState("servo.org/docs"),
+                currentDisplayUrl = "servo.org",
+                canGoBack = true,
+                canGoForward = true,
+                isLoading = false,
+                focused = false,
+                onFocusChange = {},
+                onSubmit = {},
+                onBack = {},
+                onForward = {},
+                onStopOrReload = {},
+                onMenu = {},
+                loadingArc = {},
             )
         }
     }
