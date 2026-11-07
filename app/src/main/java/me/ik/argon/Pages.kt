@@ -260,7 +260,7 @@ private fun startOfTodayMs(): Long {
  * Range picker for clearing history. [onClear] receives the cutoff: entries
  * at or after it are deleted, or null for "delete everything".
  */
-@Composable
+
 /** User-configurable action for the omnibox leading icon (Vivaldi F). */
 enum class OmniboxShortcut(val label: String) {
     NONE("None - icon only"),
@@ -324,6 +324,7 @@ fun LibraryPage(
     }
 }
 
+@Composable
 private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
