@@ -13,7 +13,8 @@ object StartPage {
             }
         val recent =
             history.take(6).joinToString("") {
-                """<a class="row" href="${esc(it.url)}"><span class="rglyph" style="--h:${hostHue(host)}">${esc(hostOf(it.url).first().uppercaseChar().toString())}</span><span class="rtext"><span class="rtitle">${esc(it.title)}</span><span class="rhost">${esc(hostOf(it.url))}</span></span></a>"""
+                val host = hostOf(it.url)
+                """<a class="row" href="${esc(it.url)}"><span class="rglyph" style="--h:${hostHue(host)}">${esc(host.firstOrNull()?.uppercaseChar()?.toString() ?: "?")}</span><span class="rtext"><span class="rtitle">${esc(it.title)}</span><span class="rhost">${esc(host)}</span></span></a>"""
             }
         val html =
             """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Argon</title><style>
