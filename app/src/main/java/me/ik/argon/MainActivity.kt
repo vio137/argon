@@ -950,16 +950,36 @@ class MainActivity : ComponentActivity(), Servo.Client {
             if (!servo.closeTab(id)) return@launch
             val wasActive = tabManager.onClosed(id)
             tabStripVersion++
-            if (wasActive) {
-                // The engine has already activated the next-newest tab.
-                val newActive = servo.activeTabId()
-                if (newActive.isNotEmpty()) {
-                    tabManager.route(newActive)
-                    tabManager.markActive(newActive)
-                    loadError = null
-                    publishActiveTab()
-                    tabStripVersion++
-                }
+            if (wasActive) reconcileAfterActiveClosed()
+        }
+    }
+
+    /** Engine-initiated close (window.close, teardown; engine patch 030 v4):
+     * tombstone the id so no racing event can resurrect the tab, then
+     * reconcile the active tab if the closed one was showing. Ids the app
+     * never adopted are tombstoned too, closing the liveness gap for views
+     * that lived and died entirely engine-side. */
+    override fun onTabClosed(webviewId: String) {
+        val known = tabManager.states.containsKey(webviewId)
+        val wasActive = tabManager.onClosed(webviewId)
+        if (!known) return
+        tabStripVersion++
+        if (wasActive) reconcileAfterActiveClosed()
+    }
+
+    /** After the active tab closed (by app or engine), the engine has
+     * activated the next-newest; adopt its reported id and publish it. */
+    private fun reconcileAfterActiveClosed() {
+        val scope = uiScope ?: return
+        val servo = ServoHolder.servo ?: return
+        scope.launch {
+            val newActive = servo.activeTabId()
+            if (newActive.isNotEmpty()) {
+                tabManager.route(newActive)
+                tabManager.markActive(newActive)
+                loadError = null
+                publishActiveTab()
+                tabStripVersion++
             }
         }
     }

@@ -118,6 +118,11 @@ internal class JNIServo {
 
         fun onHistoryChanged(webviewId: String, canGoBack: Boolean, canGoForward: Boolean)
 
+        /** Argon (engine patch 030 v4): a webview was closed by the engine
+         * (window.close, teardown) - covers closes that never passed through
+         * the app's own closeTab, so the app can tombstone the id. */
+        fun onTabClosed(webviewId: String)
+
         fun onImeShow()
 
         fun onImeHide()

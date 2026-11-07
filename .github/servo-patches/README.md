@@ -110,6 +110,15 @@ site-loading and browsing performance before drawing conclusions.
   WebViewDelegate::request_create_new - the dropped CreateNewWebViewRequest
   auto-responds None (AutomaticResponder), so the script's window.open
   returns null (popup-blocker semantics, no half-created webview).
+- 030 v4 (current): close-lifecycle reconciliation. WebViewDelegate::
+  notify_closed now forwards to the host BEFORE removal (window.rs
+  PlatformWindow::notify_webview_closed default no-op, egl override, JNI
+  onTabClosed(id)), covering engine-initiated closes (window.close,
+  teardown) that bypass app-side close bookkeeping. The app tombstones every
+  reported id - including ids it never adopted (views that lived and died
+  entirely engine-side) - so monotonic-id uniqueness plus complete close
+  tombstoning closes the adoption liveness gap: an unknown, untombstoned id
+  can only be a live view.
 - Dialog safety (upstream behavior, verified in components/servo/
   webview_delegate.rs at the pinned revision): only the informational Alert
   reaches the app via onAlert; Confirm and Prompt fall through to the

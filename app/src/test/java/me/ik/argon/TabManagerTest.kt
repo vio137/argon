@@ -133,5 +133,27 @@ fun main() {
         check(tm.isActive("wv1"), "active tab alert displayable")
         check(!tm.isActive("wv2"), "background tab alert suppressed")
     }
+    // 13. engine-initiated close notification for a tab the app never saw
+    //     (lived and died engine-side): tombstone-only, no state change
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        check(!tm.onClosed("wvGhost"), "unknown engine-closed id: not an active close")
+        check(tm.isTombstoned("wvGhost"), "unknown engine-closed id tombstoned")
+        check(tm.route("wvGhost") == null, "ghost id events dropped forever")
+        check(tm.activeId == "wv1" && tm.order == listOf("wv1"), "live tabs unaffected")
+    }
+    // 14. engine-initiated close of the ACTIVE tab reports the close so the
+    //     caller reconciles against activeTabId()
+    run {
+        val tm = TabManager()
+        tm.route("wv1")
+        tm.route("wv2")
+        tm.markActive("wv2")
+        check(tm.onClosed("wv2"), "engine close of active tab reported")
+        check(tm.isTombstoned("wv2"), "active-closed id tombstoned")
+        tm.markActive("wv1") // engine-reported next active
+        check(tm.activeId == "wv1", "reconciled to engine-chosen tab")
+    }
     println("ALL TABMANAGER TESTS PASSED")
 }

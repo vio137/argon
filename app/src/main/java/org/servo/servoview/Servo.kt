@@ -588,6 +588,9 @@ internal constructor(
 
         fun onHistoryChanged(webviewId: String, canGoBack: Boolean, canGoForward: Boolean)
 
+        /** Engine-initiated webview close (engine patch 030 v4). */
+        fun onTabClosed(webviewId: String)
+
         fun onLoadError(
             webviewId: String,
             pipelineId: String,
@@ -700,6 +703,11 @@ internal constructor(
         // publish it to the navigator only when the source tab is active.
         override fun onHistoryChanged(webviewId: String, canGoBack: Boolean, canGoForward: Boolean) {
             scope.launch { client.onHistoryChanged(webviewId, canGoBack, canGoForward) }
+        }
+
+        override fun onTabClosed(webviewId: String) {
+            Log.i("ArgonNav", "tabClosed")
+            scope.launch { client.onTabClosed(webviewId) }
         }
     }
 }

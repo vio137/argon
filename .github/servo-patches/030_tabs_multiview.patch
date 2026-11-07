@@ -1,5 +1,5 @@
 diff --git a/ports/servoshell/egl/android/mod.rs b/ports/servoshell/egl/android/mod.rs
-index 20d4df6..3a43c84 100644
+index 20d4df6..9e220bc 100644
 --- a/ports/servoshell/egl/android/mod.rs
 +++ b/ports/servoshell/egl/android/mod.rs
 @@ -305,6 +305,79 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_loadUri<'local>(
@@ -159,7 +159,7 @@ index 20d4df6..3a43c84 100644
              })
              .unwrap();
      }
-@@ -628,29 +711,37 @@ impl HostTrait for HostCallbacks {
+@@ -628,29 +711,57 @@ impl HostTrait for HostCallbacks {
          debug!("on_shutdown_complete");
      }
  
@@ -179,10 +179,29 @@ index 20d4df6..3a43c84 100644
                  env.call_method(
                      callback_ref(),
                      jni_str!("onTitleChanged"),
--                    jni_sig!("(Ljava/lang/String;)V"),
--                    &[(&title_string).into()],
 +                    jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"),
 +                    &[(&wv_string).into(), (&title_string).into()],
++                )?;
++                Ok(())
++            })
++            .unwrap();
++    }
++
++    /// Argon (tabs, patch 030 v4): engine-initiated webview close.
++    fn on_tab_closed(&self, webview_id: WebViewId) {
++        debug!("on_tab_closed");
++        let webview_id = webview_id.to_string();
++        self.jvm
++            .attach_current_thread(|env| -> Result<(), Error> {
++                let Ok(wv_string) = new_string_as_jvalue(env, &webview_id) else {
++                    return Ok(());
++                };
++                env.call_method(
++                    callback_ref(),
++                    jni_str!("onTabClosed"),
+                     jni_sig!("(Ljava/lang/String;)V"),
+-                    &[(&title_string).into()],
++                    &[(&wv_string).into()],
                  )?;
                  Ok(())
              })
@@ -201,7 +220,7 @@ index 20d4df6..3a43c84 100644
                  let Ok(url_string) = new_string_as_jvalue(env, &url) else {
                      return Ok(());
                  };
-@@ -658,25 +749,29 @@ impl HostTrait for HostCallbacks {
+@@ -658,25 +769,29 @@ impl HostTrait for HostCallbacks {
                  env.call_method(
                      callback_ref(),
                      jni_str!("onUrlChanged"),
@@ -237,7 +256,7 @@ index 20d4df6..3a43c84 100644
                  Ok(())
              })
 diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
-index 2446e75..3e1f1b5 100644
+index 2446e75..58ff299 100644
 --- a/ports/servoshell/egl/app.rs
 +++ b/ports/servoshell/egl/app.rs
 @@ -89,11 +89,12 @@ impl PlatformWindow for EmbeddedPlatformWindow {
@@ -290,7 +309,18 @@ index 2446e75..3e1f1b5 100644
                  alert_dialog.confirm();
              },
              _ => {}, // The drop implementation will send the default response.
-@@ -428,6 +431,63 @@ impl App {
+@@ -214,6 +217,10 @@ impl PlatformWindow for EmbeddedPlatformWindow {
+         self.host.on_panic(reason, backtrace);
+     }
+ 
++    fn notify_webview_closed(&self, webview_id: WebViewId) {
++        self.host.on_tab_closed(webview_id);
++    }
++
+     fn notify_load_error(
+         &self,
+         _webview: WebView,
+@@ -428,6 +435,63 @@ impl App {
          self.state.window_for_webview(&webview).activate_webview(id);
      }
  
@@ -355,7 +385,7 @@ index 2446e75..3e1f1b5 100644
      /// everytime wakeup is called or when embedder wants Servo
      /// to act on its pending events.
 diff --git a/ports/servoshell/egl/host_trait.rs b/ports/servoshell/egl/host_trait.rs
-index 568f43f..77e0b6c 100644
+index 568f43f..ddae3aa 100644
 --- a/ports/servoshell/egl/host_trait.rs
 +++ b/ports/servoshell/egl/host_trait.rs
 @@ -6,7 +6,7 @@ use servo::{InputMethodControl, LoadErrorKind, LoadStatus, SelectElement, WebVie
@@ -376,10 +406,15 @@ index 568f43f..77e0b6c 100644
      /// A top-level load failed; `url` is the failed pipeline's recorded URL
      /// and `reason` is a fixed ASCII category token.
      /// [`LoadErrorKind::Tls`] failures never offer bypass.
-@@ -45,13 +45,16 @@ pub trait HostTrait {
+@@ -45,13 +45,21 @@ pub trait HostTrait {
          _generation: u64,
      ) {
      }
++    /// Argon (tabs, patch 030 v4): a webview was closed by the engine
++    /// (window.close, teardown) - app tombstones the id so no racing event
++    /// can resurrect it. Covers closes that bypass app-side bookkeeping.
++    fn on_tab_closed(&self, _webview_id: WebViewId) {}
++
 +    /// Argon (tabs, patch 030): every state callback carries its source
 +    /// webview id so the app routes events per tab; events from background
 +    /// or just-closed tabs can never land on the active tab.
@@ -397,7 +432,7 @@ index 568f43f..77e0b6c 100644
      fn on_shutdown_complete(&self);
      /// A text input is focused.
 diff --git a/ports/servoshell/running_app_state.rs b/ports/servoshell/running_app_state.rs
-index 201a247..a902121 100644
+index 201a247..75afbdb 100644
 --- a/ports/servoshell/running_app_state.rs
 +++ b/ports/servoshell/running_app_state.rs
 @@ -751,6 +751,11 @@ impl RunningAppState {
@@ -429,3 +464,30 @@ index 201a247..a902121 100644
          let platform_window = window.platform_window();
          let webview = request
              .builder(platform_window.rendering_context())
+@@ -821,6 +836,11 @@ impl WebViewDelegate for RunningAppState {
+ 
+     fn notify_closed(&self, webview: WebView) {
+         let webview_id = webview.id();
++        // Argon (engine patch 030 v4): notify the host BEFORE removal so the
++        // app can tombstone the id; covers engine-initiated closes
++        // (window.close, teardown) that bypass app-side close bookkeeping.
++        self.platform_window_for_webview(&webview)
++            .notify_webview_closed(webview_id);
+         self.pending_webdriver_events
+             .borrow_mut()
+             .retain(|_, (pending_webview_id, _)| *pending_webview_id != webview_id);
+diff --git a/ports/servoshell/window.rs b/ports/servoshell/window.rs
+index 01308a1..b170450 100644
+--- a/ports/servoshell/window.rs
++++ b/ports/servoshell/window.rs
+@@ -478,6 +478,10 @@ pub(crate) trait PlatformWindow {
+ 
+     fn notify_crashed(&self, _: WebView, _reason: String, _backtrace: Option<String>) {}
+ 
++    /// Argon (engine patch 030 v4): a webview was closed by the engine
++    /// (script window.close, constellation teardown). Default no-op.
++    fn notify_webview_closed(&self, _webview_id: WebViewId) {}
++
+     /// Argon (engine patch 020): a top-level load failed, carrying the
+     /// failing load's request identity. Default no-op; platforms that show
+     /// load errors override this.
