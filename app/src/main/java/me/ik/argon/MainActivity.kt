@@ -286,6 +286,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     private lateinit var prefs: SharedPreferences
     private lateinit var history: HistoryStore
+    private lateinit var recentlyClosed: RecentlyClosedStore
     private lateinit var bookmarks: BookmarkStore
     private val navigator get() = ServoHolder.navigator
 
@@ -341,6 +342,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         searchEngine = SearchEngine.fromPref(prefs.getString("engine", null))
         Blocklist.apply(this, adblock)
         history = HistoryStore(this)
+        recentlyClosed = RecentlyClosedStore(this)
         bookmarks = BookmarkStore(this)
         startPageUrl = StartPage.write(this, bookmarks.entries, history.entries, searchEngine)
         // Experiment: user stylesheet declaring script-fallback family names
@@ -525,6 +527,12 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 },
                                 onBack = { screen = Screen.Browser },
                                 onCleared = { refreshStartPage() },
+                                recentlyClosed = recentlyClosed,
+                                onReopenClosed = { entry ->
+                                    recentlyClosed.remove(entry)
+                                    navigate(entry.url)
+                                    screen = Screen.Browser
+                                },
                             )
                             }
                             BackHandler { screen = Screen.Browser }
@@ -1273,6 +1281,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         val servo = ServoHolder.servo ?: return
         scope.launch {
             if (!servo.closeTab(id)) return@launch
+            tabManager.states[id]?.let { recentlyClosed.add(it.url, it.title) }
             val wasActive = tabManager.onClosed(id)
             tabStripVersion++
             if (wasActive) reconcileAfterActiveClosed()
@@ -1287,6 +1296,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
     override fun onTabClosed(webviewId: String) {
         pendingContextMenu?.let { if (it.webviewId == webviewId) dismissContextMenu(it) }
         val known = tabManager.states.containsKey(webviewId)
+        if (known) tabManager.states[webviewId]?.let { recentlyClosed.add(it.url, it.title) }
         val wasActive = tabManager.onClosed(webviewId)
         if (!known) return
         tabStripVersion++

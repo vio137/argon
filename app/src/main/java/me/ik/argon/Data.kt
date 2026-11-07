@@ -227,6 +227,53 @@ class HistoryStore(context: Context) {
     internal fun flushSaves(): SaveQueue.FlushResult = saveQueue.flush()
 }
 
+/** Tabs the user or engine closed most recently, for "reopen closed tab".
+ * Same durability semantics as HistoryStore: corrupt originals are preserved,
+ * never overwritten; in-memory session state keeps working on save failure. */
+class RecentlyClosedStore(context: Context) {
+    private val file = File(context.filesDir, "recently_closed.json")
+
+    var entries: List<HistoryEntry> = emptyList()
+        private set
+
+    private var savesBlocked = false
+
+    init {
+        val loaded = loadStore<HistoryEntry>(file)
+        entries = loaded.entries
+        savesBlocked = loaded.quarantineFailed
+    }
+
+    @Synchronized
+    fun add(url: String, title: String) {
+        if (url.isBlank() || url == "about:blank") return
+        entries =
+            (listOf(HistoryEntry(url, title.ifBlank { url }, System.currentTimeMillis())) +
+                entries.filter { it.url != url })
+                .take(25)
+        save()
+    }
+
+    @Synchronized
+    fun remove(entry: HistoryEntry) {
+        entries = entries - entry
+        save()
+    }
+
+    private val saveQueue = SaveQueue()
+
+    private fun save() {
+        if (savesBlocked) {
+            setStoreHealthFlag(StoreHealth.corruptPreserveError)
+            return
+        }
+        val snapshot = entries
+        saveQueue.enqueue { writeStore(file, storeJson.encodeToString(snapshot)) }
+    }
+
+    internal fun flushSaves(): SaveQueue.FlushResult = saveQueue.flush()
+}
+
 class BookmarkStore(context: Context) {
     private val file = File(context.filesDir, "bookmarks.json")
 

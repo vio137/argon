@@ -94,7 +94,14 @@ private fun PageTopBar(
 }
 
 @Composable
-fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> Unit, onCleared: () -> Unit = {}) {
+fun HistoryPage(
+    history: HistoryStore,
+    onOpen: (String) -> Unit,
+    onBack: () -> Unit,
+    onCleared: () -> Unit = {},
+    recentlyClosed: RecentlyClosedStore? = null,
+    onReopenClosed: (HistoryEntry) -> Unit = {},
+) {
     var confirmClear by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf("") }
     val shown =
@@ -140,6 +147,38 @@ fun HistoryPage(history: HistoryStore, onOpen: (String) -> Unit, onBack: () -> U
                         }
                     }
                 }
+            }
+            val closedShown = recentlyClosed?.entries.orEmpty()
+            if (closedShown.isNotEmpty()) {
+                Text(
+                    "Recently closed tabs",
+                    color = ArgonColors.Text3,
+                    style = ArgonType.Caption,
+                    modifier = Modifier.padding(start = 20.dp, top = 14.dp, bottom = 2.dp),
+                )
+                closedShown.take(10).forEach { entry ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier =
+                            Modifier.fillMaxWidth()
+                                .clickable { onReopenClosed(entry) }
+                                .padding(horizontal = 20.dp, vertical = 10.dp),
+                    ) {
+                        HostGlyph(hostOf(entry.url))
+                        Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(entry.title, color = ArgonColors.Text, style = ArgonType.BodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                hostOf(entry.url),
+                                color = ArgonColors.Text3,
+                                style = ArgonType.Caption,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
             }
             if (history.entries.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
