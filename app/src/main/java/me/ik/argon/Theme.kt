@@ -31,6 +31,11 @@ object ArgonType {
     val Body = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Normal, lineHeight = 22.sp)
     val BodySmall = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Normal, lineHeight = 21.sp)
     val Caption = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Normal, lineHeight = 18.sp)
+
+    // Long-form reading (Reader view): article display sizes sit between
+    // Title and Hero, with a looser measure for paragraphs.
+    val ArticleTitle = TextStyle(fontSize = 25.sp, fontWeight = FontWeight.SemiBold, lineHeight = 31.sp)
+    val ArticleBody = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Normal, lineHeight = 27.sp)
 }
 
 // 4dp-base spacing scale.

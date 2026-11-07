@@ -415,7 +415,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 .background(ArgonColors.SurfaceHigh)
                                 .padding(horizontal = 14.dp, vertical = 8.dp),
                         ) {
-                            Text("Preparing reader view...", color = ArgonColors.Text, fontSize = 14.sp)
+                            Text("Preparing reader view...", color = ArgonColors.Text, style = ArgonType.Caption)
                         }
                     }
                     readerArticle?.let { article ->
@@ -570,7 +570,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         Text(
                             "Search or enter address",
                             color = ArgonColors.Text3,
-                            fontSize = 17.sp,
+                            style = ArgonType.Body,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -579,11 +579,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         state = urlState,
                         lineLimits = TextFieldLineLimits.SingleLine,
                         textStyle =
-                            TextStyle(
-                                color = ArgonColors.Text,
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.Normal,
-                            ),
+                            ArgonType.Body.copy(color = ArgonColors.Text),
                         keyboardOptions =
                             KeyboardOptions(
                                 keyboardType = KeyboardType.Uri,

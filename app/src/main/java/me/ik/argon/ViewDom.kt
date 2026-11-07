@@ -101,13 +101,12 @@ fun DomPage(dom: String, onBack: () -> Unit) {
             Text(
                 "View DOM",
                 color = ArgonColors.Text,
-                fontSize = 17.sp,
-                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                style = ArgonType.Heading,
             )
             Text(
                 "Current DOM of the page, not the original source",
                 color = ArgonColors.Text3,
-                fontSize = 12.sp,
+                style = ArgonType.Caption,
             )
         }
         SelectionContainer {
