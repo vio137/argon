@@ -13,7 +13,7 @@ index 1bd2728ef..1c5f0c2d9 100644
  };
  
  use super::app::{App, AppInitOptions};
-@@ -592,7 +592,46 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_keyup<'local>(
+@@ -592,7 +592,47 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_keyup<'local>(
      .resolve::<ThrowRuntimeExAndDefault>()
  }
  
@@ -57,6 +57,7 @@ index 1bd2728ef..1c5f0c2d9 100644
 +    .resolve::<ThrowRuntimeExAndDefault>()
 +}
 +
++#[unsafe(no_mangle)]
  pub extern "C" fn Java_org_servo_servoview_JNIServo_touchDown<'local>(
      mut env: EnvUnowned<'local>,
      _: JClass<'local>,
