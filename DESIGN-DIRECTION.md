@@ -102,6 +102,16 @@ reduced-motion compliance, 48dp touch targets, state-aware star toggle,
 onboarding skip + back steps, system-back chain with press-again exit,
 About version from BuildConfig, no shipped sample bookmarks, no Reader/ViewDOM
 (user-directed, effective until the user changes their intent).
+Long-press back shows recent pages (3cee996). Static-flow review fixes:
+suggestion recency tier, history records web only, find/suggestions overlap,
+blocklist refresh on bundled-asset change, cold VIEW intents honor httpsOnly,
+data: URLs never display in the omnibox. Data-safety layer: AtomicFile store
+writes, verified unique quarantine of corrupt files, digest-proven blocklist
+ownership (custom/unknown lists never overwritten), .bak recovery with no
+base-file gate.
+
+Candidate 2 was assembled from 3cee996 with this exact list (signed, held
+local; sha256 22cd091f... in the manifest, not delivered).
 
 Excluded from the next build: Reader view and View DOM (user's own words,
 2026-11-07; exclusion holds until the user changes their intent, it is not
