@@ -98,24 +98,26 @@ fun ArgonTabStrip(
                         style = ArgonType.Caption,
                         modifier =
                             Modifier.padding(
-                                start = 12.dp,
-                                top = 6.dp,
-                                bottom = 6.dp,
-                                end = if (selected) 2.dp else 12.dp,
+                                start = 14.dp,
+                                top = 10.dp,
+                                bottom = 10.dp,
+                                end = if (selected) 2.dp else 14.dp,
                             ),
                     )
                     if (selected) {
                         Text(
                             "×",
                             color = ArgonColors.Text3,
-                            fontSize = 14.sp,
-                            modifier = Modifier.clickable { onClose(id) }.padding(horizontal = 8.dp),
+                            fontSize = 15.sp,
+                            modifier =
+                                Modifier.clickable { onClose(id) }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
                         )
                     }
                 } else {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(start = 10.dp, top = 6.dp, bottom = 6.dp, end = 2.dp),
+                    modifier = Modifier.padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 2.dp),
                 ) {
                     Text(
                         label,
@@ -129,8 +131,10 @@ fun ArgonTabStrip(
                     Text(
                         "×",
                         color = ArgonColors.Text3,
-                        fontSize = 14.sp,
-                        modifier = Modifier.clickable { onClose(id) }.padding(horizontal = 8.dp),
+                        fontSize = 15.sp,
+                        modifier =
+                            Modifier.clickable { onClose(id) }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
                     )
                     }
                 }
@@ -141,7 +145,8 @@ fun ArgonTabStrip(
             "+",
             color = ArgonColors.Text2,
             style = ArgonType.Heading,
-            modifier = Modifier.clickable { onNew() }.padding(horizontal = 10.dp, vertical = 4.dp),
+            modifier =
+                Modifier.clickable { onNew() }.padding(horizontal = 14.dp, vertical = 10.dp),
         )
     }
 }

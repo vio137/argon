@@ -115,4 +115,52 @@ class ChromeScreenshotTest {
             }
         }
     }
+
+    @Test
+    fun tabStripCompactMonograms() {
+        paparazzi.snapshot {
+            ArgonTabStrip(
+                data =
+                    TabStripData(
+                        chips =
+                            listOf(
+                                "1" to "github.com",
+                                "2" to "wikipedia.org",
+                                "3" to "news.ycombinator.com",
+                                "4" to "servo.org",
+                                "5" to "developer.mozilla.org",
+                                "6" to "reddit.com",
+                            ),
+                        activeId = "2",
+                    ),
+                onSelect = {},
+                onClose = {},
+                onNew = {},
+                onLongPress = {},
+                compact = true,
+            )
+        }
+    }
+
+    @Test
+    fun tabStripLongTitles() {
+        paparazzi.snapshot {
+            ArgonTabStrip(
+                data =
+                    TabStripData(
+                        chips =
+                            listOf(
+                                "1" to "A very long page title that must ellipsize cleanly in the chip",
+                                "2" to "another quite lengthy document title for width pressure",
+                                "3" to "servo.org",
+                            ),
+                        activeId = "1",
+                    ),
+                onSelect = {},
+                onClose = {},
+                onNew = {},
+                onLongPress = {},
+            )
+        }
+    }
 }
