@@ -52,6 +52,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import me.ik.argon.ArgonColors
+import me.ik.argon.ArgonType
 import me.ik.argon.R
 
 /**
@@ -127,7 +128,7 @@ fun ArgonCommandBar(
                         androidx.compose.material3.Text(
                             "Search or enter address",
                             color = ArgonColors.Text3,
-                            fontSize = 17.sp,
+                            style = ArgonType.Body,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -136,11 +137,7 @@ fun ArgonCommandBar(
                         state = urlState,
                         lineLimits = TextFieldLineLimits.SingleLine,
                         textStyle =
-                            TextStyle(
-                                color = ArgonColors.Text,
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.Normal,
-                            ),
+                            ArgonType.Body.copy(color = ArgonColors.Text),
                         cursorBrush = SolidColor(ArgonColors.Accent),
                         keyboardOptions =
                             KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),

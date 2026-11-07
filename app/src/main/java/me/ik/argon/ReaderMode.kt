@@ -193,7 +193,7 @@ fun ReaderOverlay(article: ReaderArticle, onClose: () -> Unit) {
             Text(
                 "Reader view",
                 color = ArgonColors.Text3,
-                fontSize = 13.sp,
+                style = ArgonType.Caption,
                 modifier = Modifier.weight(1f),
             )
             IconButton(onClick = onClose) {
@@ -210,13 +210,11 @@ fun ReaderOverlay(article: ReaderArticle, onClose: () -> Unit) {
                     Text(
                         article.title,
                         color = ArgonColors.Text,
-                        fontSize = 25.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        lineHeight = 31.sp,
+                        style = ArgonType.ArticleTitle,
                     )
                     if (article.byline.isNotEmpty()) {
                         Spacer(Modifier.height(6.dp))
-                        Text(article.byline, color = ArgonColors.Text3, fontSize = 14.sp)
+                        Text(article.byline, color = ArgonColors.Text3, style = ArgonType.Caption)
                     }
                     Spacer(Modifier.height(10.dp))
                     Box(Modifier.fillMaxWidth().height(1.dp).background(ArgonColors.Hairline))
@@ -227,8 +225,7 @@ fun ReaderOverlay(article: ReaderArticle, onClose: () -> Unit) {
                 Text(
                     paragraph,
                     color = ArgonColors.Text,
-                    fontSize = 17.sp,
-                    lineHeight = 27.sp,
+                    style = ArgonType.ArticleBody,
                 )
             }
             item { Spacer(Modifier.height(32.dp)) }
