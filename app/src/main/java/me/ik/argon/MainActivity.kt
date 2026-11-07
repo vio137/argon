@@ -109,6 +109,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var findIndex by mutableStateOf(0)
     private var adblock by mutableStateOf(true)
     private var showOnboarding by mutableStateOf(false)
+    // Arm timestamp for press-back-again-to-exit at the root of history.
+    private var exitArmedAt = 0L
     // External (share/view) navigation queued while onboarding is showing, so
     // a cold-start share never loads a page behind or instead of onboarding.
     private var pendingExternalUrl: String? = null
@@ -159,6 +161,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
         // Shares from other apps: cap the accepted text and ignore a second
         // delivery of the identical payload inside this window.
         private const val MAX_SHARED_TEXT_LEN = 2048
+        private const val EXIT_ARM_WINDOW_MS = 2500L
         private const val SHARE_DEDUPE_WINDOW_MS = 3000L
 
         private const val ENGINE_UA =
@@ -502,6 +505,23 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 finishAndRemoveTask()
                             },
                         )
+                    }
+                    // System back on the browser screen walks page history
+                    // first; at the root it asks for a second press to exit.
+                    if (screen == Screen.Browser && !showOnboarding && !showMenu && !findVisible) {
+                        BackHandler {
+                            when {
+                                navigator.canGoBack -> navigator.back()
+                                System.currentTimeMillis() - exitArmedAt < EXIT_ARM_WINDOW_MS ->
+                                    finishAndRemoveTask()
+                                else -> {
+                                    exitArmedAt = System.currentTimeMillis()
+                                    android.widget.Toast
+                                        .makeText(this@MainActivity, "Press back again to exit", android.widget.Toast.LENGTH_SHORT)
+                                        .show()
+                                }
+                            }
+                        }
                     }
                     if (findVisible) {
                         BackHandler { closeFind() }
