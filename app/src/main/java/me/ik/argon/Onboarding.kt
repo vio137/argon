@@ -63,6 +63,9 @@ fun OnboardingScreen(
     onDone: () -> Unit,
 ) {
     var page by remember { mutableIntStateOf(0) }
+    // Mirror the on-screen Back button: system back steps back a page
+    // instead of dropping the user out of first run.
+    androidx.activity.compose.BackHandler(enabled = page > 0) { page -= 1 }
     Column(
         modifier =
             Modifier

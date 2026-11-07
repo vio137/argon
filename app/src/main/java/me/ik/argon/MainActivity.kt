@@ -449,7 +449,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 val send = Intent(Intent.ACTION_SEND)
                                     .setType("text/plain")
-                                    .putExtra(Intent.EXTRA_TEXT, currentUrl)
+                                    .putExtra(
+                                        Intent.EXTRA_TEXT,
+                                        if (currentTitle.isBlank()) currentUrl else "$currentTitle\n$currentUrl",
+                                    )
                                 startActivity(Intent.createChooser(send, null))
                             },
                             onFind = {
