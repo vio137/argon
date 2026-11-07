@@ -120,5 +120,14 @@ no UI, no activation path - until the flipped layout has spatial evidence
 gathered under allowed methods; the source is preserved on branch
 exp-toolbar-top for later. Interface copy never carries test badges or
 verification disclaimers; caveats live in handoffs and this file, not in the
-shipped UI. Tabs and the network-error page are open gaps under
-investigation, not in this build.
+shipped UI. Tabs and the network-error page are not in this build.
+Investigation concluded 2026-11-07 against the fixed v15 engine surface: the
+JNI export list (20 symbols, nm -D on libservoshell.so 646e305b) carries no
+load-error or HTTP-status signal - onLoadEnded reports no outcome - and
+servoshell embeds a single webview/window (ServoHolder singleton, one
+addPlatformWindow attachment), so true tabs have no host-side primitive.
+Heuristic error detection (onLoadEnded + unchanged URL) was rejected: it
+cannot distinguish a failed load from a cache/reload success and would show
+error UI on good pages. Both features therefore require an engine change,
+which is out of bounds; they stay listed as future engine-dependent work,
+not as active commitments.
