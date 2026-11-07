@@ -841,8 +841,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
         if (tabManager.isActive(webviewId)) {
             alertMessage = message
         } else {
-            // Alerts auto-confirm engine-side; a background tab's alert has no
-            // user to answer it, so it is logged, not queued.
+            // Only informational alerts reach here; Confirm/Prompt are denied
+            // by default engine-side (Drop sends Cancel), never silently
+            // consented. A background tab's alert has no user to answer it,
+            // so it is logged, not queued.
             Log.i("ArgonNav", "alert dropped: background tab")
         }
     }

@@ -103,6 +103,20 @@ site-loading and browsing performance before drawing conclusions.
   servoshell host module is cfg-gated out of Android builds and the ohos
   HostCallbacks would need the same signature updates if composed for
   those targets - Android-only compile is unaffected.
+- 030 v3 (current): MAX_TOPLEVEL_WEBVIEWS (= 12) is enforced ENGINE-SIDE on
+  every creation path, so the app's user-facing tab cap is an honest memory
+  bound: the JNI new_tab path returns None at the cap, and auxiliary
+  window.open requests past the cap are denied in
+  WebViewDelegate::request_create_new - the dropped CreateNewWebViewRequest
+  auto-responds None (AutomaticResponder), so the script's window.open
+  returns null (popup-blocker semantics, no half-created webview).
+- Dialog safety (upstream behavior, verified in components/servo/
+  webview_delegate.rs at the pinned revision): only the informational Alert
+  reaches the app via onAlert; Confirm and Prompt fall through to the
+  default arm, whose Drop sends ConfirmResponse::Cancel / the prompt default
+  - consequential prompts are DENIED by default, never silently consented.
+  AlertDialog::confirm only dismisses (DOM alert() returns undefined).
+  App-side, alerts from background tabs are dropped, not shown.
 
 ### 020 revision history
 - v1 (2ad46c0): initial signal; raw bounded reason string (RETRACTED:

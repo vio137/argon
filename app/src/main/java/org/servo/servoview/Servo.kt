@@ -222,6 +222,10 @@ object ServoHolder {
     @Volatile var servo: Servo? = null
 
     @Volatile var lastUrl: String? = null
+
+    /** Source webview of [lastUrl], captured at the same event, so the
+     * reattach replay is routed by identity, not by assumed-current tab. */
+    @Volatile var lastWebviewId: String = ""
 }
 
 @Stable
@@ -377,9 +381,10 @@ internal constructor(
         Log.i("ArgonNav", "reattach: swapping scope/client/IME callbacks, lastUrl=${ServoHolder.lastUrl}")
         this.scope = scope
         servoCallbacks.reattach(scope, client, navigator, onImeShow, onImeHide)
-        // Legacy replay carries no webview id (""); the client attributes it
-        // to the active tab, the pre-030 single-tab behavior.
-        ServoHolder.lastUrl?.let { url -> scope.launch { client.onUrlChanged("", url) } }
+        // Replay carries the snapshot's source webview id; if that tab was
+        // closed meanwhile the client drops it (tombstoned), never
+        // mis-attributes it to whatever tab is active now.
+        ServoHolder.lastUrl?.let { url -> scope.launch { client.onUrlChanged(ServoHolder.lastWebviewId, url) } }
     }
 
     /** Argon: evaluate an app-bundled script in the active page. The callback
@@ -665,6 +670,7 @@ internal constructor(
         override fun onUrlChanged(webviewId: String, url: String) {
             Log.i("ArgonNav", "urlChanged $url")
             ServoHolder.lastUrl = url
+            ServoHolder.lastWebviewId = webviewId
             scope.launch { client.onUrlChanged(webviewId, url) }
         }
 

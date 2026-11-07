@@ -237,7 +237,7 @@ index 20d4df6..3a43c84 100644
                  Ok(())
              })
 diff --git a/ports/servoshell/egl/app.rs b/ports/servoshell/egl/app.rs
-index 2446e75..e4e6168 100644
+index 2446e75..3e1f1b5 100644
 --- a/ports/servoshell/egl/app.rs
 +++ b/ports/servoshell/egl/app.rs
 @@ -89,11 +89,12 @@ impl PlatformWindow for EmbeddedPlatformWindow {
@@ -290,13 +290,18 @@ index 2446e75..e4e6168 100644
                  alert_dialog.confirm();
              },
              _ => {}, // The drop implementation will send the default response.
-@@ -428,6 +431,58 @@ impl App {
+@@ -428,6 +431,63 @@ impl App {
          self.state.window_for_webview(&webview).activate_webview(id);
      }
  
 +    /// Argon (tabs, patch 030): open a new top-level webview on `url` and
 +    /// activate it. Returns None when the URL fails to parse.
 +    pub(crate) fn new_tab(&self, url: &str) -> Option<WebViewId> {
++        // Argon (tabs, patch 030 v3): enforce the same engine-level cap on the
++        // app-initiated path (see MAX_TOPLEVEL_WEBVIEWS).
++        if self.window().webview_ids().len() >= crate::running_app_state::MAX_TOPLEVEL_WEBVIEWS {
++            return None;
++        }
 +        let url = Url::parse(url).ok()?;
 +        Some(
 +            self.window()
@@ -391,3 +396,36 @@ index 568f43f..77e0b6c 100644
      /// Servo finished shutting down.
      fn on_shutdown_complete(&self);
      /// A text input is focused.
+diff --git a/ports/servoshell/running_app_state.rs b/ports/servoshell/running_app_state.rs
+index 201a247..a902121 100644
+--- a/ports/servoshell/running_app_state.rs
++++ b/ports/servoshell/running_app_state.rs
+@@ -751,6 +751,11 @@ impl RunningAppState {
+     }
+ }
+ 
++/// Argon (tabs, patch 030 v3): maximum number of top-level webviews in one
++/// window, enforced engine-side on every creation path (app JNI new_tab and
++/// script auxiliary opens). Matches the app-side user-facing tab cap.
++pub(crate) const MAX_TOPLEVEL_WEBVIEWS: usize = 12;
++
+ impl WebViewDelegate for RunningAppState {
+     fn screen_geometry(&self, webview: WebView) -> Option<servo::ScreenGeometry> {
+         Some(self.platform_window_for_webview(&webview).screen_geometry())
+@@ -808,6 +813,16 @@ impl WebViewDelegate for RunningAppState {
+             return;
+         }
+ 
++        // Argon (tabs, patch 030 v3): bound total webviews across ALL creation
++        // paths, so the app's user-facing tab cap is an honest memory bound.
++        // Auxiliary opens (window.open) past the cap are denied here: dropping
++        // the request auto-responds None (AutomaticResponder), so the script's
++        // window.open returns null - popup-blocker semantics, no half-created
++        // webview.
++        if window.webview_ids().len() >= crate::running_app_state::MAX_TOPLEVEL_WEBVIEWS {
++            return;
++        }
++
+         let platform_window = window.platform_window();
+         let webview = request
+             .builder(platform_window.rendering_context())
