@@ -330,7 +330,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         BackHandler { focusManager.clearFocus() }
                     }
                     when (screen) {
-                        Screen.History ->
+                        Screen.History -> {
                             HistoryPage(
                                 history = history,
                                 onOpen = {
@@ -340,7 +340,8 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 onBack = { screen = Screen.Browser },
                             )
                             BackHandler { screen = Screen.Browser }
-                        Screen.Bookmarks ->
+                        }
+                        Screen.Bookmarks -> {
                             BookmarksPage(
                                 bookmarks = bookmarks,
                                 onOpen = {
@@ -356,6 +357,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 StartPage.write(this@MainActivity, bookmarks.entries, searchEngine)
                                 screen = Screen.Browser
                             }
+                        }
                         Screen.Settings -> SettingsPage()
                         Screen.Browser -> {}
                     }
