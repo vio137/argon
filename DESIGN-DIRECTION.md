@@ -42,9 +42,9 @@ Reinstall: git clone --depth 1 <url> for each into the agent workspace.
 - Copy link: menu row, clipboard copy of the current page URL.
 - Search engines: Google, DuckDuckGo, Brave, Bing (settings).
 
-## Embedding limitations (accepted backlog; need engine work, not UI work)
-- Tabs: the Servo embedding exposes a single surface; no multi-view API. Tabs deferred.
-- Network-error page: no load-failure callback exists (navigate/back/forward/reload/stop + evaluateScript only), so an honest error state cannot be built. Not faked.
+## Embedding gaps under investigation (open engineering outcomes, not exclusions)
+- Tabs: the current Servo embedding exposes a single surface with no multi-view API. Investigation path: servoshell/host-side view management or a surface-swap model; not dropped, not faked with screenshots.
+- Network-error page: no load-failure callback exists today (navigate/back/forward/reload/stop + evaluateScript only). Investigation path: host-side load-state plumbing in the servo package; an honest error state stays on the list.
 
 ## Verification honesty
 - Start page: pixel-verified (headless Chrome against the live template).
