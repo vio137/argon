@@ -132,3 +132,14 @@ precedent for this class of extension. Heuristic error detection
 load from a cache/reload success and would show error UI on good pages.
 Engine research/source work is isolated from the candidate-2 snapshot,
 which stays unchanged.
+
+## Delivery record: candidate 2 (2026-11-07 13:42 IST)
+Delivered to the user: https://argon-mediaexp.surge.sh/argon-1.0.15-vc18-candidate2-22cd091f.apk
+sha256 22cd091f2d58645efea6d4dfb51d8e36678681cab95cd2c88c0d2a92c6e26777 (download-back verified
+from the public URL; identical to the GCS-staged run22 artifact). Source exp-ui-revamp @ 3cee996,
+engine v15 (.so 646e305b...), cert 5ef6a12d, vc18/1.0.15, minify off. Labeled experimental at
+delivery: never opened on Android; compile/lint/packaging/signature checks and desktop start-page
+visual inspection only; launch, native screens and video unverified; install over, do not uninstall
+or clear data; update safety not guaranteed. Stable recovery APK (54071344...) stays linked on the
+same page. The load-error engine patch (exp-load-error branch) is NOT in this build; engine work
+continues separately.
