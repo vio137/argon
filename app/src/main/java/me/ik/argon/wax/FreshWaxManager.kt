@@ -15,6 +15,13 @@ interface WaxManagedStore {
     fun deleteProfile()
     /** Explicit mode intent only. Must commit durably or return false. */
     fun saveMode(enabled:Boolean):Boolean
+    /** WARP account credentials in the same Keystore-encrypted store family. */
+    fun hasAccount():Boolean
+    /** Owned mutable bytes (WaxAccountCodec encoding); caller must wipe. */
+    fun loadAccountJson():ByteArray?
+    fun saveAccountJson(bytes:ByteArray)
+    /** Local-only removal with the profile; makes no provider call. */
+    fun deleteAccount()
 }
 interface WaxManagedSession {
     fun connect(profile:ByteArray):Int

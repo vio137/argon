@@ -6,6 +6,7 @@ data class WaxManagementState(
     val connection: WaxConnection=WaxConnection.OFF,
     val consentAccepted: Boolean=false,
     val hasProfile: Boolean=false,
+    val hasAccount: Boolean=false,
     val processEnabled: Boolean=false,
     val wantedEnabled: Boolean=false,
     val restartRequired: Boolean=false,
@@ -14,7 +15,7 @@ enum class WaxAction { REVIEW_NOTICE, IMPORT_PROFILE, REQUEST_ENABLE, REQUEST_DI
 enum class WaxEffect {
     SHOW_NOTICE, OPEN_DOCUMENT_PICKER, PERSIST_ENABLE_THEN_CLOSE, PERSIST_DISABLE_THEN_CLOSE,
     CONNECT_EXISTING_SESSION, BLOCK_EXISTING_SESSION, CONFIRM_DELETE_THEN_BLOCK_AND_DELETE,
-    EXPLAIN_PROVISIONING_UNAVAILABLE, NO_OP,
+    SHOW_REGISTRATION_DISCLOSURE, NO_OP,
 }
 /** Chooses UI effects only. No transition commits intent, registers accounts or enables a route.
  * Completion callbacks must update state from actual private-storage/native results. */
@@ -22,7 +23,9 @@ object WaxManagement {
     fun effect(s:WaxManagementState,a:WaxAction):WaxEffect=when(a) {
         WaxAction.REVIEW_NOTICE -> WaxEffect.SHOW_NOTICE
         WaxAction.IMPORT_PROFILE -> WaxEffect.OPEN_DOCUMENT_PICKER
-        WaxAction.CREATE_WARP_ACCOUNT -> WaxEffect.EXPLAIN_PROVISIONING_UNAVAILABLE
+        // Registration disclosure precedes any account creation; with a stored account and no
+        // profile the same disclosure honestly offers RESUME of the interrupted setup.
+        WaxAction.CREATE_WARP_ACCOUNT -> if(s.hasProfile) WaxEffect.NO_OP else WaxEffect.SHOW_REGISTRATION_DISCLOSURE
         WaxAction.REQUEST_ENABLE -> when {
             !s.consentAccepted -> WaxEffect.SHOW_NOTICE
             !s.hasProfile -> WaxEffect.OPEN_DOCUMENT_PICKER

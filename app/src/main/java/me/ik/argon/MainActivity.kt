@@ -101,6 +101,10 @@ import me.ik.argon.wax.WaxSessionFactory
 import me.ik.argon.wax.WaxStartup
 import me.ik.argon.wax.WaxStartupPlan
 import me.ik.argon.wax.WaxStoredIntent
+import me.ik.argon.wax.WaxAccountCodec
+import me.ik.argon.wax.WaxRegHttpTransport
+import me.ik.argon.wax.WaxRegOutcome
+import me.ik.argon.wax.WaxWarpRegistration
 import org.servo.servoview.Servo
 import org.servo.servoview.ServoNavigator
 import org.servo.servoview.ServoHolder
@@ -951,6 +955,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
             connection = waxConnection,
             consentAccepted = waxStore.consented(),
             hasProfile = waxStore.hasProfile(),
+            hasAccount = waxStore.hasAccount(),
             processEnabled = processEnabled,
             wantedEnabled = wanted,
             restartRequired = wanted != processEnabled,
@@ -1031,10 +1036,69 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 waxSession?.block()
                 if (waxSession != null) waxConnection = WaxConnection.BLOCKED
                 waxStore.deleteProfile()
+                // Local account credentials go with the profile; no provider call is made.
+                waxStore.deleteAccount()
             }
-            WaxEffect.EXPLAIN_PROVISIONING_UNAVAILABLE ->
-                FreshWaxManagementDialog.explainRegistration(this)
+            WaxEffect.SHOW_REGISTRATION_DISCLOSURE ->
+                FreshWaxManagementDialog.showRegistrationDisclosure(this, waxStore.hasAccount()) {
+                    startWaxRegistration()
+                }
             WaxEffect.NO_OP -> {}
+        }
+    }
+
+    /**
+     * User-driven WARP account setup. Runs ONLY from the registration disclosure dialog's
+     * explicit agree action - that tap is the terms consent carried by the registration
+     * request itself. Credentials persist before any later step so a failure resumes with
+     * the same account instead of creating duplicates. Never logs keys/tokens.
+     */
+    private fun startWaxRegistration() {
+        val scope = uiScope ?: return
+        alertMessage = "Contacting the WARP service..."
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val existing =
+                waxStore.loadAccountJson()?.let { bytes ->
+                    try {
+                        WaxAccountCodec.decode(bytes)
+                    } finally {
+                        bytes.fill(0)
+                    }
+                }
+            val registration =
+                WaxWarpRegistration(
+                    WaxRegHttpTransport("Argon/${BuildConfig.VERSION_NAME} (Android)"),
+                )
+            val outcome =
+                registration.provision(existing) { account ->
+                    runCatching { waxStore.saveAccountJson(WaxAccountCodec.encode(account)) }
+                        .isSuccess
+                }
+            alertMessage =
+                when (outcome) {
+                    is WaxRegOutcome.ProfileReady -> {
+                        val bytes = outcome.profileText.toByteArray(Charsets.UTF_8)
+                        val stored =
+                            runCatching { waxStore.saveProfile(bytes) }.isSuccess
+                        bytes.fill(0)
+                        if (stored) {
+                            "WARP account ready; profile stored privately. Routing stays off until you enable it. Connection not yet verified."
+                        } else {
+                            "Account created, but storing the profile failed. Use setup again to finish - no new account is created."
+                        }
+                    }
+                    WaxRegOutcome.DeclinedByProvider ->
+                        "Cloudflare declined setup from an unofficial app. Nothing was created and no workaround was attempted."
+                    WaxRegOutcome.ProviderRejected ->
+                        "WARP setup was rejected by the service. Nothing changed; try again later."
+                    WaxRegOutcome.Unreachable ->
+                        "Couldn't reach the WARP service. Check the connection and try again."
+                    WaxRegOutcome.BadResponse ->
+                        "Unexpected response from the WARP service; setup did not complete."
+                    WaxRegOutcome.StorageFailed ->
+                        "Couldn't store credentials privately; setup did not complete."
+                }
+            refreshWaxState()
         }
     }
 

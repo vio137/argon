@@ -11,9 +11,10 @@ interface WaxPrivateBlob {
     fun delete()
 }
 fun interface WaxSecretKey {fun get():SecretKey}
-/** NEW encryption store. No registration/export/share/enable behavior. */
-class WaxSecureProfile(private val key:WaxSecretKey,private val blob:WaxPrivateBlob){
-    private val aad="Argon.waX.fresh-profile.v1".toByteArray(Charsets.US_ASCII)
+/** NEW encryption store. No registration/export/share/enable behavior. aadLabel binds a
+ * blob to its purpose: ciphertext written under one label cannot be loaded as another. */
+class WaxSecureProfile(private val key:WaxSecretKey,private val blob:WaxPrivateBlob,aadLabel:String="Argon.waX.fresh-profile.v1"){
+    private val aad=aadLabel.toByteArray(Charsets.US_ASCII)
     fun save(profile:ByteArray){
         require(profile.size in 1..16384)
         val c=Cipher.getInstance("AES/GCM/NoPadding")
