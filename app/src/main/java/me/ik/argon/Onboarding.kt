@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -71,7 +72,24 @@ fun OnboardingScreen(
                 .navigationBarsPadding()
                 .padding(horizontal = 28.dp),
     ) {
-        Spacer(Modifier.height(64.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+        ) {
+            Spacer(Modifier.weight(1f))
+            if (page < 2) {
+                Text(
+                    "Skip",
+                    color = ArgonColors.Text3,
+                    style = ArgonType.BodySmall,
+                    modifier =
+                        Modifier.clip(RoundedCornerShape(ArgonRadii.Control))
+                            .clickable(onClickLabel = "Skip introduction", role = Role.Button) { onDone() }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(16.dp))
         AnimatedContent(
             targetState = page,
             transitionSpec = {
