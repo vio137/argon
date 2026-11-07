@@ -10,6 +10,8 @@ Base: servo b6c9df76bf2d79d479e4b0162f7ecb383d32d2fd (pin). CI glob-applies in n
 - js_eval_bridge.patch - JS evaluation bridge
 - net_connector_h1_client.patch / net_h2_h1_fallback.patch / net_resource_thread_h1_state.patch - HTTP/1.1 robustness
 - 050_android_ttc_face_index.patch - fonts.xml index attr -> face_index (TTC faces); v2 validated u16
+- 052_fling_timebase.patch - time-normalized fling/velocity (refresh-rate independent);
+  app-side JNI timestamp changes REQUIRED (paired release, exp-perf cc8666b+)
 
 ## DORMANT - not user-facing, pref OFF, never in EXPERIMENTAL_PREFS
 - 040_mse_traits.patch + 041_mse_script.patch - MSE DOM surface draft.
@@ -17,5 +19,5 @@ Base: servo b6c9df76bf2d79d479e4b0162f7ecb383d32d2fd (pin). CI glob-applies in n
   Must be EXCLUDED from any font/perf release-candidate assembly until main clears it.
 
 ## Separability
-Font/perf/fling work (050, planned 052) has no dependency on 040/041.
+Font/perf/fling work (050, 052) has no dependency on 040/041.
 A font+fling candidate can be assembled from pin + active set only.
