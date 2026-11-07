@@ -22,3 +22,24 @@
 - mobile-app-ui-design @ 0ad61f0 https://github.com/ceorkm/mobile-app-ui-design
 - ponytail @ 96608e0 https://github.com/dietrichgebert/ponytail MIT
 Reinstall: git clone --depth 1 <url> for each into the agent workspace.
+
+## Revamp scope status (branch exp-ui-revamp, tip green on CI lint)
+- Navigation: layered back handling (suggestions -> focus -> page history -> screens), contextual back inside the capsule.
+- Search: local-only omnibox suggestions from device history + bookmarks (no network), IME Go, hardware Enter/Escape, select-all on focus, clear button.
+- Menus: section grouping (This page / App), Share page (Android share sheet), Bookmarks screen row, Reader view, View DOM.
+- Bookmarks: dedicated screen (open/remove), start page rewrites on change so tiles and screen never disagree; import/export retained.
+- History: local filter field with explicit no-match empty state; start page Recent section (6 rows).
+- Onboarding: off-white primary buttons, welcome orbit mark.
+- Reader: bundled Mozilla Readability 0.6.0 (Apache-2.0) extraction, serif reading family, reading-progress hairline, loading pill, error dialog, stale-result guard.
+- Settings: section grouping; search engine, block list, bookmarks import/export.
+- Accessibility: 48dp touch targets in the capsule, content descriptions on icon buttons, Text3 #79828F (~4.6:1 on background).
+- Empty states: history, bookmarks, filter no-match, start page.
+- Start page: pixel-verified in headless Chrome at 360x760 and 412x900 (three columns, wrapped labels, Recent section).
+
+## Embedding limitations (accepted backlog; need engine work, not UI work)
+- Tabs: the Servo embedding exposes a single surface; no multi-view API. Tabs deferred.
+- Network-error page: no load-failure callback exists (navigate/back/forward/reload/stop + evaluateScript only), so an honest error state cannot be built. Not faked.
+
+## Verification honesty
+- Start page: pixel-verified (headless Chrome against the live template).
+- Compose screens (menu, pages, reader, onboarding, chrome): compile + CI lint verified only; no device rendering performed. Treat as visually unverified until a device run exists.
