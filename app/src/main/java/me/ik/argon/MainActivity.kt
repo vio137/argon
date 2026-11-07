@@ -725,7 +725,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
     }
 
     override fun onLoadEnded() {
-        if (currentUrl.isNotEmpty() && !currentUrl.startsWith("file://")) {
+        // History records web pages only: file:// (start page) is not
+        // browsing, and data:/about: entries can't be meaningfully
+        // revisited from the list.
+        if (currentUrl.startsWith("https://") || currentUrl.startsWith("http://")) {
             history.add(currentUrl, currentTitle)
         }
         isLoading = false

@@ -48,7 +48,10 @@ private fun suggest(query: String, history: List<HistoryEntry>, bookmarks: List<
             matches.add(Match(b.title.ifBlank { hostOf(b.url) }, b.url, bookmark = true, hostPrefix = host.startsWith(q)))
         }
     }
-    for (h in webHistory.asReversed()) {
+    // History is stored newest-first; keep that order so the stable sort
+    // leaves the most recent visit first inside a tier. (asReversed() here
+    // used to invert the tier into oldest-first.)
+    for (h in webHistory) {
         val host = hostOf(h.url).lowercase()
         val title = h.title.lowercase()
         if ((host.contains(q) || title.contains(q)) && seen.add(h.url)) {
