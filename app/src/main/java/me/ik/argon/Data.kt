@@ -50,11 +50,19 @@ private fun writeStore(file: File, payload: String): Boolean {
 }
 
 private inline fun <reified T> loadStore(file: File): LoadedStore<T> {
-    if (!file.exists()) return LoadedStore(emptyList(), quarantineFailed = false)
+    // No exists() gate here: AtomicFile.openRead recovers from its own .bak
+    // when a crash mid-write left the base missing but the backup present,
+    // and that path must not be skipped.
     val bytes = runCatching { AtomicFile(file).openRead().use { it.readBytes() } }.getOrNull()
+    if (bytes == null) {
+        // Neither base nor backup readable. If a file with content is still
+        // sitting there unreadable, treat it as corrupt and quarantine below.
+        if (!file.exists() || file.length() == 0L) return LoadedStore(emptyList(), quarantineFailed = false)
+    } else if (bytes.isEmpty()) {
+        return LoadedStore(emptyList(), quarantineFailed = false)
+    }
     val decoded = bytes?.let { runCatching { storeJson.decodeFromString<List<T>>(String(it, Charsets.UTF_8)) }.getOrNull() }
     if (decoded != null) return LoadedStore(decoded, quarantineFailed = false)
-    if (bytes == null || bytes.isEmpty()) return LoadedStore(emptyList(), quarantineFailed = false)
     // Corrupt content: move it aside under a UNIQUE name so later saves can
     // never overwrite recoverable data. If quarantine itself fails, the
     // original stays put, saves are blocked, and the user is told.
@@ -118,6 +126,10 @@ class HistoryStore(context: Context) {
 
     private fun save() {
         if (savesBlocked) {
+            // Honest failure semantics: the in-memory change STAYS (the app
+            // keeps working for the session), the disk bytes stay untouched,
+            // and the error surfaces on every blocked save so the state is
+            // never silently divergent.
             StoreHealth.corruptPreserveError.value = true
             return
         }
@@ -165,6 +177,10 @@ class BookmarkStore(context: Context) {
 
     private fun save() {
         if (savesBlocked) {
+            // Honest failure semantics: the in-memory change STAYS (the app
+            // keeps working for the session), the disk bytes stay untouched,
+            // and the error surfaces on every blocked save so the state is
+            // never silently divergent.
             StoreHealth.corruptPreserveError.value = true
             return
         }
