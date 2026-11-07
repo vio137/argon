@@ -365,7 +365,9 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         // blank-query case still backs out of editing first.
                         BackHandler { focusManager.clearFocus() }
                     }
-                    if (omniboxFocused && omniboxQuery.isNotBlank()) {
+                    // Hidden while the find bar owns the slot above the
+                    // omnibox - both anchor there and would overlap.
+                    if (omniboxFocused && omniboxQuery.isNotBlank() && !findVisible) {
                         OmniboxSuggestions(
                             query = omniboxQuery,
                             engine = searchEngine,
