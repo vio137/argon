@@ -18,7 +18,10 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true // About dialog shows VERSION_NAME/VERSION_CODE
+    }
 
     // lintVital* stalls 10+ min on the 2GB local build box; skip it there via
     // -Pargon.skipLintVital=true (kept in ~/.gradle/gradle.properties, uncommitted).
