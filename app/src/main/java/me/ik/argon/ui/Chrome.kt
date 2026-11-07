@@ -51,38 +51,44 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import me.ik.argon.ArgonColors
+import me.ik.argon.ArgonRadii
 import me.ik.argon.ArgonType
 import me.ik.argon.R
 
 /**
- * Argon command bar - chrome v2.
- * One unified capsule: navigation, omnibox and actions live inside a single
- * continuous element (no detached buttons), with the loading state drawn as a
- * thin accent track along the capsule's bottom edge. Idle: back (contextual),
- * security/search glyph, address, stop-or-reload, menu. Focused: the field
- * takes the space, clear appears, and the trailing slot crossfades to an
- * accent Go button. Touch targets stay >=44dp; every action keeps its
- * content-description for tests and accessibility.
+ * Argon command deck - redesign v2 ("Argon discharge").
+ * One unified bottom deck: nav buttons, the omnibox pill and the action slot
+ * live inside a single continuous glass surface. Idle: back (long-press
+ * trail) + forward, omnibox pill (security/search glyph, address, clear),
+ * stop-or-reload, menu. Focused: nav buttons collapse, the pill takes the
+ * space and the trailing slot crossfades to an accent Go button. The loading
+ * state is a thin accent track along the deck's bottom edge.
+ *
+ * Compose cannot backdrop-blur the webview behind the deck, so the glass is
+ * a high-alpha raised surface over the page; the hairline border carries the
+ * edge definition. The secure glyph reflects only the observed page URL
+ * scheme (https) - it is a transport indicator, not a privacy claim. Touch
+ * targets stay >=44dp; every action keeps its content-description for tests
+ * and accessibility.
  */
 @Composable
 fun ArgonCommandBar(
     urlState: TextFieldState,
     currentDisplayUrl: String,
     canGoBack: Boolean,
+    canGoForward: Boolean,
     isLoading: Boolean,
     focused: Boolean,
     secure: Boolean,
     onFocusChange: (Boolean) -> Unit,
     onSubmit: () -> Unit,
     onBack: () -> Unit,
+    onForward: () -> Unit,
     onStopOrReload: () -> Unit,
     onMenu: () -> Unit,
     onLeadingShortcut: (() -> Unit)? = null,
@@ -92,10 +98,7 @@ fun ArgonCommandBar(
     loadingArc: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // The capsule: elevation + hairline, accent border while editing.
-    val borderAlpha by animateFloatAsState(if (focused) 0.55f else 0f, label = "focusBorder")
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
+    Box(
         modifier =
             modifier
                 .fillMaxWidth()
@@ -103,26 +106,22 @@ fun ArgonCommandBar(
                 .imePadding()
                 .padding(horizontal = 12.dp, vertical = 10.dp)
                 .height(56.dp)
-                .clip(RoundedCornerShape(28.dp))
-                .background(ArgonColors.SurfaceHigh)
-                .border(
-                    1.dp,
-                    if (borderAlpha > 0.01f) ArgonColors.Accent.copy(alpha = borderAlpha)
-                    else ArgonColors.HairlineStrong,
-                    RoundedCornerShape(28.dp),
-                ),
+                .clip(RoundedCornerShape(ArgonRadii.Panel))
+                .background(ArgonColors.BgRaise.copy(alpha = 0.94f))
+                .border(1.dp, ArgonColors.HairlineStrong, RoundedCornerShape(ArgonRadii.Panel)),
     ) {
-        Box(Modifier.weight(1f).fillMaxSize()) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxSize().padding(start = 6.dp, end = 4.dp),
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxSize().padding(horizontal = 6.dp),
+        ) {
+            // Nav buttons: hidden on the start surface (nothing to navigate)
+            // and collapsed while editing so the pill gets the width.
+            AnimatedVisibility(
+                visible = (canGoBack || canGoForward) && !focused,
+                enter = slideInHorizontally(spring()) { -it } + fadeIn(),
+                exit = slideOutHorizontally(spring()) { -it } + fadeOut(),
             ) {
-                // Contextual back, inside the capsule.
-                AnimatedVisibility(
-                    visible = canGoBack && !focused,
-                    enter = slideInHorizontally(spring()) { -it } + fadeIn(),
-                    exit = slideOutHorizontally(spring()) { -it } + fadeOut(),
-                ) {
+                Row {
                     Box {
                         var showRecent by remember { mutableStateOf(false) }
                         ChromeIconButton(
@@ -131,9 +130,13 @@ fun ArgonCommandBar(
                                 if (recentHistory.isEmpty()) null
                                 else ({ showRecent = true }),
                             description = "Back",
-                            enabled = true,
+                            enabled = canGoBack,
                         ) {
-                            ChromeGlyph(R.drawable.ic_arrow_back, "Back", ArgonColors.Text)
+                            ChromeGlyph(
+                                R.drawable.ic_arrow_back,
+                                "Back",
+                                if (canGoBack) ArgonColors.Text else ArgonColors.Text3,
+                            )
                         }
                         DropdownMenu(
                             expanded = showRecent,
@@ -159,110 +162,145 @@ fun ArgonCommandBar(
                             }
                         }
                     }
-                }
-                if (onLeadingShortcut != null) {
                     ChromeIconButton(
-                        onClick = onLeadingShortcut,
-                        description = "Shortcut",
-                        enabled = true,
+                        onClick = onForward,
+                        description = "Forward",
+                        enabled = canGoForward,
                     ) {
                         ChromeGlyph(
+                            R.drawable.ic_arrow_forward,
+                            "Forward",
+                            if (canGoForward) ArgonColors.Text else ArgonColors.Text3,
+                        )
+                    }
+                }
+            }
+
+            // Omnibox pill inside the deck.
+            val pillBorderAlpha by animateFloatAsState(if (focused) 0.55f else 0f, label = "focusBorder")
+            Box(
+                Modifier.weight(1f)
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(ArgonRadii.Control))
+                    .background(ArgonColors.SurfaceHigh)
+                    .border(
+                        1.dp,
+                        if (pillBorderAlpha > 0.01f) ArgonColors.Accent.copy(alpha = pillBorderAlpha)
+                        else ArgonColors.Hairline,
+                        RoundedCornerShape(ArgonRadii.Control),
+                    ),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxSize().padding(start = 12.dp, end = 4.dp),
+                ) {
+                    if (onLeadingShortcut != null) {
+                        ChromeIconButton(
+                            onClick = onLeadingShortcut,
+                            description = "Shortcut",
+                            enabled = true,
+                            size = 32.dp,
+                            glyph = 18.dp,
+                        ) {
+                            ChromeGlyph(
+                                if (secure) R.drawable.ic_lock else R.drawable.ic_search,
+                                "Shortcut",
+                                if (secure) ArgonColors.Accent else ArgonColors.Text3,
+                            )
+                        }
+                    } else {
+                        ChromeGlyph(
                             if (secure) R.drawable.ic_lock else R.drawable.ic_search,
-                            "Shortcut",
+                            null,
                             if (secure) ArgonColors.Accent else ArgonColors.Text3,
                         )
                     }
-                } else {
-                ChromeGlyph(
-                    if (secure) R.drawable.ic_lock else R.drawable.ic_search,
-                    null,
-                    if (secure) ArgonColors.Accent else ArgonColors.Text3,
-                )
-                }
-                Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
-                    if (urlState.text.isEmpty()) {
-                        androidx.compose.material3.Text(
-                            "Search or enter address",
-                            color = ArgonColors.Text3,
-                            style = ArgonType.Body,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                    Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                        if (urlState.text.isEmpty()) {
+                            androidx.compose.material3.Text(
+                                "Search or enter address",
+                                color = ArgonColors.Text3,
+                                style = ArgonType.BodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        BasicTextField(
+                            state = urlState,
+                            lineLimits = TextFieldLineLimits.SingleLine,
+                            textStyle = ArgonType.BodySmall.copy(color = ArgonColors.Text),
+                            cursorBrush = SolidColor(ArgonColors.Accent),
+                            keyboardOptions =
+                                KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
+                            onKeyboardAction = { onSubmit() },
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .onPreviewKeyEvent { event ->
+                                        if (event.type == KeyEventType.KeyDown &&
+                                            (event.key == Key.Enter || event.key == Key.NumPadEnter)
+                                        ) {
+                                            onSubmit()
+                                            true
+                                        } else if (event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
+                                            onEscape()
+                                            true
+                                        } else false
+                                    }
+                                    .onFocusChanged { onFocusChange(it.isFocused) },
                         )
                     }
-                    BasicTextField(
-                        state = urlState,
-                        lineLimits = TextFieldLineLimits.SingleLine,
-                        textStyle =
-                            ArgonType.Body.copy(color = ArgonColors.Text),
-                        cursorBrush = SolidColor(ArgonColors.Accent),
-                        keyboardOptions =
-                            KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
-                        onKeyboardAction = { onSubmit() },
-                        modifier =
-                            Modifier.fillMaxWidth()
-                                .onPreviewKeyEvent { event ->
-                                    if (event.type == KeyEventType.KeyDown &&
-                                        (event.key == Key.Enter || event.key == Key.NumPadEnter)
-                                    ) {
-                                        onSubmit()
-                                        true
-                                    } else if (event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
-                                        onEscape()
-                                        true
-                                    } else false
-                                }
-                                .onFocusChanged { onFocusChange(it.isFocused) },
-                    )
-                }
-                AnimatedVisibility(visible = urlState.text.isNotEmpty() && focused) {
-                    ChromeIconButton(
-                        onClick = { urlState.edit { replace(0, length, "") } },
-                        description = "Clear",
-                        enabled = true,
-                    ) {
-                        ChromeGlyph(R.drawable.ic_close, "Clear", ArgonColors.Text3)
+                    AnimatedVisibility(visible = urlState.text.isNotEmpty() && focused) {
+                        ChromeIconButton(
+                            onClick = { urlState.edit { replace(0, length, "") } },
+                            description = "Clear",
+                            enabled = true,
+                            size = 32.dp,
+                            glyph = 18.dp,
+                        ) {
+                            ChromeGlyph(R.drawable.ic_close, "Clear", ArgonColors.Text3)
+                        }
                     }
                 }
+            }
 
-                // Trailing slot, inside the capsule: Go (editing) vs
-                // stop/reload + menu (idle).
-                AnimatedContent(
-                    targetState = focused,
-                    transitionSpec = {
-                        (slideInHorizontally(spring()) { it / 2 } + fadeIn()) togetherWith
-                            (slideOutHorizontally(spring()) { it / 2 } + fadeOut())
-                    },
-                    label = "trailingSlot",
-                ) { isFocused ->
-                    if (isFocused) {
-                        ChromeIconButton(onClick = onSubmit, description = "Go", enabled = true, filled = true) {
-                            ChromeGlyph(R.drawable.ic_arrow_forward, "Go", ArgonColors.OnAccent)
+            // Trailing slot, inside the deck: Go (editing) vs
+            // stop/reload + menu (idle).
+            AnimatedContent(
+                targetState = focused,
+                transitionSpec = {
+                    (slideInHorizontally(spring()) { it / 2 } + fadeIn()) togetherWith
+                        (slideOutHorizontally(spring()) { it / 2 } + fadeOut())
+                },
+                label = "trailingSlot",
+            ) { isFocused ->
+                if (isFocused) {
+                    ChromeIconButton(onClick = onSubmit, description = "Go", enabled = true, filled = true) {
+                        ChromeGlyph(R.drawable.ic_arrow_forward, "Go", ArgonColors.OnAccent)
+                    }
+                } else {
+                    Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
+                        ChromeIconButton(onClick = onStopOrReload, description = if (isLoading) "Stop" else "Reload", enabled = true) {
+                            ChromeGlyph(
+                                if (isLoading) R.drawable.ic_close else R.drawable.ic_refresh,
+                                if (isLoading) "Stop" else "Reload",
+                                ArgonColors.Text,
+                            )
                         }
-                    } else {
-                        Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
-                            ChromeIconButton(onClick = onStopOrReload, description = if (isLoading) "Stop" else "Reload", enabled = true) {
-                                ChromeGlyph(
-                                    if (isLoading) R.drawable.ic_close else R.drawable.ic_refresh,
-                                    if (isLoading) "Stop" else "Reload",
-                                    ArgonColors.Text,
-                                )
-                            }
-                            ChromeIconButton(onClick = onMenu, description = "Menu", enabled = true) {
-                                ChromeGlyph(R.drawable.ic_menu, "Menu", ArgonColors.Text)
-                            }
+                        ChromeIconButton(onClick = onMenu, description = "Menu", enabled = true) {
+                            ChromeGlyph(R.drawable.ic_menu, "Menu", ArgonColors.Text)
                         }
                     }
                 }
             }
-            // Loading: thin accent track along the capsule's bottom edge.
-            androidx.compose.animation.AnimatedVisibility(
-                visible = isLoading,
-                enter = fadeIn(),
-                exit = fadeOut(),
-                modifier = Modifier.align(Alignment.BottomCenter),
-            ) {
-                loadingArc()
-            }
+        }
+        // Loading: thin accent track along the deck's bottom edge.
+        androidx.compose.animation.AnimatedVisibility(
+            visible = isLoading,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) {
+            loadingArc()
         }
     }
 }
@@ -273,13 +311,15 @@ private fun ChromeIconButton(
     description: String,
     enabled: Boolean,
     filled: Boolean = false,
+    size: androidx.compose.ui.unit.Dp = 48.dp,
+    glyph: androidx.compose.ui.unit.Dp = 20.dp,
     onLongClick: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     Box(
         contentAlignment = Alignment.Center,
         modifier =
-            Modifier.size(48.dp)
+            Modifier.size(size)
                 .clip(CircleShape)
                 .background(if (filled) ArgonColors.Accent else Color.Transparent)
                 .then(
@@ -297,7 +337,7 @@ private fun ChromeIconButton(
                     }
                 ),
     ) {
-        content()
+        Box(Modifier.size(glyph), contentAlignment = Alignment.Center) { content() }
     }
 }
 
