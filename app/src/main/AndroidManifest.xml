@@ -32,8 +32,8 @@
                 <data android:scheme="http" />
                 <data android:scheme="https" />
             </intent-filter>
-            <!-- Share target: shared URLs open, shared text searches - the
-                 same locationFor trust path as typed omnibox input. -->
+            <!-- Share target: shared URLs open, shared text searches via the
+                 strict locationForExternal resolver (http(s) only). -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />

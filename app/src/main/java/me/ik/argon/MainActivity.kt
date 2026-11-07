@@ -289,7 +289,11 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
         val intentUrl =
             when {
-                intent?.action == Intent.ACTION_VIEW -> intent.data?.toString()
+                // Cold VIEW intents go through the same strict external
+                // resolver as shares so httpsOnly is honored on cold start
+                // (the warm path already upgrades via navigate/locationFor).
+                intent?.action == Intent.ACTION_VIEW ->
+                    intent.data?.toString()?.let { locationForExternal(it, searchEngine, httpsOnly) }
                 // Shared text goes through locationFor, exactly like typed
                 // omnibox input: URLs open, anything else becomes a search.
                 intent?.action == Intent.ACTION_SEND ->
