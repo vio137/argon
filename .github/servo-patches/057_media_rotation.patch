@@ -1,11 +1,11 @@
-commit da79472eb5785fc04e69306e1a7aa23058f69bcf
+commit 5b5725479a5ef8554cadb41072cab57ea93cdc93
 Author: Instinct Agent <agent@instinct.com>
 Date:   Sat Nov 7 19:56:35 2026 +0530
 
     057 media: I420 rotation for container rotation-degrees (host-tested)
 
 diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
-index fedd74857..f051d385b 100644
+index 1be561d1d..498ae6c0f 100644
 --- a/components/media/backends/android/android_impl/player.rs
 +++ b/components/media/backends/android/android_impl/player.rs
 @@ -380,6 +380,9 @@ struct TrackDecoder {
