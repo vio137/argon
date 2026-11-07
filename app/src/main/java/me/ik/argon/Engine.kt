@@ -55,8 +55,11 @@ fun locationForExternal(input: String, engine: SearchEngine, httpsOnly: Boolean 
 }
 
 // URLs the omnibox may display. The internal start page is an app-private
-// file: document - never show its path; an empty field shows the placeholder.
-fun displayableUrl(url: String): String = if (url.startsWith("file://")) "" else url
+// file: document - never show its path; data: documents have no host and
+// would otherwise fill the bar with the whole blob. An empty field shows
+// the placeholder.
+fun displayableUrl(url: String): String =
+    if (url.startsWith("file://") || url.startsWith("data:")) "" else url
 
 fun hostOf(url: String): String =
     runCatching { java.net.URI(url).host ?: url }.getOrDefault(url).removePrefix("www.")
