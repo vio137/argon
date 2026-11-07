@@ -344,6 +344,8 @@ fun SettingsScreen(
     onHttpsOnly: (Boolean) -> Unit,
     clearOnExit: Boolean,
     onClearOnExit: (Boolean) -> Unit,
+    toolbarTop: Boolean,
+    onToolbarTop: (Boolean) -> Unit,
     onExportBookmarks: () -> Unit,
     onImportBookmarks: () -> Unit,
     onClearHistory: (Long?) -> Unit,
@@ -373,6 +375,12 @@ fun SettingsScreen(
                     subtitle = "Upgrades addresses you type or open to https://. Resources a page loads itself are not affected",
                     checked = httpsOnly,
                     onCheckedChange = onHttpsOnly,
+                )
+                SettingSwitch(
+                    title = "Toolbar on top",
+                    subtitle = "Move the address bar to the top of the screen",
+                    checked = toolbarTop,
+                    onCheckedChange = onToolbarTop,
                 )
                 SettingSwitch(
                     title = "Clear history on exit",
