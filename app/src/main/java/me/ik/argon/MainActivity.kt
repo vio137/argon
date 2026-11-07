@@ -361,6 +361,15 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         onMenu = { showMenu = true },
                         loadingArc = { LoadingArc() },
                         onEscape = { focusManager.clearFocus() },
+                        recentHistory =
+                            history.entries
+                                .filter { it.url != currentUrl }
+                                .take(8)
+                                .map { it.title to it.url },
+                        onPickHistory = { url ->
+                            navigate(url)
+                            servoFocusRequester.requestFocus()
+                        },
                         modifier = Modifier.align(Alignment.BottomCenter),
                     )
                     val omniboxQuery = urlState.text.toString()

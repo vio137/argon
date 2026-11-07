@@ -11,7 +11,9 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -29,8 +31,14 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -79,6 +87,8 @@ fun ArgonCommandBar(
     onStopOrReload: () -> Unit,
     onMenu: () -> Unit,
     onEscape: () -> Unit = {},
+    recentHistory: List<Pair<String, String>> = emptyList(),
+    onPickHistory: (String) -> Unit = {},
     loadingArc: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -113,8 +123,41 @@ fun ArgonCommandBar(
                     enter = slideInHorizontally(spring()) { -it } + fadeIn(),
                     exit = slideOutHorizontally(spring()) { -it } + fadeOut(),
                 ) {
-                    ChromeIconButton(onClick = onBack, description = "Back", enabled = true) {
-                        ChromeGlyph(R.drawable.ic_arrow_back, "Back", ArgonColors.Text)
+                    Box {
+                        var showRecent by remember { mutableStateOf(false) }
+                        ChromeIconButton(
+                            onClick = onBack,
+                            onLongClick =
+                                if (recentHistory.isEmpty()) null
+                                else ({ showRecent = true }),
+                            description = "Back",
+                            enabled = true,
+                        ) {
+                            ChromeGlyph(R.drawable.ic_arrow_back, "Back", ArgonColors.Text)
+                        }
+                        DropdownMenu(
+                            expanded = showRecent,
+                            onDismissRequest = { showRecent = false },
+                            containerColor = ArgonColors.SurfaceHigh,
+                        ) {
+                            recentHistory.forEach { (title, url) ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            title,
+                                            color = ArgonColors.Text,
+                                            style = ArgonType.BodySmall,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    },
+                                    onClick = {
+                                        showRecent = false
+                                        onPickHistory(url)
+                                    },
+                                )
+                            }
+                        }
                     }
                 }
                 ChromeGlyph(
@@ -216,6 +259,7 @@ private fun ChromeIconButton(
     description: String,
     enabled: Boolean,
     filled: Boolean = false,
+    onLongClick: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     Box(
@@ -224,7 +268,20 @@ private fun ChromeIconButton(
             Modifier.size(48.dp)
                 .clip(CircleShape)
                 .background(if (filled) ArgonColors.Accent else Color.Transparent)
-                .clickable(enabled = enabled, onClickLabel = description, role = Role.Button, onClick = onClick),
+                .then(
+                    if (onLongClick != null) {
+                        @OptIn(ExperimentalFoundationApi::class)
+                        Modifier.combinedClickable(
+                            enabled = enabled,
+                            onClickLabel = description,
+                            role = Role.Button,
+                            onClick = onClick,
+                            onLongClick = onLongClick,
+                        )
+                    } else {
+                        Modifier.clickable(enabled = enabled, onClickLabel = description, role = Role.Button, onClick = onClick)
+                    }
+                ),
     ) {
         content()
     }
