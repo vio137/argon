@@ -1,0 +1,1584 @@
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index c58a3a6b4..b47c20918 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -353,6 +353,8 @@ pub struct Preferences {
+     /// Use the experimental direct-NDK (AMediaExtractor/AMediaCodec/AAudio) media backend on
+     /// Android instead of the dummy backend. Progressive <video>/<audio> only.
+     pub media_android_backend_enabled: bool,
++    /// Private append-source DOM interfaces. Disabled until complete.
++    pub dom_media_source_extensions_enabled: bool,
+     pub media_glvideo_enabled: bool,
+     /// Enable a non-standard event handler for verifying behavior of media elements during tests.
+     pub media_testing_enabled: bool,
+@@ -592,6 +594,7 @@ impl Preferences {
+             layout_parallelism_job_size_minimum: 16,
+             mathml_core_enabled: false,
+             media_android_backend_enabled: false,
++            dom_media_source_extensions_enabled: false,
+             media_glvideo_enabled: false,
+             media_testing_enabled: false,
+             network_connection_timeout: 15,
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index dd9980f9a..5c46c8247 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -348,6 +348,7 @@ pub struct PumpStatus {
+     pub all_buffers_ready: bool,
+     pub buffered: Vec<std::ops::Range<i64>>,
+     pub buffer_ranges: Vec<(u32, Vec<std::ops::Range<i64>>)>,
++    pub buffer_tracks: Vec<(u32, Vec<crate::mse_demux::TrackDescription>)>,
+ }
+ 
+ pub struct AppendPlayback {
+@@ -476,12 +477,14 @@ impl AppendPlayback {
+         if self.failed {
+             return Err(());
+         }
+-        let r = self
+-            .sessions
+-            .get_mut(&id)
+-            .ok_or(())?
+-            .append(bytes)
+-            .map_err(|_| ());
++        // Reclaim played history before processing new media. Retain30seconds
++        // plus each track's preceding RAP; never evict data ahead of the clock.
++        let cutoff = self.clock.now_us().saturating_sub(30_000_000);
++        let session = self.sessions.get_mut(&id).ok_or(())?;
++        if cutoff > 0 {
++            session.evict_before(cutoff);
++        }
++        let r = session.append(bytes).map_err(|_| ());
+         self.checked(r)
+     }
+     pub fn end_input(&mut self) -> Result<(), ()> {
+@@ -585,6 +588,11 @@ impl AppendPlayback {
+                 || self.clock.audio_frames_written > 0,
+             buffered: self.buffered(),
+             buffer_ranges: self.buffer_ranges(),
++            buffer_tracks: self
++                .sessions
++                .iter()
++                .map(|(id, s)| (*id, s.descriptions().to_vec()))
++                .collect(),
+         })
+     }
+     fn pump_inner(&mut self) -> Result<bool, ()> {
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index ab6af4cf3..08b27f963 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -32,6 +32,7 @@ struct State {
+     buffers: BTreeMap<u32, BufferState>,
+     buffered: Vec<Range<f64>>,
+     buffer_ranges: BTreeMap<u32, Vec<Range<f64>>>,
++    buffer_tracks: BTreeMap<u32, Vec<servo_media_player::append::AppendTrack>>,
+ }
+ pub struct AndroidAppendPlayer {
+     id: usize,
+@@ -59,6 +60,7 @@ impl AndroidAppendPlayer {
+             buffers: BTreeMap::new(),
+             buffered: vec![],
+             buffer_ranges: BTreeMap::new(),
++            buffer_tracks: BTreeMap::new(),
+         }));
+         let shared = state.clone();
+         let sender = Arc::new(Mutex::new(sender));
+@@ -138,6 +140,7 @@ impl AndroidAppendPlayer {
+                                 )
+                             })
+                             .collect();
++                        shared.lock().unwrap().buffer_tracks = status.buffer_tracks.iter().map(|(id,tracks)| (*id, tracks.iter().map(|t| servo_media_player::append::AppendTrack {id:t.id,mime:t.mime.to_owned()}).collect())).collect();
+                         let ready = status.all_buffers_ready && status.current_data;
+                         if status.all_buffers_ready
+                             && (!old_initialized
+@@ -440,6 +443,7 @@ impl Player for AndroidAppendPlayer {
+             window: start..end,
+         })
+     }
++    fn append_tracks(&self, id: u32) -> Vec<servo_media_player::append::AppendTrack> { self.state.lock().unwrap().buffer_tracks.get(&id).cloned().unwrap_or_default() }
+     fn append_buffered(&self, id: u32) -> Vec<Range<f64>> {
+         self.state
+             .lock()
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index 7278f3a8d..469594a83 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -118,7 +118,10 @@ pub trait Player: Send + MediaInstance {
+     fn append_buffered(&self, _id: u32) -> Vec<Range<f64>> {
+         vec![]
+     }
++    fn append_tracks(&self, _id: u32) -> Vec<append::AppendTrack> { vec![] }
++
+ }
++
+ // END OWNER API
+ 
+ #[test] fn player_api_matches_owner_source() {
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index 33da5560f..65a739691 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -172,6 +172,8 @@ mod pipeline_tests {
+         let metadata=loop { match events.recv_timeout(Duration::from_secs(2)).unwrap() { PlayerEvent::MetadataUpdated(m)=>break m, PlayerEvent::StateChanged(_) => panic!("decoded-data readiness emitted for initialization only"), _=>() } };
+         assert_eq!(metadata.video_tracks, ["video/avc"]);
+         assert_eq!(metadata.audio_tracks, ["audio/mp4a-latm"]);
++        assert_eq!(player.lock().unwrap().append_tracks(1).iter().map(|t|t.mime.as_str()).collect::<Vec<_>>(), ["video/avc"]);
++        assert_eq!(player.lock().unwrap().append_tracks(2).iter().map(|t|t.mime.as_str()).collect::<Vec<_>>(), ["audio/mp4a-latm"]);
+         assert!(metadata.width>0 && metadata.height>0);
+         assert!(player.lock().unwrap().buffered().is_empty());
+         assert!(events.try_iter().all(|e| !matches!(e,PlayerEvent::NeedData|PlayerEvent::StateChanged(_))));
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index 50d7d8fc9..0db1d0dda 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -104,6 +104,9 @@ impl AppendSession {
+         self.window = window;
+         Ok(())
+     }
++    pub fn evict_before(&mut self, cutoff_us: i64) -> usize {
++        self.store.evict_before(cutoff_us)
++    }
+     pub fn descriptions(&self) -> &[super::TrackDescription] {
+         self.stream.descriptions()
+     }
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+index 676e8139e..634fdfac8 100644
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -152,6 +152,28 @@ impl FrameStore {
+         }
+         Ok(accepted)
+     }
++    /// Automatic back-buffer eviction, not script remove(). Keep the random
++    /// access point preceding the retained window plus every dependent frame.
++    /// Call only with a cutoff safely behind consumed/displayed playback.
++    pub fn evict_before(&mut self, cutoff_us: i64) -> usize {
++        let mut freed = 0usize;
++        for frames in self.tracks.values_mut() {
++            let Some(keep) = frames
++                .iter()
++                .enumerate()
++                .filter(|(_, f)| f.keyframe && f.pts_us <= cutoff_us)
++                .map(|(i, _)| i)
++                .last()
++            else {
++                continue;
++            };
++            for frame in frames.drain(..keep) {
++                freed += frame.data.len();
++            }
++        }
++        self.bytes -= freed;
++        freed
++    }
+     pub fn remove(&mut self, start: i64, end: i64) -> Result<(), StoreError> {
+         if start < 0 || end <= start {
+             return Err(StoreError::Window);
+@@ -332,4 +354,38 @@ mod tests {
+             .unwrap();
+         assert_eq!(s.ranges(1), vec![0..10, 20..30]);
+     }
++    #[test]
++    fn automatic_eviction_keeps_preceding_random_access_and_dependency_chain() {
++        let mut s = FrameStore::new(128);
++        s.append(
++            vec![
++                f(0, true),
++                f(10, false),
++                f(20, true),
++                f(30, false),
++                f(40, true),
++            ],
++            0,
++            0..100,
++        )
++        .unwrap();
++        assert_eq!(s.evict_before(35), 8);
++        assert_eq!(
++            s.frames(1).iter().map(|f| f.pts_us).collect::<Vec<_>>(),
++            [20, 30, 40]
++        );
++        assert_eq!(s.bytes(), 12);
++        assert_eq!(s.ranges(1), vec![20..50]);
++        assert_eq!(s.evict_before(19), 0);
++        let replay = s.replay_from(35).unwrap();
++        assert_eq!(replay[0].pts_us, 20);
++    }
++    #[test]
++    fn automatic_eviction_does_not_drop_only_random_access_point() {
++        let mut s = FrameStore::new(128);
++        s.append(vec![f(0, true), f(10, false), f(20, false)], 0, 0..100)
++            .unwrap();
++        assert_eq!(s.evict_before(25), 0);
++        assert_eq!(s.bytes(), 12);
++    }
+ }
+diff --git a/components/media/player/append.rs b/components/media/player/append.rs
+index 92255abb2..a70aecc0a 100644
+--- a/components/media/player/append.rs
++++ b/components/media/player/append.rs
+@@ -14,3 +14,6 @@ pub enum AppendEvent {
+     Closed,
+ }
+ pub type AppendCallback = Box<dyn Fn(AppendEvent) + Send + Sync>;
++
++#[derive(Clone,Debug,PartialEq,Eq)]
++pub struct AppendTrack { pub id:u32, pub mime:String }
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+index 522d317d5..ea3985854 100644
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -269,6 +269,11 @@ impl AppendBuffer {
+         b.window = window;
+         Ok(())
+     }
++    pub fn tracks(&self) -> Result<Vec<crate::append::AppendTrack>, SourceError> {
++        let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;
++        let player={let s=inner.state.lock().unwrap(); if s.epoch!=self.epoch || !s.buffers.contains_key(&self.id) {return Err(SourceError::InvalidState);} s.player.clone().ok_or(SourceError::InvalidState)?};
++        let tracks=player.lock().unwrap().append_tracks(self.id);Ok(tracks)
++    }
+     pub fn buffered(&self) -> Vec<std::ops::Range<f64>> {
+         let Some(inner) = self.owner.upgrade() else {
+             return vec![];
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 1a5bd4dee..7e62d9230 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -156,4 +156,6 @@ pub trait Player: Send + MediaInstance {
+     fn append_buffered(&self, _id: u32) -> Vec<Range<f64>> {
+         vec![]
+     }
++    fn append_tracks(&self, _id: u32) -> Vec<append::AppendTrack> { vec![] }
++
+ }
+diff --git a/components/script/dom/audio/audiotracklist.rs b/components/script/dom/audio/audiotracklist.rs
+index 1b4a393c0..43bf2c550 100644
+--- a/components/script/dom/audio/audiotracklist.rs
++++ b/components/script/dom/audio/audiotracklist.rs
+@@ -20,6 +20,7 @@ use crate::dom::window::Window;
+ 
+ #[dom_struct]
+ pub(crate) struct AudioTrackList {
++    owns_tracks: bool,
+     eventtarget: EventTarget,
+     tracks: DomRefCell<Vec<Dom<AudioTrack>>>,
+     media_element: Option<Dom<HTMLMediaElement>>,
+@@ -31,6 +32,7 @@ impl AudioTrackList {
+         media_element: Option<&HTMLMediaElement>,
+     ) -> AudioTrackList {
+         AudioTrackList {
++            owns_tracks: true,
+             eventtarget: EventTarget::new_inherited(),
+             tracks: DomRefCell::new(tracks.iter().map(|track| Dom::from_ref(&**track)).collect()),
+             media_element: media_element.map(Dom::from_ref),
+@@ -50,6 +52,21 @@ impl AudioTrackList {
+         )
+     }
+ 
++    pub(crate) fn new_shared(
++        cx: &mut JSContext,
++        window: &Window,
++        media: &HTMLMediaElement,
++    ) -> DomRoot<AudioTrackList> {
++        let mut list = Self::new_inherited(&[], Some(media));
++        list.owns_tracks = false;
++        reflect_dom_object(cx, Box::new(list), window)
++    }
++    pub(crate) fn add_shared(&self, track: &AudioTrack) {
++        assert!(!self.owns_tracks);
++        if !self.tracks.borrow().iter().any(|t| &**t == track) {
++            self.tracks.borrow_mut().push(Dom::from_ref(track));
++        }
++    }
+     pub(crate) fn len(&self) -> usize {
+         self.tracks.borrow().len()
+     }
+@@ -105,10 +122,12 @@ impl AudioTrackList {
+     }
+ 
+     pub(crate) fn clear(&self) {
+-        self.tracks
+-            .borrow()
+-            .iter()
+-            .for_each(|t| t.remove_track_list());
++        if self.owns_tracks {
++            self.tracks
++                .borrow()
++                .iter()
++                .for_each(|t| t.remove_track_list());
++        }
+         self.tracks.borrow_mut().clear();
+     }
+ }
+diff --git a/components/script/dom/globalscope/globalscope.rs b/components/script/dom/globalscope/globalscope.rs
+index e8a2b540e..3d0986292 100644
+--- a/components/script/dom/globalscope/globalscope.rs
++++ b/components/script/dom/globalscope/globalscope.rs
+@@ -183,6 +183,11 @@ pub(crate) struct GlobalScope {
+ 
+     /// The blobs managed by this global, if any.
+     blob_state: DomRefCell<HashMapTracedValues<BlobId, BlobInfo, FxBuildHasher>>,
++    // Strongly traced per-global URL entries. Exact canonical URL keys avoid
++    // treating a guessed UUID with another origin as a valid local source URL.
++    append_source_urls: DomRefCell<
++        HashMapTracedValues<String, Dom<crate::dom::mediasource::MediaSource>, FxBuildHasher>,
++    >,
+ 
+     /// <https://w3c.github.io/ServiceWorker/#environment-settings-object-service-worker-registration-object-map>
+     registration_map: DomRefCell<
+@@ -411,6 +416,7 @@ impl GlobalScope {
+             broadcast_channel_state: DomRefCell::new(BroadcastChannelState::UnManaged),
+             constellation_interest_counts: Default::default(),
+             blob_state: Default::default(),
++            append_source_urls: Default::default(),
+             eventtarget: EventTarget::new_inherited(),
+             registration_map: DomRefCell::new(HashMapTracedValues::new_fx()),
+             indexeddb: Default::default(),
+@@ -1703,6 +1709,33 @@ impl GlobalScope {
+         }
+     }
+ 
++    pub(crate) fn register_append_source_url(
++        &self,
++        url: &ServoUrl,
++        source: &crate::dom::mediasource::MediaSource,
++    ) {
++        self.append_source_urls
++            .borrow_mut()
++            .insert(url.as_str().to_owned(), Dom::from_ref(source));
++    }
++    pub(crate) fn lookup_append_source_url(
++        &self,
++        url: &ServoUrl,
++    ) -> Option<DomRoot<crate::dom::mediasource::MediaSource>> {
++        let mut url = url.clone();
++        url.as_mut_url().set_fragment(None);
++        self.append_source_urls
++            .borrow()
++            .get(url.as_str())
++            .map(|source| DomRoot::from_ref(&**source))
++    }
++    pub(crate) fn revoke_append_source_url(&self, url: &ServoUrl) -> bool {
++        self.append_source_urls
++            .borrow_mut()
++            .remove(url.as_str())
++            .is_some()
++    }
++
+     pub(crate) fn get_blob_url_id(&self, blob_id: &BlobId) -> Uuid {
+         let mut blob_state = self.blob_state.borrow_mut();
+         let parent = {
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index fa38a79f4..ffdd84367 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -8,6 +8,7 @@ use std::ops::Deref;
+ use std::sync::{Arc, Mutex, OnceLock};
+ use std::time::{Duration, Instant};
+ 
++use crate::dom::mediasource::MediaSource;
+ use atomic_refcell::AtomicRefCell;
+ use bytes::Bytes;
+ use content_security_policy::sandboxing_directive::SandboxingFlagSet;
+@@ -26,6 +27,7 @@ use net_traits::{CoreResourceThread, FetchMetadata, Metadata, NetworkError, Reso
+ use pixels::{CorsStatus, RasterImage};
+ use script_bindings::assert::assert_in_script;
+ use script_bindings::cell::DomRefCell;
++use script_bindings::codegen::GenericUnionTypes::BlobOrMediaSource;
+ use script_bindings::codegen::InheritTypes::{
+     ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId, NodeTypeId,
+ };
+@@ -58,7 +60,7 @@ use crate::dom::bindings::codegen::Bindings::TextTrackCueBinding::TextTrackCueMe
+ use crate::dom::bindings::codegen::Bindings::URLBinding::URLMethods;
+ use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
+ use crate::dom::bindings::codegen::UnionTypes::{
+-    MediaStreamOrBlob, VideoTrackOrAudioTrackOrTextTrack,
++    MediaStreamOrMediaSourceOrBlob, VideoTrackOrAudioTrackOrTextTrack,
+ };
+ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
+ use crate::dom::bindings::inheritance::Castable;
+@@ -127,15 +129,19 @@ const SEEK_POSITION_THRESHOLD: f64 = 0.5;
+ #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+ #[derive(JSTraceable, MallocSizeOf)]
+ enum SrcObject {
++    MediaSource(Dom<MediaSource>),
+     MediaStream(Dom<MediaStream>),
+     Blob(Dom<Blob>),
+ }
+ 
+-impl From<MediaStreamOrBlob> for SrcObject {
+-    fn from(src_object: MediaStreamOrBlob) -> SrcObject {
++impl From<MediaStreamOrMediaSourceOrBlob> for SrcObject {
++    fn from(src_object: MediaStreamOrMediaSourceOrBlob) -> SrcObject {
+         match src_object {
+-            MediaStreamOrBlob::Blob(blob) => SrcObject::Blob(Dom::from_ref(&*blob)),
+-            MediaStreamOrBlob::MediaStream(stream) => {
++            MediaStreamOrMediaSourceOrBlob::MediaSource(source) => {
++                SrcObject::MediaSource(Dom::from_ref(&*source))
++            },
++            MediaStreamOrMediaSourceOrBlob::Blob(blob) => SrcObject::Blob(Dom::from_ref(&*blob)),
++            MediaStreamOrMediaSourceOrBlob::MediaStream(stream) => {
+                 SrcObject::MediaStream(Dom::from_ref(&*stream))
+             },
+         }
+@@ -188,6 +194,7 @@ pub(crate) struct HTMLMediaElement {
+     ready_state: Cell<ReadyState>,
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-srcobject>
+     src_object: DomRefCell<Option<SrcObject>>,
++    attached_append_source: MutNullableDom<MediaSource>,
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-currentsrc>
+     #[no_trace]
+     current_src: AtomicRefCell<String>,
+@@ -411,6 +418,7 @@ impl HTMLMediaElement {
+             network_state: Cell::new(NetworkState::Empty),
+             ready_state: Cell::new(ReadyState::HaveNothing),
+             src_object: Default::default(),
++            attached_append_source: MutNullableDom::new(None),
+             current_src: Default::default(),
+             generation_id: Cell::new(0),
+             fired_loadeddata_event: Cell::new(false),
+@@ -1526,6 +1534,9 @@ impl HTMLMediaElement {
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-algorithm>
+     fn resource_selection_algorithm_failure_steps(&self, cx: &JSContext) {
++        if self.attached_append_source.get().is_some() {
++            self.reset_media_player(cx.no_gc());
++        }
+         match self.load_state.get() {
+             LoadState::LoadingFromSrcObject => {
+                 // Step 9.object.4. Failed with media provider: Reaching this step indicates that
+@@ -1641,12 +1652,40 @@ impl HTMLMediaElement {
+ 
+     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+     fn resource_fetch_algorithm(&self, cx: &JSContext, resource: Resource) {
+-        if let Err(e) = self.create_media_player(&resource) {
++        let append_source = match &resource {
++            Resource::Url(url) => self.global().lookup_append_source_url(url),
++            Resource::Object => match &*self.src_object.borrow() {
++                Some(SrcObject::MediaSource(source)) => Some(DomRoot::from_ref(&**source)),
++                _ => None,
++            },
++        };
++        if let Err(e) = self.create_media_player(&resource, append_source.is_some()) {
+             error!("Create media player error {:?}", e);
+             self.resource_selection_algorithm_failure_steps(cx);
+             return;
+         }
+ 
++        if let Some(source) = append_source {
++            let Some(player) = self.player.borrow().as_ref().cloned() else {
++                self.resource_selection_algorithm_failure_steps(cx);
++                return;
++            };
++            if source.attach(player, self).is_err() {
++                self.reset_media_player(cx.no_gc());
++                self.resource_selection_algorithm_failure_steps(cx);
++                return;
++            }
++            self.attached_append_source.set(Some(&source));
++            let this = Trusted::new(self);
++            let generation = self.generation_id.get();
++            self.global().task_manager().media_element_task_source().queue(task!(append_source_release_load_delay: move |cx| {
++                let this = this.root(); if this.generation_id.get() == generation { this.delay_load_event(cx, false); }
++            }));
++            // No URL fetch, AMediaExtractor, HTTP range request or progressive
++            // input is permitted for an attached append source.
++            return;
++        }
++
+         // Steps 1-2.
+         // Unapplicable, the `resource` variable already conveys which mode
+         // is in use.
+@@ -1707,11 +1746,18 @@ impl HTMLMediaElement {
+                 if let Some(ref src_object) = *self.src_object.borrow() {
+                     match src_object {
+                         SrcObject::Blob(blob) => {
+-                            let blob_url = URL::CreateObjectURL(&self.global(), blob);
++                            let blob_url = URL::CreateObjectURL(
++                                &self.global(),
++                                BlobOrMediaSource::Blob(DomRoot::from_ref(&**blob)),
++                            );
+                             *self.blob_url.borrow_mut() =
+                                 Some(ServoUrl::parse(&blob_url.str()).expect("infallible"));
+                             self.fetch_request(cx, None, None);
+                         },
++                        SrcObject::MediaSource(_) => {
++                            self.resource_selection_algorithm_failure_steps(cx);
++                            return;
++                        },
+                         SrcObject::MediaStream(stream) => {
+                             let tracks = &*stream.get_tracks();
+                             for (pos, track) in tracks.iter().enumerate() {
+@@ -2086,6 +2132,9 @@ impl HTMLMediaElement {
+     /// => "If the connection is interrupted after some media data has been received..."
+     /// => "If the media data is corrupted"
+     fn media_data_processing_fatal_steps(&self, cx: &mut JSContext, error: u16) {
++        if self.attached_append_source.get().is_some() {
++            self.reset_media_player(cx.no_gc());
++        }
+         *self.source_children_pointer.borrow_mut() = None;
+         self.current_source_child.set(None);
+ 
+@@ -2256,7 +2305,7 @@ impl HTMLMediaElement {
+             .map(|player| player.lock().unwrap().get_id())
+     }
+ 
+-    fn create_media_player(&self, resource: &Resource) -> Result<(), ()> {
++    fn create_media_player(&self, resource: &Resource, append: bool) -> Result<(), ()> {
+         let stream_type = match *resource {
+             Resource::Object => {
+                 if let Some(ref src_object) = *self.src_object.borrow() {
+@@ -2320,14 +2369,20 @@ impl HTMLMediaElement {
+             }));
+         })
+         .unwrap();
+-        let player = ServoMedia::get().create_player(
+-            &client_context_id,
+-            stream_type,
+-            action_callback,
+-            video_renderer,
+-            audio_renderer,
+-            Box::new(window.get_player_context()),
+-        );
++        let player = if append {
++            ServoMedia::get()
++                .create_append_player(&client_context_id, action_callback, video_renderer)
++                .map_err(|_| ())?
++        } else {
++            ServoMedia::get().create_player(
++                &client_context_id,
++                stream_type,
++                action_callback,
++                video_renderer,
++                audio_renderer,
++                Box::new(window.get_player_context()),
++            )
++        };
+ 
+         let player_id = {
+             let player_guard = player.lock().unwrap();
+@@ -2375,6 +2430,10 @@ impl HTMLMediaElement {
+     }
+ 
+     fn reset_media_player(&self, no_gc: &NoGC) {
++        if let Some(source) = self.attached_append_source.get() {
++            self.attached_append_source.set(None);
++            source.detach();
++        }
+         if self.player.borrow().is_none() {
+             return;
+         }
+@@ -2699,6 +2758,10 @@ impl HTMLMediaElement {
+                 .fire(cx, video_track_list.upcast::<EventTarget>());
+         }
+ 
++        if let Some(source) = self.attached_append_source.get() {
++            source.sync_tracks(cx);
++        }
++
+         // => "Once enough of the media data has been fetched to determine the duration..."
+ 
+         // TODO Step 1. Establish the media timeline for the purposes of the current playback
+@@ -3374,19 +3437,24 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-srcobject>
+-    fn GetSrcObject(&self) -> Option<MediaStreamOrBlob> {
++    fn GetSrcObject(&self) -> Option<MediaStreamOrMediaSourceOrBlob> {
+         (*self.src_object.borrow())
+             .as_ref()
+             .map(|src_object| match src_object {
+-                SrcObject::Blob(blob) => MediaStreamOrBlob::Blob(DomRoot::from_ref(blob)),
++                SrcObject::MediaSource(source) => {
++                    MediaStreamOrMediaSourceOrBlob::MediaSource(DomRoot::from_ref(source))
++                },
++                SrcObject::Blob(blob) => {
++                    MediaStreamOrMediaSourceOrBlob::Blob(DomRoot::from_ref(blob))
++                },
+                 SrcObject::MediaStream(stream) => {
+-                    MediaStreamOrBlob::MediaStream(DomRoot::from_ref(stream))
++                    MediaStreamOrMediaSourceOrBlob::MediaStream(DomRoot::from_ref(stream))
+                 },
+             })
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dom-media-srcobject>
+-    fn SetSrcObject(&self, cx: &mut JSContext, value: Option<MediaStreamOrBlob>) {
++    fn SetSrcObject(&self, cx: &mut JSContext, value: Option<MediaStreamOrMediaSourceOrBlob>) {
+         *self.src_object.borrow_mut() = value.map(|value| value.into());
+         self.media_element_load_algorithm(cx);
+     }
+diff --git a/components/script/dom/media/videotracklist.rs b/components/script/dom/media/videotracklist.rs
+index 5bdfc60ff..e7d5c86f3 100644
+--- a/components/script/dom/media/videotracklist.rs
++++ b/components/script/dom/media/videotracklist.rs
+@@ -20,6 +20,7 @@ use crate::dom::window::Window;
+ 
+ #[dom_struct]
+ pub(crate) struct VideoTrackList {
++    owns_tracks: bool,
+     eventtarget: EventTarget,
+     tracks: DomRefCell<Vec<Dom<VideoTrack>>>,
+     media_element: Option<Dom<HTMLMediaElement>>,
+@@ -31,6 +32,7 @@ impl VideoTrackList {
+         media_element: Option<&HTMLMediaElement>,
+     ) -> VideoTrackList {
+         VideoTrackList {
++            owns_tracks: true,
+             eventtarget: EventTarget::new_inherited(),
+             tracks: DomRefCell::new(tracks.iter().map(|track| Dom::from_ref(&**track)).collect()),
+             media_element: media_element.map(Dom::from_ref),
+@@ -50,6 +52,21 @@ impl VideoTrackList {
+         )
+     }
+ 
++    pub(crate) fn new_shared(
++        cx: &mut JSContext,
++        window: &Window,
++        media: &HTMLMediaElement,
++    ) -> DomRoot<VideoTrackList> {
++        let mut list = Self::new_inherited(&[], Some(media));
++        list.owns_tracks = false;
++        reflect_dom_object(cx, Box::new(list), window)
++    }
++    pub(crate) fn add_shared(&self, track: &VideoTrack) {
++        assert!(!self.owns_tracks);
++        if !self.tracks.borrow().iter().any(|t| &**t == track) {
++            self.tracks.borrow_mut().push(Dom::from_ref(track));
++        }
++    }
+     pub(crate) fn len(&self) -> usize {
+         self.tracks.borrow().len()
+     }
+@@ -113,10 +130,12 @@ impl VideoTrackList {
+     }
+ 
+     pub(crate) fn clear(&self) {
+-        self.tracks
+-            .borrow()
+-            .iter()
+-            .for_each(|t| t.remove_track_list());
++        if self.owns_tracks {
++            self.tracks
++                .borrow()
++                .iter()
++                .for_each(|t| t.remove_track_list());
++        }
+         self.tracks.borrow_mut().clear();
+     }
+ }
+diff --git a/components/script/dom/mod.rs b/components/script/dom/mod.rs
+index 403936fda..15e337698 100644
+--- a/components/script/dom/mod.rs
++++ b/components/script/dom/mod.rs
+@@ -283,6 +283,8 @@ pub(crate) mod intersectionobserver;
+ pub(crate) use self::intersectionobserver::*;
+ pub(crate) mod mathml;
+ pub(crate) use self::mathml::*;
++pub(crate) mod mse;
++pub(crate) use self::mse::*;
+ pub(crate) mod media;
+ pub(crate) use self::media::*;
+ pub(crate) mod mimetype;
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+new file mode 100644
+index 000000000..7d3c1b206
+--- /dev/null
++++ b/components/script/dom/mse/mediasource.rs
+@@ -0,0 +1,284 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++//! Uncompiled attachment draft. No preference or capability is enabled.
++//! HTMLMediaElement must call detach before NETWORK_EMPTY/resource teardown.
++use crate::dom::{
++    bindings::{
++        inheritance::Castable,
++        reflector::DomGlobal,
++        root::{DomRoot, MutNullableDom},
++    },
++    eventtarget::EventTarget,
++    globalscope::GlobalScope,
++    htmlmediaelement::HTMLMediaElement,
++    sourcebuffer::SourceBuffer,
++    sourcebufferlist::SourceBufferList,
++    window::Window,
++};
++use dom_struct::dom_struct;
++use js::{context::JSContext, rust::HandleObject};
++use script_bindings::{
++    assert::assert_in_script,
++    codegen::GenericBindings::MediaSourceBinding::{
++        EndOfStreamError, MediaSourceMethods, ReadyState,
++    },
++    domstring::DOMString,
++    error::{Error, Fallible},
++    num::Finite,
++    reflector::reflect_weak_referenceable_dom_object_with_proto,
++    weakref::WeakRef,
++};
++use servo_media::player::{
++    Player,
++    append_source::{AppendSource, SourceError, SourceEvent, SourceState},
++};
++use std::{
++    cell::{Cell, RefCell},
++    rc::Rc,
++    sync::{
++        Arc, Mutex, Weak,
++        atomic::{AtomicU64, Ordering},
++    },
++};
++
++#[dom_struct]
++pub(crate) struct MediaSource {
++    event_target: EventTarget,
++    #[no_trace]
++    #[ignore_malloc_size_of = "private append source controller"]
++    controller: AppendSource,
++    #[no_trace]
++    #[ignore_malloc_size_of = "weak backend callback routing"]
++    callback_route: Arc<Mutex<Weak<Mutex<SourceEventTarget>>>>,
++    #[no_trace]
++    #[ignore_malloc_size_of = "backend event generation"]
++    generation: Arc<AtomicU64>,
++    #[no_trace]
++    #[ignore_malloc_size_of = "script-thread weak DOM event target"]
++    event_target_owner: RefCell<Option<Arc<Mutex<SourceEventTarget>>>>,
++    media: MutNullableDom<HTMLMediaElement>,
++    source_buffers: MutNullableDom<SourceBufferList>,
++    active_buffers: MutNullableDom<SourceBufferList>,
++    duration: Cell<f64>,
++}
++fn source_error(error: SourceError) -> Error {
++    match error {
++        SourceError::InvalidState | SourceError::Backend => Error::InvalidState(None),
++        SourceError::Type => Error::Type("Invalid source parameters".to_owned()),
++        SourceError::NotSupported => Error::NotSupported(None),
++        SourceError::Quota => Error::QuotaExceeded {
++            quota: None,
++            requested: None,
++        },
++    }
++}
++impl MediaSource {
++    pub(crate) fn new_with_proto(
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        proto: Option<HandleObject>,
++    ) -> Fallible<DomRoot<Self>> {
++        let route: Arc<Mutex<Weak<Mutex<SourceEventTarget>>>> = Arc::new(Mutex::new(Weak::new()));
++        let callback_route = route.clone();
++        let generation = Arc::new(AtomicU64::new(0));
++        let callback_generation = generation.clone();
++        let tasks = Arc::new(Mutex::new(
++            global
++                .task_manager()
++                .media_element_task_source()
++                .to_sendable(),
++        ));
++        let controller = AppendSource::new(Arc::new(move |event| {
++            let target = callback_route.lock().unwrap().clone();
++            let generation = callback_generation.load(Ordering::Acquire);
++            tasks.lock().unwrap().queue(task!(append_source_backend_event: move |cx| {
++                // Upgrade, root and drop the non-thread-safe weak DOM handle
++                // only on the script thread, never in the native callback.
++                let Some(target)=target.upgrade() else{return;};
++                let this={ let target=target.lock().unwrap(); target.source.root() };
++                let Some(this)=this else{return;};
++                if this.generation.load(Ordering::Acquire)==generation {this.backend_event(cx,event);}
++            }));
++        }));
++        let this = reflect_weak_referenceable_dom_object_with_proto(
++            cx,
++            Rc::new(Self {
++                event_target: EventTarget::new_inherited(),
++                controller,
++                callback_route: route,
++                generation,
++                event_target_owner: RefCell::new(None),
++                media: MutNullableDom::new(None),
++                source_buffers: MutNullableDom::new(None),
++                active_buffers: MutNullableDom::new(None),
++                duration: Cell::new(f64::NAN),
++            }),
++            global,
++            proto,
++        );
++        let target = Arc::new(Mutex::new(SourceEventTarget {
++            source: WeakRef::new(&*this),
++        }));
++        *this.callback_route.lock().unwrap() = Arc::downgrade(&target);
++        *this.event_target_owner.borrow_mut() = Some(target);
++        Ok(this)
++    }
++    pub(crate) fn attach(
++        &self,
++        player: Arc<Mutex<dyn Player>>,
++        media: &HTMLMediaElement,
++    ) -> Fallible<()> {
++        if self.controller.state() != SourceState::Closed || self.media.get().is_some() {
++            return Err(Error::InvalidState(None));
++        }
++        self.media.set(Some(media));
++        self.generation.fetch_add(1, Ordering::AcqRel);
++        if let Err(error) = self.controller.attach(player) {
++            self.media.set(None);
++            return Err(source_error(error));
++        }
++        Ok(())
++    }
++    pub(crate) fn detach(&self) {
++        self.generation.fetch_add(1, Ordering::AcqRel);
++        self.controller.detach();
++        self.media.set(None);
++        self.duration.set(f64::NAN);
++        if let Some(list) = self.source_buffers.get() {
++            list.clear();
++        }
++        if let Some(list) = self.active_buffers.get() {
++            list.clear();
++        }
++    }
++    pub(crate) fn sync_tracks(&self, cx: &mut JSContext) {
++        if let Some(list) = self.source_buffers.get() {
++            for buffer in list.buffers() {
++                if buffer.sync_tracks(cx) {
++                    self.ActiveSourceBuffers(cx).add(&buffer);
++                }
++            }
++        }
++    }
++    fn backend_event(&self, cx: &mut JSContext, event: SourceEvent) {
++        match event {
++            SourceEvent::Open => self
++                .upcast::<EventTarget>()
++                .fire_event(cx, stylo_atoms::Atom::from("sourceopen")),
++            SourceEvent::Ended => self
++                .upcast::<EventTarget>()
++                .fire_event(cx, stylo_atoms::Atom::from("sourceended")),
++            SourceEvent::Closed => self
++                .upcast::<EventTarget>()
++                .fire_event(cx, stylo_atoms::Atom::from("sourceclose")),
++            SourceEvent::BufferAdded(_) => (),
++            SourceEvent::BufferEvent(id, event) => {
++                if let Some(list) = self.source_buffers.get() {
++                    for buffer in list.buffers() {
++                        if buffer.buffer_id() == id {
++                            buffer.fire_backend_event(cx, event);
++                            break;
++                        }
++                    }
++                }
++            },
++        }
++    }
++}
++impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
++    fn Constructor(
++        cx: &mut JSContext,
++        global: &Window,
++        proto: Option<HandleObject>,
++    ) -> Fallible<DomRoot<Self>> {
++        Self::new_with_proto(cx, global.as_global_scope(), proto)
++    }
++    fn SourceBuffers(&self, cx: &mut JSContext) -> DomRoot<SourceBufferList> {
++        self.source_buffers
++            .or_init(|| SourceBufferList::new(cx, &self.global()))
++    }
++    fn ActiveSourceBuffers(&self, cx: &mut JSContext) -> DomRoot<SourceBufferList> {
++        self.active_buffers
++            .or_init(|| SourceBufferList::new(cx, &self.global()))
++    }
++    fn ReadyState(&self) -> ReadyState {
++        match self.controller.state() {
++            SourceState::Closed => ReadyState::Closed,
++            SourceState::Open => ReadyState::Open,
++            SourceState::Ended => ReadyState::Ended,
++        }
++    }
++    fn Duration(&self) -> f64 {
++        self.duration.get()
++    }
++    fn SetDuration(&self, _: f64) -> Fallible<()> {
++        Err(Error::NotSupported(Some(
++            "Duration changes require coordinated coded-frame removal".to_owned(),
++        )))
++    }
++    fn CanConstructInDedicatedWorker(_: &Window) -> bool {
++        false
++    }
++    fn AddSourceBuffer(
++        &self,
++        cx: &mut JSContext,
++        mime: DOMString,
++    ) -> Fallible<DomRoot<SourceBuffer>> {
++        if mime.is_empty() {
++            return Err(Error::Type("Empty SourceBuffer type".to_owned()));
++        }
++        let media = self.media.get().ok_or(Error::InvalidState(None))?;
++        let handle = self
++            .controller
++            .add_buffer(&mime.to_string())
++            .map_err(source_error)?;
++        let buffer = SourceBuffer::new(cx, &self.global(), handle, &media);
++        self.SourceBuffers(cx).add(&buffer);
++        // Active membership MUST be populated from initialization track metadata,
++        // not simply from addSourceBuffer. No fabricated active list here.
++        Ok(buffer)
++    }
++    fn RemoveSourceBuffer(&self, _: &SourceBuffer) -> Fallible<()> {
++        Err(Error::NotSupported(Some(
++            "Live decoder removal synchronization is not implemented".to_owned(),
++        )))
++    }
++    fn EndOfStream(&self, error: Option<EndOfStreamError>) -> Fallible<()> {
++        if error.is_some() {
++            return Err(Error::NotSupported(Some(
++                "Error endOfStream propagation is not implemented".to_owned(),
++            )));
++        }
++        self.controller.end_input().map_err(source_error)
++    }
++    fn SetLiveSeekableRange(&self, _: Finite<f64>, _: Finite<f64>) -> Fallible<()> {
++        Err(Error::NotSupported(None))
++    }
++    fn ClearLiveSeekableRange(&self) -> Fallible<()> {
++        Err(Error::NotSupported(None))
++    }
++    // Capability stays false until actual decoder/platform/DOM support is ready.
++    fn IsTypeSupported(_: &Window, _: DOMString) -> bool {
++        false
++    }
++    event_handler!(sourceopen, GetOnsourceopen, SetOnsourceopen);
++    event_handler!(sourceended, GetOnsourceended, SetOnsourceended);
++    event_handler!(sourceclose, GetOnsourceclose, SetOnsourceclose);
++}
++
++// Like the existing HTMLMediaElement event handler, this owner is accessed
++// and dropped only on the script thread. Worker callbacks capture ONLY Weak
++// handles and queue them without upgrading; no DOM allocation is rooted by
++// the callback registration itself.
++#[derive(JSTraceable, MallocSizeOf)]
++struct SourceEventTarget {
++    source: WeakRef<MediaSource>,
++}
++#[expect(unsafe_code)]
++unsafe impl Send for SourceEventTarget {}
++impl Drop for SourceEventTarget {
++    fn drop(&mut self) {
++        assert_in_script();
++    }
++}
+diff --git a/components/script/dom/mse/mod.rs b/components/script/dom/mse/mod.rs
+new file mode 100644
+index 000000000..3827c6fc7
+--- /dev/null
++++ b/components/script/dom/mse/mod.rs
+@@ -0,0 +1,3 @@
++pub(crate) mod mediasource;
++pub(crate) mod sourcebuffer;
++pub(crate) mod sourcebufferlist;
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+new file mode 100644
+index 000000000..5b9449db0
+--- /dev/null
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -0,0 +1,271 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++//! Staged real controller-backed DOM wrapper. This remains unexposed while
++//! abort/remove/changeType/sequence and track synchronization are incomplete.
++use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementMethods;
++use crate::dom::{
++    audio::audiotracklist::AudioTrackList,
++    bindings::{
++        inheritance::Castable,
++        refcounted::Trusted,
++        reflector::DomGlobal,
++        root::{Dom, DomRoot, MutNullableDom},
++    },
++    eventtarget::EventTarget,
++    globalscope::GlobalScope,
++    htmlmediaelement::HTMLMediaElement,
++    texttracklist::TextTrackList,
++    timeranges::{TimeRanges, TimeRangesContainer},
++    videotracklist::VideoTrackList,
++};
++use crate::dom::{event::Event, trackevent::TrackEvent};
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use script_bindings::codegen::GenericUnionTypes::VideoTrackOrAudioTrackOrTextTrack;
++use script_bindings::{
++    codegen::{
++        GenericBindings::SourceBufferBinding::{AppendMode, SourceBufferMethods},
++        GenericUnionTypes::ArrayBufferViewOrArrayBuffer,
++    },
++    domstring::DOMString,
++    error::{Error, Fallible},
++    num::Finite,
++    reflector::reflect_dom_object,
++};
++use servo_media::player::append_source::{AppendBuffer, SourceError};
++use std::cell::Cell;
++#[dom_struct]
++pub(crate) struct SourceBuffer {
++    event_target: EventTarget,
++    #[no_trace]
++    #[ignore_malloc_size_of = "private backend controller"]
++    buffer: AppendBuffer,
++    media: Dom<HTMLMediaElement>,
++    last_offset: Cell<f64>,
++    last_start: Cell<f64>,
++    last_end: Cell<f64>,
++    tracks_synced: Cell<bool>,
++    audio_tracks: MutNullableDom<AudioTrackList>,
++    video_tracks: MutNullableDom<VideoTrackList>,
++    text_tracks: MutNullableDom<TextTrackList>,
++}
++fn source_error(error: SourceError) -> Error {
++    match error {
++        SourceError::Type => Error::Type("Invalid append timestamp/window".to_owned()),
++        SourceError::NotSupported => Error::NotSupported(None),
++        SourceError::Quota => Error::QuotaExceeded {
++            quota: None,
++            requested: None,
++        },
++        SourceError::InvalidState | SourceError::Backend => Error::InvalidState(None),
++    }
++}
++impl SourceBuffer {
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        buffer: AppendBuffer,
++        media: &HTMLMediaElement,
++    ) -> DomRoot<Self> {
++        reflect_dom_object(
++            cx,
++            Box::new(Self {
++                event_target: EventTarget::new_inherited(),
++                buffer,
++                media: Dom::from_ref(media),
++                last_offset: Cell::new(0.0),
++                last_start: Cell::new(0.0),
++                last_end: Cell::new(f64::INFINITY),
++                tracks_synced: Cell::new(false),
++                audio_tracks: MutNullableDom::new(None),
++                video_tracks: MutNullableDom::new(None),
++                text_tracks: MutNullableDom::new(None),
++            }),
++            global,
++        )
++    }
++    pub(crate) fn sync_tracks(&self, cx: &mut JSContext) -> bool {
++        if self.tracks_synced.get() {
++            return true;
++        }
++        let Ok(tracks) = self.buffer.tracks() else {
++            return false;
++        };
++        if tracks.is_empty()
++            || tracks
++                .iter()
++                .any(|t| t.mime != "audio/mp4a-latm" && t.mime != "video/avc")
++        {
++            return false;
++        }
++        // Validate all targets before mutating either list. The backend permits
++        // only one audio and one video track, so each maps to element index0.
++        let audio = if tracks.iter().any(|t| t.mime == "audio/mp4a-latm") {
++            self.media.AudioTracks(cx).item(0)
++        } else {
++            None
++        };
++        let video = if tracks.iter().any(|t| t.mime == "video/avc") {
++            self.media.VideoTracks(cx).item(0)
++        } else {
++            None
++        };
++        if (tracks.iter().any(|t| t.mime == "audio/mp4a-latm") && audio.is_none())
++            || (tracks.iter().any(|t| t.mime == "video/avc") && video.is_none())
++        {
++            return false;
++        }
++        if let Some(track) = audio {
++            let list = self.AudioTracks(cx);
++            list.add_shared(&track);
++            let event = TrackEvent::new(
++                cx,
++                self.global().as_window(),
++                atom!("addtrack"),
++                false,
++                false,
++                &Some(VideoTrackOrAudioTrackOrTextTrack::AudioTrack(track)),
++            );
++            let event = Trusted::new(&*event);
++            let list = Trusted::new(&*list);
++            self.global().task_manager().media_element_task_source().queue(task!(append_audio_track_added:move|cx| {event.root().upcast::<Event>().fire(cx,list.root().upcast::<EventTarget>());}));
++        }
++        if let Some(track) = video {
++            let list = self.VideoTracks(cx);
++            list.add_shared(&track);
++            let event = TrackEvent::new(
++                cx,
++                self.global().as_window(),
++                atom!("addtrack"),
++                false,
++                false,
++                &Some(VideoTrackOrAudioTrackOrTextTrack::VideoTrack(track)),
++            );
++            let event = Trusted::new(&*event);
++            let list = Trusted::new(&*list);
++            self.global().task_manager().media_element_task_source().queue(task!(append_video_track_added:move|cx| {event.root().upcast::<Event>().fire(cx,list.root().upcast::<EventTarget>());}));
++        }
++        self.tracks_synced.set(true);
++        true
++    }
++    pub(crate) fn buffer_id(&self) -> u32 {
++        self.buffer.id()
++    }
++    pub(crate) fn fire_backend_event(
++        &self,
++        cx: &mut JSContext,
++        event: servo_media::player::append::AppendEvent,
++    ) {
++        use servo_media::player::append::AppendEvent;
++        let name = match event {
++            AppendEvent::UpdateStart => "updatestart",
++            AppendEvent::Update => "update",
++            AppendEvent::UpdateEnd => "updateend",
++            AppendEvent::Error => "error",
++            AppendEvent::Ready | AppendEvent::Closed => return,
++        };
++        self.upcast::<EventTarget>()
++            .fire_event(cx, stylo_atoms::Atom::from(name));
++    }
++}
++impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
++    fn Mode(&self) -> AppendMode {
++        AppendMode::Segments
++    }
++    fn SetMode(&self, value: AppendMode) -> Fallible<()> {
++        if self.buffer.options().is_err() || self.buffer.updating() {
++            return Err(Error::InvalidState(None));
++        }
++        if value == AppendMode::Sequence {
++            return Err(Error::NotSupported(Some(
++                "Sequence append mode is not implemented".to_owned(),
++            )));
++        }
++        Ok(())
++    }
++    fn Updating(&self) -> bool {
++        self.buffer.updating()
++    }
++    fn GetBuffered(&self, cx: &mut JSContext) -> Fallible<DomRoot<TimeRanges>> {
++        self.buffer.options().map_err(source_error)?;
++        let mut ranges = TimeRangesContainer::default();
++        for range in self.buffer.buffered() {
++            let _ = ranges.add(range.start, range.end);
++        }
++        Ok(TimeRanges::new(cx, self.global().as_window(), ranges))
++    }
++    fn TimestampOffset(&self) -> Finite<f64> {
++        Finite::new(self.last_offset.get()).expect("validated finite offset")
++    }
++    fn SetTimestampOffset(&self, value: Finite<f64>) -> Fallible<()> {
++        let (_, window) = self.buffer.options().map_err(source_error)?;
++        self.buffer
++            .set_options(*value, window)
++            .map_err(source_error)?;
++        self.last_offset.set(*value);
++        Ok(())
++    }
++    fn AppendWindowStart(&self) -> Finite<f64> {
++        Finite::new(self.last_start.get()).expect("validated finite window start")
++    }
++    fn SetAppendWindowStart(&self, value: Finite<f64>) -> Fallible<()> {
++        let (offset, window) = self.buffer.options().map_err(source_error)?;
++        self.buffer
++            .set_options(offset, *value..window.end)
++            .map_err(source_error)?;
++        self.last_start.set(*value);
++        Ok(())
++    }
++    fn AppendWindowEnd(&self) -> f64 {
++        self.last_end.get()
++    }
++    fn SetAppendWindowEnd(&self, value: f64) -> Fallible<()> {
++        let (offset, window) = self.buffer.options().map_err(source_error)?;
++        self.buffer
++            .set_options(offset, window.start..value)
++            .map_err(source_error)?;
++        self.last_end.set(value);
++        Ok(())
++    }
++    fn AudioTracks(&self, cx: &mut JSContext) -> DomRoot<AudioTrackList> {
++        self.audio_tracks
++            .or_init(|| AudioTrackList::new_shared(cx, self.global().as_window(), &self.media))
++    }
++    fn VideoTracks(&self, cx: &mut JSContext) -> DomRoot<VideoTrackList> {
++        self.video_tracks
++            .or_init(|| VideoTrackList::new_shared(cx, self.global().as_window(), &self.media))
++    }
++    fn TextTracks(&self, cx: &mut JSContext) -> DomRoot<TextTrackList> {
++        self.text_tracks
++            .or_init(|| TextTrackList::new(cx, &self.media, self.global().as_window(), &[]))
++    }
++    fn AppendBuffer(&self, data: ArrayBufferViewOrArrayBuffer) -> Fallible<()> {
++        let bytes = match data {
++            ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
++            ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
++        }
++        .ok_or_else(|| Error::Type("Buffer is detached".to_owned()))?;
++        self.buffer.append(bytes).map_err(source_error)
++    }
++    fn Abort(&self) -> Fallible<()> {
++        Err(Error::NotSupported(Some(
++            "Decoder/parser abort reset is not implemented".to_owned(),
++        )))
++    }
++    fn ChangeType(&self, _: DOMString) -> Fallible<()> {
++        Err(Error::NotSupported(Some(
++            "Decoder format replacement is not implemented".to_owned(),
++        )))
++    }
++    fn Remove(&self, _: Finite<f64>, _: f64) -> Fallible<()> {
++        Err(Error::NotSupported(Some(
++            "Live decoder removal synchronization is not implemented".to_owned(),
++        )))
++    }
++    event_handler!(updatestart, GetOnupdatestart, SetOnupdatestart);
++    event_handler!(update, GetOnupdate, SetOnupdate);
++    event_handler!(updateend, GetOnupdateend, SetOnupdateend);
++    event_handler!(error, GetOnerror, SetOnerror);
++    event_handler!(abort, GetOnabort, SetOnabort);
++}
+diff --git a/components/script/dom/mse/sourcebufferlist.rs b/components/script/dom/mse/sourcebufferlist.rs
+new file mode 100644
+index 000000000..3908d9007
+--- /dev/null
++++ b/components/script/dom/mse/sourcebufferlist.rs
+@@ -0,0 +1,88 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++//! Staged replacement for the excluded draft's freshly wrapped indexed getters.
++//! The list holds the actual DOM SourceBuffer objects, preserving JS identity.
++use crate::dom::{
++    bindings::{
++        inheritance::Castable,
++        refcounted::Trusted,
++        reflector::DomGlobal,
++        root::{Dom, DomRoot},
++    },
++    eventtarget::EventTarget,
++    globalscope::GlobalScope,
++    sourcebuffer::SourceBuffer,
++};
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use script_bindings::{
++    cell::DomRefCell, codegen::GenericBindings::SourceBufferListBinding::SourceBufferListMethods,
++    reflector::reflect_dom_object,
++};
++use stylo_atoms::Atom;
++#[dom_struct]
++pub(crate) struct SourceBufferList {
++    event_target: EventTarget,
++    buffers: DomRefCell<Vec<Dom<SourceBuffer>>>,
++}
++impl SourceBufferList {
++    pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<Self> {
++        reflect_dom_object(
++            cx,
++            Box::new(Self {
++                event_target: EventTarget::new_inherited(),
++                buffers: DomRefCell::new(vec![]),
++            }),
++            global,
++        )
++    }
++    pub(crate) fn add(&self, buffer: &SourceBuffer) {
++        if self.buffers.borrow().iter().any(|b| &**b == buffer) {
++            return;
++        }
++        self.buffers.borrow_mut().push(Dom::from_ref(buffer));
++        self.queue_change(stylo_atoms::Atom::from("addsourcebuffer"));
++    }
++    pub(crate) fn remove(&self, buffer: &SourceBuffer) {
++        let index = self.buffers.borrow().iter().position(|b| &**b == buffer);
++        if let Some(index) = index {
++            self.buffers.borrow_mut().remove(index);
++            self.queue_change(stylo_atoms::Atom::from("removesourcebuffer"));
++        }
++    }
++    pub(crate) fn clear(&self) {
++        if !self.buffers.borrow().is_empty() {
++            self.buffers.borrow_mut().clear();
++            self.queue_change(stylo_atoms::Atom::from("removesourcebuffer"));
++        }
++    }
++    pub(crate) fn buffers(&self) -> Vec<DomRoot<SourceBuffer>> {
++        self.buffers
++            .borrow()
++            .iter()
++            .map(|b| DomRoot::from_ref(&**b))
++            .collect()
++    }
++    fn queue_change(&self, name: Atom) {
++        let this = Trusted::new(self);
++        self.global().task_manager().media_element_task_source().queue(task!(mse_source_buffer_list_change:move |cx| {this.root().upcast::<EventTarget>().fire_event(cx,name);}));
++    }
++}
++impl SourceBufferListMethods<crate::DomTypeHolder> for SourceBufferList {
++    fn Length(&self) -> u32 {
++        self.buffers.borrow().len() as u32
++    }
++    fn IndexedGetter(&self, _cx: &mut JSContext, index: u32) -> Option<DomRoot<SourceBuffer>> {
++        self.buffers
++            .borrow()
++            .get(index as usize)
++            .map(|b| DomRoot::from_ref(&**b))
++    }
++    event_handler!(addsourcebuffer, GetOnaddsourcebuffer, SetOnaddsourcebuffer);
++    event_handler!(
++        removesourcebuffer,
++        GetOnremovesourcebuffer,
++        SetOnremovesourcebuffer
++    );
++}
+diff --git a/components/script/dom/url/url.rs b/components/script/dom/url/url.rs
+index 7af3ab63a..0885fef10 100644
+--- a/components/script/dom/url/url.rs
++++ b/components/script/dom/url/url.rs
+@@ -15,6 +15,7 @@ use net_traits::filemanager_thread::FileManagerThreadMsg;
+ use profile_traits::generic_channel;
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::cformat;
++use script_bindings::codegen::GenericUnionTypes::BlobOrMediaSource;
+ use script_bindings::reflector::{Reflector, reflect_weak_referenceable_dom_object_with_proto};
+ use servo_base::generic_channel::GenericSend;
+ use servo_url::{ImmutableOrigin, ServoUrl};
+@@ -193,14 +194,27 @@ impl URLMethods<crate::DomTypeHolder> for URL {
+     }
+ 
+     /// <https://w3c.github.io/FileAPI/#dfn-createObjectURL>
+-    fn CreateObjectURL(global: &GlobalScope, blob: &Blob) -> DOMString {
++    fn CreateObjectURL(
++        global: &GlobalScope,
++        object: BlobOrMediaSource<crate::DomTypeHolder>,
++    ) -> DOMString {
+         // XXX: Second field is an unicode-serialized Origin, it is a temporary workaround
+         //      and should not be trusted. See issue https://github.com/servo/servo/issues/11722
+         let origin = global.origin();
+ 
+-        let id = blob.get_blob_url_id();
++        let id = match &object {
++            BlobOrMediaSource::Blob(blob) => blob.get_blob_url_id(),
++            BlobOrMediaSource::MediaSource(_) => Uuid::new_v4(),
++        };
+ 
+-        DOMString::from(URL::unicode_serialization_blob_url(origin.immutable(), &id))
++        let url = URL::unicode_serialization_blob_url(origin.immutable(), &id);
++        if let BlobOrMediaSource::MediaSource(source) = object {
++            global.register_append_source_url(
++                &ServoUrl::parse(&url).expect("generated blob URL"),
++                &source,
++            );
++        }
++        DOMString::from(url)
+     }
+ 
+     /// <https://w3c.github.io/FileAPI/#dfn-revokeObjectURL>
+@@ -209,6 +223,11 @@ impl URLMethods<crate::DomTypeHolder> for URL {
+         // if the value provided for the url argument does not have an entry in the Blob URL Store,
+         // this method call does nothing. User agents may display a message on the error console.
+         let origin = global.origin().immutable().clone();
++        if let Ok(parsed) = ServoUrl::parse(&url.str()) {
++            if global.revoke_append_source_url(&parsed) {
++                return;
++            }
++        }
+ 
+         if let Ok(url) = ServoUrl::parse(&url.str()) &&
+             url.fragment().is_none() &&
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 87b3cf859..463384634 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -1711,6 +1711,9 @@ DOMInterfaces = {
+     'cx': ['Enqueue', 'Error', 'Terminate']
+ },
+ 
++'MediaSource': { 'weakReferenceable': True, 'cx': ['SourceBuffers', 'ActiveSourceBuffers', 'AddSourceBuffer'] },
++'SourceBuffer': { 'cx': ['GetBuffered', 'AudioTracks', 'VideoTracks', 'TextTracks'] },
++'SourceBufferList': { 'cx': ['IndexedGetter'] },
+ }
+ 
+ Dictionaries = {
+@@ -1902,4 +1905,7 @@ SubCrates = {
+     'GPUMapMode', 'GPUOutOfMemoryError', 'GPUPipelineError', 'GPURenderPipeline', 'GPURenderPassEncoder', 'GPUQuerySet', 'GPUQueue', 'GPURenderBundleEncoder', 'GPUSampler',
+     'GPURenderBundle', 'GPUShaderStage', 'GPUShaderModule', 'GPUSupportedLimits', 'GPUSupportedFeatures', 'GPUTexture', 'GPUTextureView', 'GPUUncapturedErrorEvent', 'GPUValidationError',
+     'GPUTextureUsage', 'WGSLLanguageFeatures'],
++
+ }
++
++# Private, preference-off append source interfaces.
+diff --git a/components/script_bindings/webidls/HTMLMediaElement.webidl b/components/script_bindings/webidls/HTMLMediaElement.webidl
+index 7ceae06f1..39b891613 100644
+--- a/components/script_bindings/webidls/HTMLMediaElement.webidl
++++ b/components/script_bindings/webidls/HTMLMediaElement.webidl
+@@ -5,7 +5,7 @@
+ // https://html.spec.whatwg.org/multipage/#htmlmediaelement
+ 
+ enum CanPlayTypeResult { "" /* empty string */, "maybe", "probably" };
+-typedef (MediaStream /*or MediaSource */ or Blob) MediaProvider;
++typedef (MediaStream or MediaSource or Blob) MediaProvider;
+ 
+ [Exposed=Window, Abstract]
+ interface HTMLMediaElement : HTMLElement {
+diff --git a/components/script_bindings/webidls/MediaSource.webidl b/components/script_bindings/webidls/MediaSource.webidl
+new file mode 100644
+index 000000000..dffd2c735
+--- /dev/null
++++ b/components/script_bindings/webidls/MediaSource.webidl
+@@ -0,0 +1,48 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++/*
++ * The origin of this IDL file is
++ * https://www.w3.org/TR/media-source-2/#mediasource
++ *
++ */
++
++// https://www.w3.org/TR/media-source-2/#dom-readystate
++enum ReadyState {
++  "closed",
++  "open",
++  "ended",
++};
++
++// https://www.w3.org/TR/media-source-2/#dom-endofstreamerror
++enum EndOfStreamError {
++  "network",
++  "decode",
++};
++
++// https://www.w3.org/TR/media-source-2/#dom-mediasource
++[Pref="dom_media_source_extensions_enabled", Exposed=(Window)]
++interface MediaSource : EventTarget {
++    [Throws] constructor();
++
++    // [SameObject, Exposed=DedicatedWorker]
++    // readonly  attribute MediaSourceHandle handle;
++    [SameObject] readonly  attribute SourceBufferList sourceBuffers;
++    [SameObject] readonly  attribute SourceBufferList activeSourceBuffers;
++    readonly  attribute ReadyState readyState;
++
++    [SetterThrows] attribute unrestricted double duration;
++    attribute EventHandler onsourceopen;
++    attribute EventHandler onsourceended;
++    attribute EventHandler onsourceclose;
++
++    static readonly attribute boolean canConstructInDedicatedWorker;
++
++    [Throws] SourceBuffer addSourceBuffer(DOMString type);
++    [Throws] undefined removeSourceBuffer(SourceBuffer sourceBuffer);
++    [Throws] undefined endOfStream(optional EndOfStreamError error);
++    [Throws] undefined setLiveSeekableRange(double start, double end);
++    [Throws] undefined clearLiveSeekableRange();
++    static boolean isTypeSupported(DOMString type);
++};
+diff --git a/components/script_bindings/webidls/SourceBuffer.webidl b/components/script_bindings/webidls/SourceBuffer.webidl
+new file mode 100644
+index 000000000..805f2404d
+--- /dev/null
++++ b/components/script_bindings/webidls/SourceBuffer.webidl
+@@ -0,0 +1,40 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++/*
++ * The origin of this IDL file is
++ * https://www.w3.org/TR/media-source-2/#sourcebuffer
++ *
++ */
++
++// https://www.w3.org/TR/media-source-2/#dom-appendmode
++enum AppendMode {
++  "segments",
++  "sequence",
++};
++
++// https://www.w3.org/TR/media-source-2/#dom-sourcebuffer
++[Pref="dom_media_source_extensions_enabled", Exposed=(Window)]
++interface SourceBuffer : EventTarget {
++  [SetterThrows] attribute AppendMode mode;
++  readonly  attribute boolean updating;
++  [GetterThrows] readonly  attribute TimeRanges buffered;
++  [SetterThrows] attribute double timestampOffset;
++  readonly  attribute AudioTrackList audioTracks;
++  readonly  attribute VideoTrackList videoTracks;
++  readonly  attribute TextTrackList textTracks;
++  [SetterThrows] attribute double appendWindowStart;
++  [SetterThrows] attribute unrestricted double appendWindowEnd;
++
++  attribute EventHandler onupdatestart;
++  attribute EventHandler onupdate;
++  attribute EventHandler onupdateend;
++  attribute EventHandler onerror;
++  attribute EventHandler onabort;
++
++  [Throws] undefined appendBuffer(BufferSource data);
++  [Throws] undefined abort();
++  [Throws] undefined changeType(DOMString type);
++  [Throws] undefined remove(double start, unrestricted double end);
++};
+\ No newline at end of file
+diff --git a/components/script_bindings/webidls/SourceBufferList.webidl b/components/script_bindings/webidls/SourceBufferList.webidl
+new file mode 100644
+index 000000000..9a15a888a
+--- /dev/null
++++ b/components/script_bindings/webidls/SourceBufferList.webidl
+@@ -0,0 +1,20 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++/*
++ * The origin of this IDL file is
++ * https://www.w3.org/TR/media-source-2/#sourcebufferlist
++ *
++ */
++
++// https://www.w3.org/TR/media-source-2/#dom-sourcebufferlist
++[Pref="dom_media_source_extensions_enabled", Exposed=(Window)]
++interface SourceBufferList : EventTarget {
++  readonly attribute unsigned long length;
++
++  attribute EventHandler onaddsourcebuffer;
++  attribute EventHandler onremovesourcebuffer;
++
++  getter SourceBuffer (unsigned long index);
++};
+\ No newline at end of file
+diff --git a/components/script_bindings/webidls/URL.webidl b/components/script_bindings/webidls/URL.webidl
+index 4bb54c15a..197df2954 100644
+--- a/components/script_bindings/webidls/URL.webidl
++++ b/components/script_bindings/webidls/URL.webidl
+@@ -26,7 +26,7 @@ interface URL {
+            attribute USVString hash;
+ 
+   // https://w3c.github.io/FileAPI/#creating-revoking
+-  static DOMString createObjectURL(Blob blob);
++  static DOMString createObjectURL((Blob or MediaSource) obj);
+   static undefined revokeObjectURL(DOMString url);
+ 
+   USVString toJSON();
