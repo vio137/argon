@@ -62,13 +62,16 @@ internal class JNIServo {
 
     external fun keyup(keycode: Int, unicode: Int)
 
-    external fun touchDown(x: Float, y: Float, pointer_id: Int)
+    /** [eventTimeNanos]: event time in the SystemClock.uptimeMillis() clock
+     * base with nanosecond precision (see Servo.eventTimeUptimeNanos);
+     * 0 = unknown. Engine patch 052: feeds the time-normalized fling estimator. */
+    external fun touchDown(x: Float, y: Float, pointer_id: Int, eventTimeNanos: Long)
 
-    external fun touchMove(x: Float, y: Float, pointer_id: Int)
+    external fun touchMove(x: Float, y: Float, pointer_id: Int, eventTimeNanos: Long)
 
-    external fun touchUp(x: Float, y: Float, pointer_id: Int)
+    external fun touchUp(x: Float, y: Float, pointer_id: Int, eventTimeNanos: Long)
 
-    external fun touchCancel(x: Float, y: Float, pointer_id: Int)
+    external fun touchCancel(x: Float, y: Float, pointer_id: Int, eventTimeNanos: Long)
 
     external fun pausePainting()
 
@@ -79,7 +82,10 @@ internal class JNIServo {
     /** Argon: evaluate an app-bundled script; result arrives via Callbacks.onJsResult. */
     external fun evaluateScript(requestId: Int, script: String)
 
-    external fun doFrame()
+    /** [frameTimeNanos]: frame time in the SystemClock.uptimeMillis() clock
+     * base with nanosecond precision (see Servo.frameTsToUptimeNanos);
+     * 0 = unknown. Engine patch 052: drives refresh-rate-independent fling decay. */
+    external fun doFrame(frameTimeNanos: Long)
 
     interface Callbacks {
         fun wakeup()

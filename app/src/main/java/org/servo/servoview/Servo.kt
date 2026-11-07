@@ -8,6 +8,7 @@ package org.servo.servoview
 import android.util.Log
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.util.Size
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -57,6 +58,30 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 
 @Composable
+/**
+ * Engine patch 052 clock basis: the engine gets ONE monotonic clock basis -
+ * the SystemClock.uptimeMillis() base at nanosecond precision - for both
+ * touch events and frame times, and only ever computes deltas.
+ *
+ * MotionEvent.eventTimeNanos (API 34+) is already in that base; on API 29-33
+ * eventTime (uptimeMillis) is scaled. Reference: developer.android.com
+ * MotionEvent#getEventTimeNanos.
+ */
+private fun MotionEvent.eventTimeUptimeNanos(): Long =
+    if (Build.VERSION.SDK_INT >= 34) eventTimeNanos else eventTime * 1_000_000L
+
+/**
+ * Choreographer/withFrameNanos frame times are System.nanoTime()-based
+ * (AOSP Choreographer computes latency against System.nanoTime()), which can
+ * diverge from uptime across suspend. Normalize into the uptime basis with an
+ * offset resampled per call, so the conversion stays drift-safe.
+ */
+private fun frameTsToUptimeNanos(frameTs: Long): Long {
+    if (frameTs == 0L) return 0L
+    val nanoToUptimeOffset = System.nanoTime() - SystemClock.uptimeMillis() * 1_000_000L
+    return frameTs - nanoToUptimeOffset
+}
+
 fun Servo(
     experimentalModeEnabled: Boolean,
     args: String?,
@@ -144,12 +169,17 @@ fun Servo(
                     }
 
                     val action = motionEvent.actionMasked
+                    // Engine patch 052: the event's own timestamp (uptime
+                    // clock base, nanos), captured once per MotionEvent and
+                    // carried with each pointer dispatch, including through
+                    // move coalescing (the delivered move keeps its own ts).
+                    val eventTs = motionEvent.eventTimeUptimeNanos()
 
                     when (action) {
                         MotionEvent.ACTION_DOWN,
                         MotionEvent.ACTION_POINTER_DOWN -> {
                             val i = motionEvent.actionIndex
-                            servo.touchDown(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i))
+                            servo.touchDown(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i), eventTs)
                         }
                         // MOVE carries EVERY active pointer (actionIndex is
                         // meaningless here); deliver each pointer's latest
@@ -161,17 +191,18 @@ fun Servo(
                                     motionEvent.getX(i),
                                     motionEvent.getY(i),
                                     motionEvent.getPointerId(i),
+                                    eventTs,
                                 )
                             }
                         }
                         MotionEvent.ACTION_UP,
                         MotionEvent.ACTION_POINTER_UP -> {
                             val i = motionEvent.actionIndex
-                            servo.touchUp(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i))
+                            servo.touchUp(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i), eventTs)
                         }
                         MotionEvent.ACTION_CANCEL -> {
                             val i = motionEvent.actionIndex.coerceAtMost(motionEvent.pointerCount - 1)
-                            servo.touchCancel(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i))
+                            servo.touchCancel(motionEvent.getX(i), motionEvent.getY(i), motionEvent.getPointerId(i), eventTs)
                         }
                     }
 
@@ -481,7 +512,15 @@ internal constructor(
     // and exit when superseded. Down/up/cancel flush pending moves first, so
     // ordering against gesture state transitions is preserved (pinch keeps each
     // pointer's latest position).
-    private class MoveEvent(val x: Float, val y: Float, val pointerId: Int, val postNs: Long)
+    private class MoveEvent(
+        val x: Float,
+        val y: Float,
+        val pointerId: Int,
+        val postNs: Long,
+        /** The MotionEvent's own timestamp (uptime nanos); survives coalescing
+         * because latest-wins keeps the newest move WITH its timestamp. */
+        val eventTs: Long,
+    )
     private val pendingMoves = java.util.concurrent.ConcurrentHashMap<Int, MoveEvent>()
 
     private fun flushPendingMoves() {
@@ -490,20 +529,20 @@ internal constructor(
         pendingMoves.clear()
         for (move in snapshot) {
             me.ik.argon.PerfStats.recordInput(move.postNs)
-            runCatching { jni.touchMove(move.x, move.y, move.pointerId) }
+            runCatching { jni.touchMove(move.x, move.y, move.pointerId, move.eventTs) }
         }
     }
 
-    fun touchDown(x: Float, y: Float, pointerId: Int) {
+    fun touchDown(x: Float, y: Float, pointerId: Int, eventTimeNanos: Long = 0L) {
         scope.launch(glDispatcher) {
             flushPendingMoves()
-            jni.touchDown(x, y, pointerId)
+            jni.touchDown(x, y, pointerId, eventTimeNanos)
         }
     }
 
-    fun touchMove(x: Float, y: Float, pointerId: Int) {
+    fun touchMove(x: Float, y: Float, pointerId: Int, eventTimeNanos: Long = 0L) {
         me.ik.argon.PerfStats.recordInputPosted()
-        pendingMoves[pointerId] = MoveEvent(x, y, pointerId, System.nanoTime())
+        pendingMoves[pointerId] = MoveEvent(x, y, pointerId, System.nanoTime(), eventTimeNanos)
         scope.launch(glDispatcher) {
             val move = pendingMoves.remove(pointerId)
             if (move == null) {
@@ -511,21 +550,21 @@ internal constructor(
                 return@launch // superseded by a newer move
             }
             me.ik.argon.PerfStats.recordInput(move.postNs)
-            runCatching { jni.touchMove(move.x, move.y, move.pointerId) }
+            runCatching { jni.touchMove(move.x, move.y, move.pointerId, move.eventTs) }
         }
     }
 
-    fun touchUp(x: Float, y: Float, pointerId: Int) {
+    fun touchUp(x: Float, y: Float, pointerId: Int, eventTimeNanos: Long = 0L) {
         scope.launch(glDispatcher) {
             flushPendingMoves()
-            jni.touchUp(x, y, pointerId)
+            jni.touchUp(x, y, pointerId, eventTimeNanos)
         }
     }
 
-    fun touchCancel(x: Float, y: Float, pointerId: Int) {
+    fun touchCancel(x: Float, y: Float, pointerId: Int, eventTimeNanos: Long = 0L) {
         scope.launch(glDispatcher) {
             flushPendingMoves()
-            jni.touchCancel(x, y, pointerId)
+            jni.touchCancel(x, y, pointerId, eventTimeNanos)
         }
     }
 
@@ -567,7 +606,7 @@ internal constructor(
             if (ts == -1L) return@launch // superseded; a newer task renders it
             if (paintingActive.get()) {
                 val t0 = System.nanoTime()
-                jni.doFrame()
+                jni.doFrame(frameTsToUptimeNanos(ts))
                 me.ik.argon.PerfStats.recordFrame(ts, t0, System.nanoTime() - t0)
             }
         }
