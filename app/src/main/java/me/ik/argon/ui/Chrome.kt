@@ -221,7 +221,7 @@ private fun ChromeIconButton(
     Box(
         contentAlignment = Alignment.Center,
         modifier =
-            Modifier.size(44.dp)
+            Modifier.size(48.dp)
                 .clip(CircleShape)
                 .background(if (filled) ArgonColors.Accent else Color.Transparent)
                 .clickable(enabled = enabled, onClickLabel = description, role = Role.Button, onClick = onClick),
