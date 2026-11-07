@@ -129,7 +129,7 @@ index 18de96f..c6cbcd5 100644
  servo-media-traits = { workspace = true }
  
 diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
-index 41be87d..86b0a8e 100644
+index 41be87d..ebdd778 100644
 --- a/components/media/player/lib.rs
 +++ b/components/media/player/lib.rs
 @@ -15,6 +15,7 @@ pub mod video;
@@ -156,7 +156,7 @@ index 41be87d..86b0a8e 100644
 +
 +    /// Connect an MSE media source (ported from servo/media#458). Backends
 +    /// without MSE support keep the default failure.
-+    fn connect_media_source(&self, source: &dyn MediaSource) -> Result<(), PlayerError> {
++    fn connect_media_source(&self, _source: &dyn MediaSource) -> Result<(), PlayerError> {
 +        Err(PlayerError::SetStreamFailed)
 +    }
  }
