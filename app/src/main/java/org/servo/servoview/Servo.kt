@@ -831,6 +831,18 @@ internal constructor(
             }
         }
 
+        // Client-side half (Callbacks implements both JNIServo.Callbacks and
+        // Client): delegate to the current client, same as the other relays.
+        override fun onContextMenu(
+            webviewId: String,
+            handle: Int,
+            linkUrl: String?,
+            imageUrl: String?,
+            items: List<ContextMenuEntry>,
+        ) {
+            scope.launch { client.onContextMenu(webviewId, handle, linkUrl, imageUrl, items) }
+        }
+
         override fun onImeShow() {
             scope.launch { onImeShow.invoke() }
         }
