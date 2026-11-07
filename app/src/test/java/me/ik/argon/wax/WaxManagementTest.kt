@@ -29,6 +29,15 @@ class WaxManagementTest {
     }
 
     @Test
+    fun unknownOutcomeStillRoutesThroughDisclosure() {
+        val state = WaxManagementState(setupUnknown = true)
+        assertEquals(
+            WaxEffect.SHOW_REGISTRATION_DISCLOSURE,
+            WaxManagement.effect(state, WaxAction.CREATE_WARP_ACCOUNT),
+        )
+    }
+
+    @Test
     fun existingGatesUnchanged() {
         // Enabling still requires consent and a profile; connect still requires an
         // enabled process. Registration must not have loosened routing gates.

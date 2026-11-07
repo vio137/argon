@@ -956,6 +956,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
             consentAccepted = waxStore.consented(),
             hasProfile = waxStore.hasProfile(),
             hasAccount = waxStore.hasAccount(),
+            setupUnknown = !waxStore.hasAccount() && waxStore.hasPendingRegistration(),
             processEnabled = processEnabled,
             wantedEnabled = wanted,
             restartRequired = wanted != processEnabled,
@@ -1038,9 +1039,14 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 waxStore.deleteProfile()
                 // Local account credentials go with the profile; no provider call is made.
                 waxStore.deleteAccount()
+                waxStore.deletePending()
             }
             WaxEffect.SHOW_REGISTRATION_DISCLOSURE ->
-                FreshWaxManagementDialog.showRegistrationDisclosure(this, waxStore.hasAccount()) {
+                FreshWaxManagementDialog.showRegistrationDisclosure(
+                    this,
+                    waxStore.hasAccount(),
+                    waxStore.hasPendingRegistration(),
+                ) {
                     startWaxRegistration()
                 }
             WaxEffect.NO_OP -> {}
@@ -1050,30 +1056,52 @@ class MainActivity : ComponentActivity(), Servo.Client {
     /**
      * User-driven WARP account setup. Runs ONLY from the registration disclosure dialog's
      * explicit agree action - that tap is the terms consent carried by the registration
-     * request itself. Credentials persist before any later step so a failure resumes with
-     * the same account instead of creating duplicates. Never logs keys/tokens.
+     * request itself. A pending marker is persisted BEFORE the request, so an ambiguous
+     * outcome never leads to an automatic duplicate registration; the user sees the
+     * unknown state and chooses. Never logs keys/tokens.
      */
     private fun startWaxRegistration() {
         val scope = uiScope ?: return
+        // Explicit user choice after an unknown outcome: discard the unrecoverable
+        // marker so a fresh registration is allowed (disclosed possible duplicate).
+        if (!waxStore.hasAccount() && waxStore.hasPendingRegistration()) waxStore.deletePending()
         alertMessage = "Contacting the WARP service..."
         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            val existing =
-                waxStore.loadAccountJson()?.let { bytes ->
-                    try {
-                        WaxAccountCodec.decode(bytes)
-                    } finally {
-                        bytes.fill(0)
-                    }
+            val storeAdapter =
+                object : me.ik.argon.wax.WaxRegStore {
+                    override fun loadAccount() =
+                        waxStore.loadAccountJson()?.let { bytes ->
+                            try {
+                                WaxAccountCodec.decode(bytes)
+                            } finally {
+                                bytes.fill(0)
+                            }
+                        }
+                    override fun loadPending() =
+                        waxStore.loadPendingJson()?.let { bytes ->
+                            try {
+                                me.ik.argon.wax.PendingWaxCodec.decode(bytes)
+                            } finally {
+                                bytes.fill(0)
+                            }
+                        }
+                    override fun savePending(pending: me.ik.argon.wax.PendingWaxRegistration) =
+                        runCatching {
+                                waxStore.savePendingJson(
+                                    me.ik.argon.wax.PendingWaxCodec.encode(pending)
+                                )
+                            }
+                            .isSuccess
+                    override fun saveAccount(account: me.ik.argon.wax.WaxAccount) =
+                        runCatching { waxStore.saveAccountJson(WaxAccountCodec.encode(account)) }
+                            .isSuccess
+                    override fun clearPending() = waxStore.deletePending()
                 }
             val registration =
                 WaxWarpRegistration(
                     WaxRegHttpTransport("Argon/${BuildConfig.VERSION_NAME} (Android)"),
                 )
-            val outcome =
-                registration.provision(existing) { account ->
-                    runCatching { waxStore.saveAccountJson(WaxAccountCodec.encode(account)) }
-                        .isSuccess
-                }
+            val outcome = registration.provision(storeAdapter)
             alertMessage =
                 when (outcome) {
                     is WaxRegOutcome.ProfileReady -> {
@@ -1082,19 +1110,21 @@ class MainActivity : ComponentActivity(), Servo.Client {
                             runCatching { waxStore.saveProfile(bytes) }.isSuccess
                         bytes.fill(0)
                         if (stored) {
-                            "WARP account ready; profile stored privately. Routing stays off until you enable it. Connection not yet verified."
+                            "WARP account created and profile stored privately. Routing stays off until you enable it, and the connection is not verified internet access."
                         } else {
-                            "Account created, but storing the profile failed. Use setup again to finish - no new account is created."
+                            "Account created, but storing the profile failed. Use setup again to finish - the same account is resumed."
                         }
                     }
                     WaxRegOutcome.DeclinedByProvider ->
                         "Cloudflare declined setup from an unofficial app. Nothing was created and no workaround was attempted."
                     WaxRegOutcome.ProviderRejected ->
-                        "WARP setup was rejected by the service. Nothing changed; try again later."
+                        "WARP setup was rejected by the service. Nothing was created; try again later."
                     WaxRegOutcome.Unreachable ->
-                        "Couldn't reach the WARP service. Check the connection and try again."
-                    WaxRegOutcome.BadResponse ->
-                        "Unexpected response from the WARP service; setup did not complete."
+                        "Couldn't reach the WARP service to finish setup. The stored account resumes next time."
+                    WaxRegOutcome.RegistrationUnknown ->
+                        "The setup result is unknown - an account may exist that Argon can't recover. Reopen waX setup to review your options; nothing was retried automatically."
+                    WaxRegOutcome.Incomplete ->
+                        "The account was created but its profile data was unexpected. Use setup again to finish - the same account is resumed."
                     WaxRegOutcome.StorageFailed ->
                         "Couldn't store credentials privately; setup did not complete."
                 }

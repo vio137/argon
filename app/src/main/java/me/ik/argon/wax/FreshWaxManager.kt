@@ -22,6 +22,12 @@ interface WaxManagedStore {
     fun saveAccountJson(bytes:ByteArray)
     /** Local-only removal with the profile; makes no provider call. */
     fun deleteAccount()
+    /** Pending-registration marker (unknown-outcome guard), same encrypted family. */
+    fun hasPendingRegistration():Boolean
+    /** Owned mutable bytes (PendingWaxCodec encoding); caller must wipe. */
+    fun loadPendingJson():ByteArray?
+    fun savePendingJson(bytes:ByteArray)
+    fun deletePending()
 }
 interface WaxManagedSession {
     fun connect(profile:ByteArray):Int

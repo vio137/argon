@@ -13,8 +13,8 @@ android {
         applicationId = "me.ik.argon"
         minSdk = 29
         targetSdk = 37
-        versionCode = 23
-        versionName = "1.0.20"
+        versionCode = 24
+        versionName = "1.0.21"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
@@ -63,6 +63,10 @@ dependencies {
     implementation("androidx.compose.material3.adaptive:adaptive:1.2.0")
     implementation("androidx.preference:preference-ktx:1.2.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.12.0")
+    // Vetted X25519 for WARP device keygen (platform XDH needs API 33; minSdk is 29).
+    // Only the low-level org.bouncycastle.crypto classes are used - no JCA provider
+    // registration, so platform crypto behavior is untouched.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.4")
 }
 

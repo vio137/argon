@@ -2,6 +2,7 @@ package me.ik.argon.wax
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -26,12 +27,42 @@ class WaxWarpRegistrationTest {
     }
 
     private class ThrowingTransport : WaxRegTransport {
+        var calls = 0
+
         override fun request(
             method: String,
             url: String,
             bearerToken: String?,
             jsonBody: String?,
-        ): WaxRegHttpResponse = throw java.net.SocketTimeoutException("simulated")
+        ): WaxRegHttpResponse {
+            calls++
+            throw java.net.SocketTimeoutException("simulated")
+        }
+    }
+
+    private class MemStore : WaxRegStore {
+        var account: WaxAccount? = null
+        var pending: PendingWaxRegistration? = null
+        var failSavePending = false
+        var failSaveAccount = false
+        var clearCount = 0
+
+        override fun loadAccount() = account
+        override fun loadPending() = pending
+        override fun savePending(pending: PendingWaxRegistration): Boolean {
+            if (failSavePending) return false
+            this.pending = pending
+            return true
+        }
+        override fun saveAccount(account: WaxAccount): Boolean {
+            if (failSaveAccount) return false
+            this.account = account
+            return true
+        }
+        override fun clearPending() {
+            clearCount++
+            pending = null
+        }
     }
 
     private val accountId = "11111111-2222-3333-4444-555555555555"
@@ -48,13 +79,11 @@ class WaxWarpRegistrationTest {
 
     private fun deviceResponse() = "{${configJson()}}"
 
-    private val persisted = mutableListOf<WaxAccount>()
-    private val persist: (WaxAccount) -> Boolean = { persisted.add(it); true }
-
     @Test
     fun freshRegistrationSendsTosConsentAndBuildsProfile() {
         val transport = FakeTransport(200 to regResponse())
-        val outcome = WaxWarpRegistration(transport).provision(null, persist)
+        val store = MemStore()
+        val outcome = WaxWarpRegistration(transport).provision(store)
 
         assertTrue(outcome is WaxRegOutcome.ProfileReady)
         assertEquals(1, transport.calls.size)
@@ -68,9 +97,10 @@ class WaxWarpRegistrationTest {
         assertTrue(body.contains("\"model\":\"Argon\""))
         assertTrue(Regex("\"key\":\"[A-Za-z0-9+/]{43}=\"").containsMatchIn(body))
 
-        // Account persisted (with the registered private key), and no second call was made.
-        assertEquals(1, persisted.size)
-        val account = persisted[0]
+        // Pending marker was cleared, account persisted, no further call was made.
+        assertNull(store.pending)
+        assertEquals(1, store.clearCount)
+        val account = store.account!!
         assertEquals(accountId, account.id)
         assertEquals(token, account.token)
         assertEquals(license, account.license)
@@ -100,53 +130,74 @@ class WaxWarpRegistrationTest {
     }
 
     @Test
-    fun declinedByProviderMeansNoPersistAndNoRetry() {
+    fun declinedByProviderClearsPendingAndStops() {
         val transport = FakeTransport(403 to "error 1020")
-        val outcome = WaxWarpRegistration(transport).provision(null, persist)
-        assertEquals(WaxRegOutcome.DeclinedByProvider, outcome)
+        val store = MemStore()
+        assertEquals(WaxRegOutcome.DeclinedByProvider, WaxWarpRegistration(transport).provision(store))
         assertEquals(1, transport.calls.size)
-        assertTrue(persisted.isEmpty())
+        assertNull(store.account)
+        assertNull(store.pending) // definite refusal: marker cleared
     }
 
     @Test
-    fun unauthorizedMapsToDeclined() {
-        val transport = FakeTransport(401 to "")
-        assertEquals(WaxRegOutcome.DeclinedByProvider, WaxWarpRegistration(transport).provision(null, persist))
-        assertTrue(persisted.isEmpty())
-    }
-
-    @Test
-    fun serverErrorMapsToRejected() {
+    fun serverErrorClearsPending() {
         val transport = FakeTransport(500 to "")
-        assertEquals(WaxRegOutcome.ProviderRejected, WaxWarpRegistration(transport).provision(null, persist))
-        assertTrue(persisted.isEmpty())
+        val store = MemStore()
+        assertEquals(WaxRegOutcome.ProviderRejected, WaxWarpRegistration(transport).provision(store))
+        assertNull(store.pending)
+        assertNull(store.account)
     }
 
     @Test
-    fun transportFailureMapsToUnreachable() {
-        assertEquals(WaxRegOutcome.Unreachable, WaxWarpRegistration(ThrowingTransport()).provision(null, persist))
-        assertTrue(persisted.isEmpty())
+    fun ambiguousTransportFailureRetainsPendingAndNeverAutoRetries() {
+        val transport = ThrowingTransport()
+        val store = MemStore()
+        assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport).provision(store))
+        assertNotNull(store.pending) // unknown outcome: marker retained
+        assertNull(store.account)
+
+        // A later provision with a stored marker MUST NOT send any request.
+        val transport2 = ThrowingTransport()
+        assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport2).provision(store))
+        assertEquals(0, transport2.calls)
     }
 
     @Test
-    fun malformedSuccessIsBadResponse() {
+    fun unreadableSuccessIsUnknownNotSilentDuplicate() {
         val transport = FakeTransport(200 to "{\"unexpected\":true}")
-        assertEquals(WaxRegOutcome.BadResponse, WaxWarpRegistration(transport).provision(null, persist))
-        assertTrue(persisted.isEmpty())
+        val store = MemStore()
+        assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport).provision(store))
+        assertNotNull(store.pending)
+        assertNull(store.account)
+        // And a subsequent attempt still refuses to auto-POST.
+        val transport2 = FakeTransport(200 to regResponse())
+        assertEquals(WaxRegOutcome.RegistrationUnknown, WaxWarpRegistration(transport2).provision(store))
+        assertEquals(0, transport2.calls.size)
     }
 
     @Test
-    fun storageFailureStopsBeforeProfile() {
+    fun savePendingFailureIsStorageFailedWithoutNetwork() {
+        val transport = ThrowingTransport()
+        val store = MemStore().apply { failSavePending = true }
+        assertEquals(WaxRegOutcome.StorageFailed, WaxWarpRegistration(transport).provision(store))
+        assertEquals(0, transport.calls)
+    }
+
+    @Test
+    fun saveAccountFailureRetainsPendingForRecovery() {
         val transport = FakeTransport(200 to regResponse())
-        val outcome = WaxWarpRegistration(transport).provision(null) { false }
-        assertEquals(WaxRegOutcome.StorageFailed, outcome)
+        val store = MemStore().apply { failSaveAccount = true }
+        assertEquals(WaxRegOutcome.StorageFailed, WaxWarpRegistration(transport).provision(store))
+        assertNotNull(store.pending)
+        assertNull(store.account)
     }
 
     @Test
     fun existingAccountResumesWithoutDuplicatePost() {
         val existing = WaxAccount.of(accountId, token, license, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")!!
         val transport = FakeTransport(200 to deviceResponse())
-        val outcome = WaxWarpRegistration(transport).provision(existing, persist)
+        val store = MemStore().apply { account = existing }
+        val outcome = WaxWarpRegistration(transport).provision(store)
 
         assertTrue(outcome is WaxRegOutcome.ProfileReady)
         assertEquals(1, transport.calls.size)
@@ -154,17 +205,26 @@ class WaxWarpRegistrationTest {
         assertEquals("GET", call.method)
         assertEquals("https://api.cloudflareclient.com/v0a5641/reg/$accountId", call.url)
         assertEquals(token, call.token)
-        assertTrue(persisted.isEmpty()) // already stored, not re-persisted
         val profile = (outcome as WaxRegOutcome.ProfileReady).profileText
         assertTrue(profile.contains("PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
         assertTrue(profile.contains("Endpoint = 162.159.192.7:2408"))
     }
 
     @Test
+    fun resumeTransportFailureIsSafelyRetryable() {
+        val existing = WaxAccount.of(accountId, token, license, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")!!
+        val store = MemStore().apply { account = existing }
+        // GET failure does not create accounts, so this is plain Unreachable (resume safe).
+        assertEquals(WaxRegOutcome.Unreachable, WaxWarpRegistration(ThrowingTransport()).provision(store))
+        assertEquals(existing, store.account)
+    }
+
+    @Test
     fun resumeGetDeclinedStopsHonestly() {
         val existing = WaxAccount.of(accountId, token, license, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")!!
+        val store = MemStore().apply { account = existing }
         val transport = FakeTransport(403 to "")
-        assertEquals(WaxRegOutcome.DeclinedByProvider, WaxWarpRegistration(transport).provision(existing, persist))
+        assertEquals(WaxRegOutcome.DeclinedByProvider, WaxWarpRegistration(transport).provision(store))
     }
 
     @Test
@@ -173,27 +233,30 @@ class WaxWarpRegistrationTest {
             "{\"id\":\"$accountId\",\"token\":\"$token\",\"account\":{\"license\":\"$license\"}," +
                 "\"config\":{\"interface\":{\"addresses\":{\"v4\":\"172.16.0.2/32\",\"v6\":\"2606:4700:110::1/128\"}}," +
                 "\"peers\":[{\"public_key\":\"$peerKey\",\"endpoint\":{\"v4\":\"162.159.193.10\"}}]}}"
-        val outcome = WaxWarpRegistration(FakeTransport(200 to response)).provision(null, persist)
+        val store = MemStore()
+        val outcome = WaxWarpRegistration(FakeTransport(200 to response)).provision(store)
         assertTrue(outcome is WaxRegOutcome.ProfileReady)
         assertTrue((outcome as WaxRegOutcome.ProfileReady).profileText.contains("Endpoint = 162.159.193.10:2408"))
     }
 
     @Test
-    fun nonLiteralEndpointIsRejected() {
+    fun nonLiteralEndpointLeavesStoredAccountForResume() {
         val response =
             "{\"id\":\"$accountId\",\"token\":\"$token\",\"account\":{\"license\":\"$license\"}," +
                 "\"config\":{\"interface\":{\"addresses\":{\"v4\":\"172.16.0.2\",\"v6\":\"2606:4700:110::1\"}}," +
                 "\"peers\":[{\"public_key\":\"$peerKey\",\"endpoint\":{\"v4\":\"engage.cloudflareclient.com\"}}]}}"
+        val store = MemStore()
         assertEquals(
-            WaxRegOutcome.BadResponse,
-            WaxWarpRegistration(FakeTransport(200 to response)).provision(null, persist),
+            WaxRegOutcome.Incomplete,
+            WaxWarpRegistration(FakeTransport(200 to response)).provision(store),
         )
+        assertNotNull(store.account) // account kept; a later resume retries the config fetch
     }
 
     @Test
     fun outcomesNeverLeakSecrets() {
-        val transport = FakeTransport(200 to regResponse())
-        val outcome = WaxWarpRegistration(transport).provision(null, persist)
+        val store = MemStore()
+        val outcome = WaxWarpRegistration(FakeTransport(200 to regResponse())).provision(store)
         val text = outcome.toString()
         assertFalse(text.contains(token))
         assertFalse(text.contains(license))

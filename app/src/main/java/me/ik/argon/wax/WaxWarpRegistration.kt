@@ -22,10 +22,24 @@ interface WaxRegTransport {
 
 class WaxRegHttpResponse(val status: Int, val body: String)
 
+/** Credential persistence seam (the Keystore-encrypted store in production). */
+interface WaxRegStore {
+    fun loadAccount(): WaxAccount?
+    fun loadPending(): PendingWaxRegistration?
+
+    /** Durable or false. */
+    fun savePending(pending: PendingWaxRegistration): Boolean
+
+    /** Durable or false. */
+    fun saveAccount(account: WaxAccount): Boolean
+    fun clearPending()
+}
+
 sealed interface WaxRegOutcome {
     /**
-     * Account durably persisted (persist() returned true) and profile text built.
-     * Caller must still validate the profile with the native validator before storing.
+     * Account durably persisted and profile text built. Caller must still validate the
+     * profile with the native validator before storing. The account is NOT asserted
+     * connect-ready: provider-side activation state is unverified (see class docs).
      */
     class ProfileReady(val profileText: String) : WaxRegOutcome {
         override fun toString() = "ProfileReady(redacted)"
@@ -34,20 +48,28 @@ sealed interface WaxRegOutcome {
     /** Provider declined this client (HTTP 401/403). Honest stop; no workaround is attempted. */
     data object DeclinedByProvider : WaxRegOutcome
 
-    /** Any other HTTP rejection. */
+    /** Any other definite HTTP rejection (the server answered; nothing was created). */
     data object ProviderRejected : WaxRegOutcome
 
-    /** DNS/TLS/timeout failure. */
+    /**
+     * The outcome of the registration request is UNKNOWN: the connection failed after
+     * the request may have reached the provider, or a success payload was unreadable.
+     * An account may exist server-side that cannot be recovered. A pending marker is
+     * retained and no retry is made automatically; only the user's explicit fresh-setup
+     * choice (which may create a duplicate, disclosed in the UI) clears it.
+     */
+    data object RegistrationUnknown : WaxRegOutcome
+
+    /** DNS/TLS/timeout before the request could be sent (pending marker predates it). */
     data object Unreachable : WaxRegOutcome
 
     /**
-     * A success status carried an unparseable payload. If this followed a fresh
-     * registration POST, an account MAY exist server-side that we cannot recover;
-     * a later explicit user retry would create a fresh one (disclosed in UI copy).
+     * Account IS durably stored but the profile could not be built/fetched from the
+     * provider payload. A later setup resumes the same account (no duplicate).
      */
-    data object BadResponse : WaxRegOutcome
+    data object Incomplete : WaxRegOutcome
 
-    /** Private credential storage failed; nothing was kept and no profile was built. */
+    /** Private credential storage failed; nothing usable was kept. */
     data object StorageFailed : WaxRegOutcome
 }
 
@@ -65,13 +87,19 @@ sealed interface WaxRegOutcome {
  * 2026-11-07): POST {base}/{version}/reg -> id/token/account.license/config, and
  * GET {base}/{version}/reg/{id} (Bearer) -> config for resuming an interrupted setup.
  *
- * Duplicate-safety: a fresh POST happens only when no account is stored; the account
- * (including the registered private key) is persisted BEFORE any further step, so a
- * later failure resumes with the same account instead of creating another.
+ * Duplicate-safety: a pending marker (the generated key, encrypted) is persisted BEFORE
+ * the POST; the account is persisted before any later step. An ambiguous POST outcome
+ * (throw mid-flight, unreadable 200) returns [WaxRegOutcome.RegistrationUnknown] and
+ * retains the marker, and a stored marker blocks any automatic re-POST - the user
+ * explicitly chooses a fresh setup, accepting the disclosed possible duplicate.
  *
- * Fail-closed policy per project direction: no TLS or header fingerprint mimicry, no
- * endpoint or API-version cycling to evade a refusal. 401/403 maps to
- * [WaxRegOutcome.DeclinedByProvider] and stops.
+ * Provider-side activation: the registration response carries a warp_enabled flag and
+ * the official client may update it via PATCH; whether a fresh account routes traffic
+ * without that step is UNVERIFIED (no live registration is ever performed during
+ * development). Outcomes therefore never claim connect-readiness.
+ *
+ * Fail-closed policy: no TLS or header fingerprint mimicry, no endpoint or API-version
+ * cycling to evade a refusal. 401/403 maps to [WaxRegOutcome.DeclinedByProvider].
  */
 class WaxWarpRegistration(
     private val transport: WaxRegTransport,
@@ -91,69 +119,90 @@ class WaxWarpRegistration(
         private val JSON = Json { ignoreUnknownKeys = true }
     }
 
-    fun provision(existing: WaxAccount?, persist: (WaxAccount) -> Boolean): WaxRegOutcome {
-        val account: WaxAccount
-        var config: JsonObject? = null
-        if (existing != null) {
-            account = existing
-        } else {
-            val privateKey = WaxCurve25519.privateKey(random)
-            try {
-                val b64 = Base64.getEncoder()
-                val publicKey = b64.encodeToString(WaxCurve25519.publicFrom(privateKey))
-                val serial = ByteArray(6).also { random.nextBytes(it) }
-                    .joinToString("") { "%02x".format(it) }
-                val requestBody = "{" +
-                    "\"install_id\":\"\"," +
-                    "\"fcm_token\":\"\"," +
-                    "\"key\":\"$publicKey\"," +
-                    "\"type\":\"Android\"," +
-                    "\"model\":\"Argon\"," +
-                    "\"locale\":\"en_US\"," +
-                    "\"serial_number\":\"$serial\"," +
-                    "\"tos\":\"${now()}\"" +
-                    "}"
-                val response = try {
-                    transport.request("POST", "$API_BASE/$API_VERSION/reg", null, requestBody)
-                } catch (_: Exception) {
-                    return WaxRegOutcome.Unreachable
-                }
-                when (response.status) {
-                    200 -> {}
-                    401, 403 -> return WaxRegOutcome.DeclinedByProvider
-                    else -> return WaxRegOutcome.ProviderRejected
-                }
-                val registered = parseRegistration(response.body) ?: return WaxRegOutcome.BadResponse
-                val created = WaxAccount.of(
-                    registered.id, registered.token, registered.license,
-                    b64.encodeToString(privateKey),
-                ) ?: return WaxRegOutcome.BadResponse
-                // Credentials must be durable BEFORE any later step can fail.
-                if (!persist(created)) return WaxRegOutcome.StorageFailed
-                account = created
-                config = registered.config
-            } finally {
-                privateKey.fill(0)
-            }
+    fun provision(store: WaxRegStore): WaxRegOutcome {
+        store.loadAccount()?.let { account ->
+            // Resume an interrupted setup with the SAME account; never a second POST.
+            store.clearPending()
+            return finishWithExisting(account)
         }
-        val resolvedConfig = config ?: run {
+        if (store.loadPending() != null) {
+            // An earlier attempt's outcome is unknown; never silently re-POST.
+            return WaxRegOutcome.RegistrationUnknown
+        }
+        return registerFresh(store)
+    }
+
+    private fun registerFresh(store: WaxRegStore): WaxRegOutcome {
+        val privateKey = WaxCurve25519.privateKey(random)
+        try {
+            val b64 = Base64.getEncoder()
+            val privateB64 = b64.encodeToString(privateKey)
+            val pending = PendingWaxRegistration.of(privateB64, now().toString())
+                ?: return WaxRegOutcome.StorageFailed
+            // Marker must be durable BEFORE the request can have an unknown outcome.
+            if (!store.savePending(pending)) return WaxRegOutcome.StorageFailed
+
+            val publicKey = b64.encodeToString(WaxCurve25519.publicFrom(privateKey))
+            val serial = ByteArray(6).also { random.nextBytes(it) }
+                .joinToString("") { "%02x".format(it) }
+            val requestBody = "{" +
+                "\"install_id\":\"\"," +
+                "\"fcm_token\":\"\"," +
+                "\"key\":\"$publicKey\"," +
+                "\"type\":\"Android\"," +
+                "\"model\":\"Argon\"," +
+                "\"locale\":\"en_US\"," +
+                "\"serial_number\":\"$serial\"," +
+                "\"tos\":\"${now()}\"" +
+                "}"
             val response = try {
-                transport.request("GET", "$API_BASE/$API_VERSION/reg/${account.id}", account.token, null)
+                transport.request("POST", "$API_BASE/$API_VERSION/reg", null, requestBody)
             } catch (_: Exception) {
-                return WaxRegOutcome.Unreachable
+                // May or may not have reached the provider; marker retained.
+                return WaxRegOutcome.RegistrationUnknown
             }
             when (response.status) {
-                200 ->
-                    runCatching {
-                        JSON.parseToJsonElement(response.body).asObject()?.get("config")?.asObject()
-                    }.getOrNull()
-                        ?.let { parseConfig(it) }
-                        ?: return WaxRegOutcome.BadResponse
-                401, 403 -> return WaxRegOutcome.DeclinedByProvider
-                else -> return WaxRegOutcome.ProviderRejected
+                200 -> {}
+                401, 403 -> {
+                    store.clearPending() // definite refusal: nothing was created
+                    return WaxRegOutcome.DeclinedByProvider
+                }
+                else -> {
+                    store.clearPending() // definite rejection: nothing was created
+                    return WaxRegOutcome.ProviderRejected
+                }
             }
+            val registered = parseRegistration(response.body)
+                ?: return WaxRegOutcome.RegistrationUnknown // success claimed, unreadable
+            val created = WaxAccount.of(registered.id, registered.token, registered.license, privateB64)
+                ?: return WaxRegOutcome.RegistrationUnknown
+            if (!store.saveAccount(created)) return WaxRegOutcome.StorageFailed
+            store.clearPending()
+            val config = registered.config ?: return finishWithExisting(created)
+            val profile = buildProfile(created, config) ?: return WaxRegOutcome.Incomplete
+            return WaxRegOutcome.ProfileReady(profile)
+        } finally {
+            privateKey.fill(0)
         }
-        val profile = buildProfile(account, resolvedConfig) ?: return WaxRegOutcome.BadResponse
+    }
+
+    private fun finishWithExisting(account: WaxAccount): WaxRegOutcome {
+        val response = try {
+            transport.request("GET", "$API_BASE/$API_VERSION/reg/${account.id}", account.token, null)
+        } catch (_: Exception) {
+            return WaxRegOutcome.Unreachable // account is stored; a later resume is safe
+        }
+        val config = when (response.status) {
+            200 ->
+                runCatching {
+                    JSON.parseToJsonElement(response.body).asObject()?.get("config")?.asObject()
+                }.getOrNull()
+                    ?.let { parseConfig(it) }
+                    ?: return WaxRegOutcome.Incomplete
+            401, 403 -> return WaxRegOutcome.DeclinedByProvider
+            else -> return WaxRegOutcome.ProviderRejected
+        }
+        val profile = buildProfile(account, config) ?: return WaxRegOutcome.Incomplete
         return WaxRegOutcome.ProfileReady(profile)
     }
 
@@ -179,14 +228,13 @@ class WaxWarpRegistration(
         val endpoint = peer["endpoint"]?.asObject() ?: return null
         val endpointV4 = endpoint["v4"]?.jsonPrimitive?.content ?: return null
         val ports = endpoint["ports"]?.jsonArray?.mapNotNull { it.jsonPrimitive.intOrNull }
-        val normalized = kotlinx.serialization.json.buildJsonObject {
+        kotlinx.serialization.json.buildJsonObject {
             put("v4", kotlinx.serialization.json.JsonPrimitive(v4))
             put("v6", kotlinx.serialization.json.JsonPrimitive(v6))
             put("peer_key", kotlinx.serialization.json.JsonPrimitive(publicKey))
             put("endpoint_v4", kotlinx.serialization.json.JsonPrimitive(endpointV4))
             put("port", kotlinx.serialization.json.JsonPrimitive(ports?.firstOrNull() ?: DEFAULT_ENDPOINT_PORT))
         }
-        normalized
     }.getOrNull()
 
     private fun kotlinx.serialization.json.JsonElement.asObject(): JsonObject? =

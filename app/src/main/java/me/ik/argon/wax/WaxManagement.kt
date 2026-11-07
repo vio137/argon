@@ -7,6 +7,8 @@ data class WaxManagementState(
     val consentAccepted: Boolean=false,
     val hasProfile: Boolean=false,
     val hasAccount: Boolean=false,
+    /** An earlier registration attempt ended with an unknown outcome; see the dialog copy. */
+    val setupUnknown: Boolean=false,
     val processEnabled: Boolean=false,
     val wantedEnabled: Boolean=false,
     val restartRequired: Boolean=false,

@@ -39,6 +39,42 @@ class WaxAccount private constructor(
     }
 }
 
+/**
+ * Marker persisted BEFORE the registration POST is sent. If the request's outcome is
+ * unknown (connection dropped mid-flight, unreadable success payload, process death),
+ * an account MAY exist server-side that cannot be recovered (the API has no lookup by
+ * key). While a marker exists, setup never silently re-POSTs: the UI surfaces the
+ * unknown state and only the user's explicit choice discards it and starts fresh.
+ */
+@Serializable
+class PendingWaxRegistration private constructor(val privateKey: String, val createdAt: String) {
+    init {
+        require(B64KEY_RE.matches(privateKey)) { "key shape" }
+        require(createdAt.length in 10..40) { "timestamp shape" }
+    }
+
+    override fun toString() = "PendingWaxRegistration(redacted)"
+
+    companion object {
+        private val B64KEY_RE = Regex("[A-Za-z0-9+/]{43}=")
+
+        fun of(privateKey: String, createdAt: String): PendingWaxRegistration? =
+            runCatching { PendingWaxRegistration(privateKey, createdAt) }.getOrNull()
+    }
+}
+
+object PendingWaxCodec {
+    private val json = Json { ignoreUnknownKeys = false }
+
+    fun encode(pending: PendingWaxRegistration): ByteArray =
+        json.encodeToString(PendingWaxRegistration.serializer(), pending).toByteArray(Charsets.UTF_8)
+
+    fun decode(bytes: ByteArray): PendingWaxRegistration? = runCatching {
+        require(bytes.size in 2..4096)
+        json.decodeFromString(PendingWaxRegistration.serializer(), bytes.toString(Charsets.UTF_8))
+    }.getOrNull()
+}
+
 object WaxAccountCodec {
     private val json = Json { ignoreUnknownKeys = false }
 
