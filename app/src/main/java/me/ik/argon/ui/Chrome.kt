@@ -64,17 +64,18 @@ import me.ik.argon.R
  * Argon command deck - redesign v2 ("Argon discharge").
  * One unified bottom deck: nav buttons, the omnibox pill and the action slot
  * live inside a single continuous glass surface. Idle: back (long-press
- * trail) + forward, omnibox pill (security/search glyph, address, clear),
+ * trail) + forward, omnibox pill (site/search glyph, address, clear),
  * stop-or-reload, menu. Focused: nav buttons collapse, the pill takes the
  * space and the trailing slot crossfades to an accent Go button. The loading
  * state is a thin accent track along the deck's bottom edge.
  *
  * Compose cannot backdrop-blur the webview behind the deck, so the glass is
  * a high-alpha raised surface over the page; the hairline border carries the
- * edge definition. The secure glyph reflects only the observed page URL
- * scheme (https) - it is a transport indicator, not a privacy claim. Touch
- * targets stay >=44dp; every action keeps its content-description for tests
- * and accessibility.
+ * edge definition. The leading glyph is a neutral site icon: the engine
+ * does not expose verified transport state to the embedder, so the UI never
+ * implies certificate validation; it becomes a search glyph while editing.
+ * Touch targets stay >=44dp; every action keeps its content-description for
+ * tests and accessibility.
  */
 @Composable
 fun ArgonCommandBar(
@@ -84,7 +85,6 @@ fun ArgonCommandBar(
     canGoForward: Boolean,
     isLoading: Boolean,
     focused: Boolean,
-    secure: Boolean,
     onFocusChange: (Boolean) -> Unit,
     onSubmit: () -> Unit,
     onBack: () -> Unit,
@@ -202,18 +202,10 @@ fun ArgonCommandBar(
                             size = 32.dp,
                             glyph = 18.dp,
                         ) {
-                            ChromeGlyph(
-                                if (secure) R.drawable.ic_lock else R.drawable.ic_search,
-                                "Shortcut",
-                                if (secure) ArgonColors.Accent else ArgonColors.Text3,
-                            )
+                            ChromeGlyph(leadingGlyphRes(focused), "Shortcut", ArgonColors.Text3)
                         }
                     } else {
-                        ChromeGlyph(
-                            if (secure) R.drawable.ic_lock else R.drawable.ic_search,
-                            null,
-                            if (secure) ArgonColors.Accent else ArgonColors.Text3,
-                        )
+                        ChromeGlyph(leadingGlyphRes(focused), null, ArgonColors.Text3)
                     }
                     Box(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                         if (urlState.text.isEmpty()) {
@@ -304,6 +296,9 @@ fun ArgonCommandBar(
         }
     }
 }
+
+private fun leadingGlyphRes(focused: Boolean): Int =
+    if (focused) R.drawable.ic_search else R.drawable.ic_globe
 
 @Composable
 private fun ChromeIconButton(

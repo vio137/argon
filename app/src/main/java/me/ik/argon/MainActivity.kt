@@ -488,7 +488,6 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         canGoForward = navigator.canGoForward,
                         isLoading = isLoading,
                         focused = omniboxFocused,
-                        secure = currentUrl.startsWith("https://"),
                         onLeadingShortcut =
                             if (omniboxShortcut == OmniboxShortcut.NONE) null
                             else ({ runOmniboxShortcut() }),

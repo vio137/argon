@@ -1,6 +1,7 @@
 package me.ik.argon.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
@@ -17,10 +18,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import me.ik.argon.ArgonColors
+import me.ik.argon.ArgonType
 
 /** Snapshot of the strip's presentation data. @Immutable so ArgonTabStrip is
  * skippable: without a stable wrapper the List<Pair<..>> parameter makes every
@@ -29,10 +32,28 @@ import me.ik.argon.ArgonColors
 @Immutable
 data class TabStripData(val chips: List<Pair<String, String>>, val activeId: String)
 
+/** Deterministic per-site tint for monogram chips (redesign v2): a small
+ * muted palette keyed off the label so each site keeps a stable hue. Placeholder
+ * until the favicon pipeline lands. */
+private fun siteTint(label: String): Color {
+    val palette =
+        listOf(
+            Color(0xFF9B8CFF), // argon violet
+            Color(0xFF6FB8A5), // teal
+            Color(0xFFD8A75B), // amber
+            Color(0xFFD97B96), // rose
+            Color(0xFF7FA8E0), // sky
+            Color(0xFF8FBF6F), // moss
+        )
+    val h = label.fold(0) { acc, c -> (acc * 31 + c.code) and Int.MAX_VALUE }
+    return palette[h % palette.size]
+}
+
 /** Horizontal tab strip: one chip per open tab (title, or host when untitled),
  * close affordance per chip, and a trailing new-tab button. Selection state
  * and per-tab data are owned by MainActivity's TabManager; this composable is
- * pure presentation. */
+ * pure presentation. Redesign v2: hairline chips, active chip carries the
+ * accent wash, compact mode shows a per-site tinted monogram. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ArgonTabStrip(
@@ -53,22 +74,28 @@ fun ArgonTabStrip(
         data.chips.forEach { (id, label) ->
             val selected = id == data.activeId
             Surface(
-                color = if (selected) ArgonColors.SurfaceHigh else ArgonColors.Surface,
-                shape = RoundedCornerShape(10.dp),
+                color = if (selected) ArgonColors.AccentSoft else ArgonColors.BgRaise,
+                shape = RoundedCornerShape(12.dp),
                 modifier =
-                    Modifier.combinedClickable(
-                        onClick = { onSelect(id) },
-                        onLongClick = { onLongPress(id) },
-                    ),
+                    Modifier.border(
+                            1.dp,
+                            if (selected) ArgonColors.Accent.copy(alpha = 0.45f) else ArgonColors.Hairline,
+                            RoundedCornerShape(12.dp),
+                        )
+                        .combinedClickable(
+                            onClick = { onSelect(id) },
+                            onLongClick = { onLongPress(id) },
+                        ),
             ) {
                 if (compact) {
-                    // Compact density: fixed-size initial chip (site monogram
-                    // placeholder until a favicon pipeline lands); close only on
-                    // the active chip so background chips stay tap targets.
+                    // Compact density: fixed-size monogram chip, tinted per
+                    // site (site monogram placeholder until a favicon pipeline
+                    // lands); close only on the active chip so background chips
+                    // stay tap targets.
                     Text(
                         label.firstOrNull()?.uppercase() ?: "?",
-                        color = if (selected) ArgonColors.Text else ArgonColors.Text2,
-                        fontSize = 13.sp,
+                        color = if (selected) ArgonColors.Accent else siteTint(label),
+                        style = ArgonType.Caption,
                         modifier =
                             Modifier.padding(
                                 start = 12.dp,
@@ -79,7 +106,7 @@ fun ArgonTabStrip(
                     )
                     if (selected) {
                         Text(
-                            "\u00d7",
+                            "×",
                             color = ArgonColors.Text3,
                             fontSize = 14.sp,
                             modifier = Modifier.clickable { onClose(id) }.padding(horizontal = 8.dp),
@@ -93,14 +120,14 @@ fun ArgonTabStrip(
                     Text(
                         label,
                         color = if (selected) ArgonColors.Text else ArgonColors.Text2,
+                        style = ArgonType.Caption,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        fontSize = 12.sp,
                         modifier = Modifier.widthIn(max = 120.dp),
                     )
                     if (selected || showCloseOnBackground) {
                     Text(
-                        "\u00d7",
+                        "×",
                         color = ArgonColors.Text3,
                         fontSize = 14.sp,
                         modifier = Modifier.clickable { onClose(id) }.padding(horizontal = 8.dp),
@@ -113,7 +140,7 @@ fun ArgonTabStrip(
         Text(
             "+",
             color = ArgonColors.Text2,
-            fontSize = 16.sp,
+            style = ArgonType.Heading,
             modifier = Modifier.clickable { onNew() }.padding(horizontal = 10.dp, vertical = 4.dp),
         )
     }
