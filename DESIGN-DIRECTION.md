@@ -38,6 +38,10 @@ Reinstall: git clone --depth 1 <url> for each into the agent workspace.
 - Empty states: history, bookmarks, filter no-match, start page.
 - Start page: pixel-verified in headless Chrome at 360x760 and 412x900 (three columns, wrapped labels, Recent section).
 
+- Find in page: app-bundled JS helper via the evaluateScript bridge (mark-wrap, next/prev scroll-into-view, 500-match cap, generation-bound results). JS logic verified in headless Chrome against a fixture page (5-match case, script-tag exclusion, case-insensitivity, clear, empty query). Bridge symbol confirmed exported in the shipped v15 .so (nm -D). Bridge runtime behavior on device remains unverified.
+- Copy link: menu row, clipboard copy of the current page URL.
+- Search engines: Google, DuckDuckGo, Brave, Bing (settings).
+
 ## Embedding limitations (accepted backlog; need engine work, not UI work)
 - Tabs: the Servo embedding exposes a single surface; no multi-view API. Tabs deferred.
 - Network-error page: no load-failure callback exists (navigate/back/forward/reload/stop + evaluateScript only), so an honest error state cannot be built. Not faked.

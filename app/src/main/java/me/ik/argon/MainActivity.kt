@@ -103,6 +103,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private var screen by mutableStateOf(Screen.Browser)
     private var showMenu by mutableStateOf(false)
     private var showAbout by mutableStateOf(false)
+    private var findVisible by mutableStateOf(false)
+    private var findQuery by mutableStateOf("")
+    private var findCount by mutableStateOf(0)
+    private var findIndex by mutableStateOf(0)
     private var adblock by mutableStateOf(true)
     private var showOnboarding by mutableStateOf(false)
     private var httpsOnly by mutableStateOf(false)
@@ -184,6 +188,28 @@ class MainActivity : ComponentActivity(), Servo.Client {
     private lateinit var history: HistoryStore
     private lateinit var bookmarks: BookmarkStore
     private val navigator get() = ServoHolder.navigator
+
+    /** Run a find-in-page script, binding the result to the document it was
+     * issued on (generation advances on every load start, like the reader
+     * binding did). Runtime behavior of the bridge is unverified on device;
+     * the symbol is confirmed exported by the shipped v15 .so. */
+    private fun runFindScript(script: String) {
+        val servo = ServoHolder.servo ?: return
+        val generationAtRequest = Servo.navigationGeneration.get()
+        servo.evaluateScript(script) { json, error ->
+            if (Servo.navigationGeneration.get() != generationAtRequest) return@evaluateScript
+            if (error != null) return@evaluateScript
+            FindInPage.parse(json)?.let {
+                findCount = it.count
+                findIndex = it.index
+            }
+        }
+    }
+
+    private fun closeFind() {
+        if (findVisible) runFindScript(FindInPage.CLEAR_SCRIPT)
+        findVisible = false
+    }
 
     /** Rewrite the local start page and, when it is the page on screen,
      * reload so cleared/removed entries never linger in the visible page or
@@ -398,6 +424,15 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                     .putExtra(Intent.EXTRA_TEXT, currentUrl)
                                 startActivity(Intent.createChooser(send, null))
                             },
+                            onFind = {
+                                showMenu = false
+                                findVisible = true
+                            },
+                            onCopyLink = {
+                                showMenu = false
+                                val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("link", currentUrl))
+                            },
                             onBookmarks = {
                                 showMenu = false
                                 screen = Screen.Bookmarks
@@ -429,6 +464,37 @@ class MainActivity : ComponentActivity(), Servo.Client {
                                 showMenu = false
                                 finishAndRemoveTask()
                             },
+                        )
+                    }
+                    if (findVisible) {
+                        BackHandler { closeFind() }
+                        // Debounced highlight on query change / bar open.
+                        LaunchedEffect(findQuery) {
+                            kotlinx.coroutines.delay(300)
+                            if (findQuery.isNotEmpty()) {
+                                runFindScript(FindInPage.highlightScript(findQuery))
+                            } else {
+                                runFindScript(FindInPage.CLEAR_SCRIPT)
+                                findCount = 0
+                                findIndex = 0
+                            }
+                        }
+                        // A navigation drops the old document's marks; re-run.
+                        LaunchedEffect(currentUrl) {
+                            if (findQuery.isNotEmpty()) runFindScript(FindInPage.highlightScript(findQuery))
+                        }
+                        FindBar(
+                            query = findQuery,
+                            count = findCount,
+                            index = findIndex,
+                            onQuery = { findQuery = it },
+                            onNext = { runFindScript(FindInPage.NEXT_SCRIPT) },
+                            onPrev = { runFindScript(FindInPage.PREV_SCRIPT) },
+                            onClose = { closeFind() },
+                            modifier =
+                                Modifier.align(Alignment.BottomCenter)
+                                    .navigationBarsPadding()
+                                    .padding(start = 12.dp, end = 12.dp, bottom = 84.dp),
                         )
                     }
                     if (showAbout) {

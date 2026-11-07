@@ -397,6 +397,8 @@ fun MenuSheet(
     canGoForward: Boolean,
     shareEnabled: Boolean,
     onShare: () -> Unit,
+    onFind: () -> Unit,
+    onCopyLink: () -> Unit,
     onBookmarks: () -> Unit,
     currentHost: String,
     onDismiss: () -> Unit,
@@ -428,7 +430,9 @@ fun MenuSheet(
                 }
             }
             SheetLabel("This page")
+            SheetRow(R.drawable.ic_search, "Find in page", shareEnabled, onFind)
             SheetRow(R.drawable.ic_share, "Share page", shareEnabled, onShare)
+            SheetRow(R.drawable.ic_copy, "Copy link", shareEnabled, onCopyLink)
             SheetRow(R.drawable.ic_arrow_forward, "Forward", canGoForward, onForward)
             SheetRow(R.drawable.ic_star, "Add to start page", true, onAddToStart)
             SheetLabel("App")
