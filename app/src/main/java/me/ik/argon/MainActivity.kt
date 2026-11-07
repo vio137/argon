@@ -272,7 +272,16 @@ class MainActivity : ComponentActivity(), Servo.Client {
             android.util.Log.i("ArgonNav", "DISPLAY_MODE peak=${best?.refreshRate} was=${cur.refreshRate}")
         }
 
-        val intentUrl = if (intent?.action == Intent.ACTION_VIEW) intent.data?.toString() else null
+        val intentUrl =
+            when {
+                intent?.action == Intent.ACTION_VIEW -> intent.data?.toString()
+                // Shared text goes through locationFor, exactly like typed
+                // omnibox input: URLs open, anything else becomes a search.
+                intent?.action == Intent.ACTION_SEND ->
+                    intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
+                        ?.let { locationFor(it, searchEngine, httpsOnly) }
+                else -> null
+            }
 
         setContent {
             ArgonTheme {
@@ -543,8 +552,10 @@ class MainActivity : ComponentActivity(), Servo.Client {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (intent.action == Intent.ACTION_VIEW) {
-            intent.data?.toString()?.let { navigate(it) }
+        when (intent.action) {
+            Intent.ACTION_VIEW -> intent.data?.toString()?.let { navigate(it) }
+            Intent.ACTION_SEND ->
+                intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }?.let { navigate(it) }
         }
     }
 
