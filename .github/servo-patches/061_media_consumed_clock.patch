@@ -1,0 +1,229 @@
+From 9cb2680b122e477b6fc0019f1d798aa531d24549 Mon Sep 17 00:00:00 2001
+From: Instinct Agent <agent@instinct.com>
+Date: Sat, 7 Nov 2026 22:18:02 +0530
+Subject: [PATCH] 061 media: clock from endpoint-consumed frames, not queued
+ PCM writes
+
+---
+ .../backends/android/android_impl/player.rs   | 17 ++++-
+ .../backends/android/android_impl/sys.rs      |  1 +
+ components/media/backends/android/clock.rs    | 75 +++++++++++++++++--
+ 3 files changed, 84 insertions(+), 9 deletions(-)
+
+diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
+index 908ef0b4c..47ca28eee 100644
+--- a/components/media/backends/android/android_impl/player.rs
++++ b/components/media/backends/android/android_impl/player.rs
+@@ -802,8 +802,10 @@ impl Pipeline {
+ 
+             let mut did_work = false;
+             did_work |= self.feed_inputs();
++            self.update_audio_clock();
+             did_work |= self.pump_video();
+             did_work |= self.pump_audio();
++            self.update_audio_clock();
+             if !did_work {
+                 std::thread::sleep(Duration::from_millis(4));
+             }
+@@ -884,6 +886,13 @@ impl Pipeline {
+         true
+     }
+ 
++    fn update_audio_clock(&mut self) {
++        if !self.aaudio.is_null() {
++            let counter = unsafe { sys::AAudioStream_getFramesRead(self.aaudio) };
++            self.clock.observe_audio_consumed(counter);
++        }
++    }
++
+     fn audio_transition_failed(&mut self) {
+         if !self.aaudio.is_null() {
+             unsafe { sys::AAudioStream_close(self.aaudio) };
+@@ -947,6 +956,9 @@ impl Pipeline {
+             )
+         };
+         self.clock.rebase(target_us);
++        if !self.aaudio.is_null() {
++            self.clock.reset_audio_epoch(unsafe { sys::AAudioStream_getFramesRead(self.aaudio) });
++        }
+         let held = self.focus.hold != Hold::None;
+         if self.shared.get().paused || held {
+             // rebase restarts the wall clock; freeze it again while paused.
+@@ -1382,7 +1394,7 @@ impl Pipeline {
+                 self.aaudio = stream;
+                 self.clock.has_audio = true;
+                 self.clock.audio_sample_rate = rate as i64;
+-                self.clock.audio_frames_written = 0;
++                self.clock.reset_audio_epoch(sys::AAudioStream_getFramesRead(stream));
+                 if !self.shared.get().paused && self.focus.hold == Hold::None {
+                     self.set_audio_running(true);
+                 }
+@@ -1422,7 +1434,8 @@ impl Pipeline {
+                 return;
+             }
+             let written = written as usize;
+-            self.clock.audio_frames_written += written as u64;
++            self.clock.audio_frames_written = self.clock.audio_frames_written.saturating_add(written as u64);
++            self.update_audio_clock();
+             offset_frames += written;
+             frames_left -= written;
+             if written == 0 {
+diff --git a/components/media/backends/android/android_impl/sys.rs b/components/media/backends/android/android_impl/sys.rs
+index ea1ce4dde..f6dbf6b42 100644
+--- a/components/media/backends/android/android_impl/sys.rs
++++ b/components/media/backends/android/android_impl/sys.rs
+@@ -198,6 +198,7 @@ unsafe extern "C" {
+         builder: *mut *mut AAudioStreamBuilder,
+     ) -> aaudio_result_t;
+     pub fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
++    pub fn AAudioStream_getFramesRead(stream: *mut AAudioStream) -> i64;
+     pub fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> aaudio_result_t;
+     pub fn AAudioStreamBuilder_setDirection(builder: *mut AAudioStreamBuilder, direction: i32);
+     pub fn AAudioStreamBuilder_setSampleRate(builder: *mut AAudioStreamBuilder, sample_rate: i32);
+diff --git a/components/media/backends/android/clock.rs b/components/media/backends/android/clock.rs
+index ef663ab14..111ff604e 100644
+--- a/components/media/backends/android/clock.rs
++++ b/components/media/backends/android/clock.rs
+@@ -2,8 +2,8 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-//! Master playback clock. Audio-driven when an audio track is being written
+-//! to AAudio; wall-clock otherwise. Pure logic: hosttest/ runs these tests on
++//! Master playback clock. Audio-driven by endpoint-consumed frames, not queued
++//! writes (not a DAC timestamp); wall-clock otherwise. Pure logic: hosttest/ runs these tests on
+ //! the host against the exact file the Android build compiles.
+ 
+ use std::time::{Duration, Instant};
+@@ -13,6 +13,8 @@ pub struct MasterClock {
+     pub(crate) has_audio: bool,
+     pub(crate) audio_frames_written: u64,
+     pub(crate) audio_sample_rate: i64,
++    audio_frames_consumed: u64,
++    audio_counter_origin: i64,
+     wall_started: Option<Instant>,
+     wall_accumulated: Duration,
+ }
+@@ -24,6 +26,8 @@ impl MasterClock {
+             has_audio: false,
+             audio_frames_written: 0,
+             audio_sample_rate: 0,
++            audio_frames_consumed: 0,
++            audio_counter_origin: 0,
+             wall_started: None,
+             wall_accumulated: Duration::ZERO,
+         }
+@@ -35,9 +39,30 @@ impl MasterClock {
+         self.anchor_pts_us = pts_us;
+     }
+ 
++    /// Begin a fresh stream/seek epoch. AAudio counters are lifetime counters:
++    /// flush does not zero them, and may advance them. Capture origin AFTER flush.
++    pub fn reset_audio_epoch(&mut self, counter_origin: i64) {
++        self.audio_counter_origin = counter_origin.max(0);
++        self.audio_frames_consumed = 0;
++        self.audio_frames_written = 0;
++    }
++
++    /// The endpoint may report frames beyond our submitted data after underrun.
++    /// Clamp to written frames, ignore negative/stale counters, never rewind.
++    pub fn observe_audio_consumed(&mut self, counter: i64) {
++        if counter < self.audio_counter_origin {
++            return;
++        }
++        let frames = counter.saturating_sub(self.audio_counter_origin) as u64;
++        self.audio_frames_consumed = self
++            .audio_frames_consumed
++            .max(frames.min(self.audio_frames_written));
++    }
++
+     pub fn rebase(&mut self, anchor_pts_us: i64) {
+         self.anchor_pts_us = anchor_pts_us;
+         self.audio_frames_written = 0;
++        self.audio_frames_consumed = 0;
+         self.wall_started = Some(Instant::now());
+         self.wall_accumulated = Duration::ZERO;
+     }
+@@ -56,8 +81,10 @@ impl MasterClock {
+ 
+     pub fn now_us(&self) -> i64 {
+         if self.has_audio && self.audio_sample_rate > 0 {
+-            self.anchor_pts_us +
+-                (self.audio_frames_written as i64) * 1_000_000 / self.audio_sample_rate
++            let elapsed =
++                (self.audio_frames_consumed as u128) * 1_000_000 / self.audio_sample_rate as u128;
++            self.anchor_pts_us
++                .saturating_add(elapsed.min(i64::MAX as u128) as i64)
+         } else {
+             let running = self
+                 .wall_started
+@@ -80,10 +107,12 @@ mod tests {
+         clock.has_audio = true;
+         clock.audio_sample_rate = 48_000;
+         assert_eq!(clock.now_us(), 2_000_000);
+-        clock.audio_frames_written = 48_000; // one second of samples
++        clock.audio_frames_written = 48_000; // queued writes alone must not advance
++        assert_eq!(clock.now_us(), 2_000_000);
++        clock.observe_audio_consumed(48_000);
++        assert_eq!(clock.now_us(), 3_000_000);
++        clock.observe_audio_consumed(24_000); // stale counter cannot rewind
+         assert_eq!(clock.now_us(), 3_000_000);
+-        clock.audio_frames_written = 24_000; // half a second
+-        assert_eq!(clock.now_us(), 2_500_000);
+     }
+ 
+     #[test]
+@@ -93,6 +122,7 @@ mod tests {
+         clock.has_audio = true;
+         clock.audio_sample_rate = 48_000;
+         clock.audio_frames_written = 48_000;
++        clock.observe_audio_consumed(48_000);
+         sleep(Duration::from_millis(5));
+         // Wall time must not leak into an audio-driven clock.
+         assert_eq!(clock.now_us(), 1_000_000);
+@@ -123,6 +153,7 @@ mod tests {
+         clock.has_audio = true;
+         clock.audio_sample_rate = 48_000;
+         clock.audio_frames_written = 48_000;
++        clock.observe_audio_consumed(48_000);
+         assert_eq!(clock.now_us(), 6_000_000);
+         clock.rebase(500_000);
+         assert_eq!(clock.now_us(), 500_000);
+@@ -138,4 +169,34 @@ mod tests {
+         // Degenerate audio state must not divide by zero or freeze the clock.
+         let _ = clock.now_us();
+     }
++    #[test]
++    fn lifetime_counter_origin_and_underrun_are_clamped() {
++        let mut c = MasterClock::new();
++        c.rebase(1_000_000);
++        c.has_audio = true;
++        c.audio_sample_rate = 48_000;
++        c.reset_audio_epoch(96_000);
++        c.audio_frames_written = 48_000;
++        c.observe_audio_consumed(120_000);
++        assert_eq!(c.now_us(), 1_500_000);
++        c.observe_audio_consumed(999_999);
++        assert_eq!(c.now_us(), 2_000_000);
++        c.observe_audio_consumed(-1);
++        assert_eq!(c.now_us(), 2_000_000);
++        c.rebase(500_000);
++        c.reset_audio_epoch(999_999);
++        c.audio_frames_written = 24_000;
++        c.observe_audio_consumed(1_023_999);
++        assert_eq!(c.now_us(), 1_000_000);
++    }
++    #[test]
++    fn extreme_frame_counts_do_not_overflow_clock() {
++        let mut c = MasterClock::new();
++        c.rebase(i64::MAX - 10);
++        c.has_audio = true;
++        c.audio_sample_rate = 1;
++        c.audio_frames_written = u64::MAX;
++        c.observe_audio_consumed(i64::MAX);
++        assert_eq!(c.now_us(), i64::MAX);
++    }
+ }
+-- 
+2.34.1
+
