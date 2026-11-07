@@ -71,7 +71,10 @@ fun OmniboxSuggestions(
     onPick: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val matches = suggest(query, history, bookmarks)
+    // Recompute only when the query or a store snapshot changes; other
+    // recompositions (row ripple, parent pass) reuse the last result.
+    // (Perf audit 1.0.17.)
+    val matches = androidx.compose.runtime.remember(query, history, bookmarks) { suggest(query, history, bookmarks) }
     Column(
         modifier =
             modifier
