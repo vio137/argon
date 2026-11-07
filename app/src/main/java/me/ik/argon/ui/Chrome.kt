@@ -17,6 +17,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -98,7 +99,7 @@ fun ArgonCommandBar(
     loadingArc: @Composable () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Box(
+    BoxWithConstraints(
         modifier =
             modifier
                 .fillMaxWidth()
@@ -110,6 +111,12 @@ fun ArgonCommandBar(
                 .background(ArgonColors.BgRaise.copy(alpha = 0.94f))
                 .border(1.dp, ArgonColors.HairlineStrong, RoundedCornerShape(ArgonRadii.Panel)),
     ) {
+        // Adaptive chrome: below a comfortable width the forward button folds
+        // away so the omnibox pill keeps meaningful address text (review:
+        // at small-phone width with 1.3x font, five controls leave the pill
+        // only a couple of characters).
+        val roomy = maxWidth >= 380.dp
+        val showForward = canGoForward && roomy
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxSize().padding(horizontal = 6.dp),
@@ -117,7 +124,7 @@ fun ArgonCommandBar(
             // Nav buttons: hidden on the start surface (nothing to navigate)
             // and collapsed while editing so the pill gets the width.
             AnimatedVisibility(
-                visible = (canGoBack || canGoForward) && !focused,
+                visible = (canGoBack || showForward) && !focused,
                 enter = slideInHorizontally(spring()) { -it } + fadeIn(),
                 exit = slideOutHorizontally(spring()) { -it } + fadeOut(),
             ) {
@@ -162,16 +169,14 @@ fun ArgonCommandBar(
                             }
                         }
                     }
-                    ChromeIconButton(
-                        onClick = onForward,
-                        description = "Forward",
-                        enabled = canGoForward,
-                    ) {
-                        ChromeGlyph(
-                            R.drawable.ic_arrow_forward,
-                            "Forward",
-                            if (canGoForward) ArgonColors.Text else ArgonColors.Text3,
-                        )
+                    if (showForward) {
+                        ChromeIconButton(
+                            onClick = onForward,
+                            description = "Forward",
+                            enabled = true,
+                        ) {
+                            ChromeGlyph(R.drawable.ic_arrow_forward, "Forward", ArgonColors.Text)
+                        }
                     }
                 }
             }

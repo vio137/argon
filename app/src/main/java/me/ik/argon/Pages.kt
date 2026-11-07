@@ -1,6 +1,7 @@
 package me.ik.argon
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -466,73 +467,91 @@ fun SettingsScreen(
     Surface(Modifier.fillMaxSize(), color = ArgonColors.Bg) {
         Column(Modifier.fillMaxSize()) {
             PageTopBar("Settings", onBack)
-            Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
                 SettingsLabel("Privacy")
-                SettingSwitch(
-                    title = "Ad blocking",
-                    subtitle = "${String.format("%,d", Blocklist.DOMAIN_COUNT)} ad and tracker domains blocked at the engine level",
-                    checked = adblock,
-                    onCheckedChange = onAdblock,
-                )
+                SettingsCard {
+                    SettingSwitch(
+                        title = "Ad blocking",
+                        // Grounded: DOMAIN_COUNT is the shipped hosts.txt rule-list
+                        // size, not a count of blocked requests.
+                        subtitle = "Blocks ads and trackers using a built-in list of ${String.format("%,d", Blocklist.DOMAIN_COUNT)} domains",
+                        checked = adblock,
+                        onCheckedChange = onAdblock,
+                    )
+                }
                 SettingsLabel("General")
-                SettingClick(
-                    title = "Search engine",
-                    subtitle = searchEngine.label,
-                    onClick = { engineDialog = true },
-                )
-                SettingClick(
-                    title = "Address-bar shortcut",
-                    subtitle = omniboxShortcut.label,
-                    onClick = { shortcutDialog = true },
-                )
-                SettingSwitch(
-                    title = "HTTPS-only",
-                    subtitle = "Upgrades addresses you type or open to https://. Resources a page loads itself are not affected",
-                    checked = httpsOnly,
-                    onCheckedChange = onHttpsOnly,
-                )
-                SettingSwitch(
-                    title = "Clear history on exit",
-                    subtitle = "Clears Argon's history list when the app is closed. Engine cookies and cache are not cleared",
-                    checked = clearOnExit,
-                    onCheckedChange = onClearOnExit,
-                )
-                SettingSwitch(
-                    title = "Experimental web features",
-                    subtitle = "In-development Servo capabilities",
-                    checked = experimental,
-                    onCheckedChange = onExperimental,
-                )
+                SettingsCard {
+                    SettingClick(
+                        title = "Search engine",
+                        subtitle = searchEngine.label,
+                        onClick = { engineDialog = true },
+                    )
+                    SettingsDivider()
+                    SettingClick(
+                        title = "Address-bar shortcut",
+                        subtitle = omniboxShortcut.label,
+                        onClick = { shortcutDialog = true },
+                    )
+                    SettingsDivider()
+                    SettingSwitch(
+                        title = "HTTPS-only",
+                        subtitle = "Upgrades addresses you type or open to https://. Resources a page loads itself are not affected",
+                        checked = httpsOnly,
+                        onCheckedChange = onHttpsOnly,
+                    )
+                    SettingsDivider()
+                    SettingSwitch(
+                        title = "Clear history on exit",
+                        subtitle = "Clears Argon's history list when the app is closed. Engine cookies and cache are not cleared",
+                        checked = clearOnExit,
+                        onCheckedChange = onClearOnExit,
+                    )
+                    SettingsDivider()
+                    SettingSwitch(
+                        title = "Experimental web features",
+                        subtitle = "In-development Servo capabilities",
+                        checked = experimental,
+                        onCheckedChange = onExperimental,
+                    )
+                }
                 SettingsLabel("Tabs")
-                SettingSwitch(
-                    title = "Compact tabs",
-                    subtitle = "Smaller tab chips showing the site initial; close button only on the active tab",
-                    checked = compactTabs,
-                    onCheckedChange = onCompactTabs,
-                )
-                SettingSwitch(
-                    title = "Close button on background tabs",
-                    subtitle = "Shows the close control on every tab chip, not only the active one",
-                    checked = closeButtonsBackgroundTabs,
-                    onCheckedChange = onCloseButtonsBackgroundTabs,
-                )
+                SettingsCard {
+                    SettingSwitch(
+                        title = "Compact tabs",
+                        subtitle = "Smaller tab chips showing the site initial; close button only on the active tab",
+                        checked = compactTabs,
+                        onCheckedChange = onCompactTabs,
+                    )
+                    SettingsDivider()
+                    SettingSwitch(
+                        title = "Close button on background tabs",
+                        subtitle = "Shows the close control on every tab chip, not only the active one",
+                        checked = closeButtonsBackgroundTabs,
+                        onCheckedChange = onCloseButtonsBackgroundTabs,
+                    )
+                }
                 SettingsLabel("Data")
-                SettingClick(
-                    title = "Export bookmarks",
-                    subtitle = "Save as browser-compatible HTML",
-                    onClick = onExportBookmarks,
-                )
-                SettingClick(
-                    title = "Import bookmarks",
-                    subtitle = "From a Chrome, Firefox, Edge or Safari HTML file; existing entries are kept",
-                    onClick = onImportBookmarks,
-                )
-                SettingClick(title = "Clear history", subtitle = null, danger = true, onClick = { confirmClear = true })
-                Spacer(Modifier.height(32.dp))
+                SettingsCard {
+                    SettingClick(
+                        title = "Export bookmarks",
+                        subtitle = "Save as browser-compatible HTML",
+                        onClick = onExportBookmarks,
+                    )
+                    SettingsDivider()
+                    SettingClick(
+                        title = "Import bookmarks",
+                        subtitle = "From a Chrome, Firefox, Edge or Safari HTML file; existing entries are kept",
+                        onClick = onImportBookmarks,
+                    )
+                    SettingsDivider()
+                    SettingClick(title = "Clear history", subtitle = null, danger = true, onClick = { confirmClear = true })
+                }
+                Spacer(Modifier.height(24.dp))
                 Text(
                     "Argon 1.0 · Servo engine b6c9df7 · Block list StevenBlack/hosts (Nov 2026)",
                     color = ArgonColors.Text3,
                     style = ArgonType.Caption,
+                    modifier = Modifier.padding(horizontal = 4.dp),
                 )
             }
         }
@@ -612,10 +631,33 @@ fun SettingsScreen(
 @Composable
 private fun SettingsLabel(label: String) {
     Text(
-        label,
+        label.uppercase(),
         color = ArgonColors.Text3,
-        style = ArgonType.Caption,
-        modifier = Modifier.padding(top = 20.dp, bottom = 2.dp),
+        style = ArgonType.Section,
+        modifier = Modifier.padding(start = 4.dp, top = 20.dp, bottom = 8.dp),
+    )
+}
+
+/** v2 grouped card: one hairline-outlined raised surface per section, rows
+ * separated by inset hairlines (macOS/Deepin grouped-list idiom). */
+@Composable
+private fun SettingsCard(content: @Composable () -> Unit) {
+    androidx.compose.foundation.layout.Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(ArgonRadii.Card))
+                .background(ArgonColors.BgRaise)
+                .border(1.dp, ArgonColors.Hairline, RoundedCornerShape(ArgonRadii.Card))
+                .padding(horizontal = 16.dp),
+    ) {
+        content()
+    }
+}
+
+@Composable
+private fun SettingsDivider() {
+    androidx.compose.foundation.layout.Box(
+        Modifier.fillMaxWidth().height(1.dp).background(ArgonColors.Hairline),
     )
 }
 
@@ -623,7 +665,7 @@ private fun SettingsLabel(label: String) {
 private fun SettingSwitch(title: String, subtitle: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
     ) {
         Column(Modifier.weight(1f).padding(end = 16.dp)) {
             Text(title, color = ArgonColors.Text, style = ArgonType.Body)
@@ -648,7 +690,7 @@ private fun SettingSwitch(title: String, subtitle: String, checked: Boolean, onC
 private fun SettingClick(title: String, subtitle: String?, danger: Boolean = false, onClick: () -> Unit) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp),
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 14.dp),
     ) {
         Column {
             Text(title, color = if (danger) ArgonColors.Danger else ArgonColors.Text, style = ArgonType.Body)
