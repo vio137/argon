@@ -1,11 +1,11 @@
-commit 43856afd5b569958503b0dc941dd87123548867b
+commit a7ebef639566b082b9332cb13a928c2aaa5241d2
 Author: Instinct Agent <agent@instinct.com>
 Date:   Sat Nov 7 19:57:46 2026 +0530
 
     058 media: flush AAudio queue on seek (drop stale pre-seek audio)
 
 diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
-index f051d385b..84910d7b7 100644
+index 498ae6c0f..cf16528e8 100644
 --- a/components/media/backends/android/android_impl/player.rs
 +++ b/components/media/backends/android/android_impl/player.rs
 @@ -899,8 +899,17 @@ impl Pipeline {

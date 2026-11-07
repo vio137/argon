@@ -1,11 +1,11 @@
-commit 114d800c1ad97cc82f277af4801e905214f13ac2
+commit a66843ef859817410cfd09e2ddec4b6a341828ee
 Author: Instinct Agent <agent@instinct.com>
 Date:   Sat Nov 7 19:54:09 2026 +0530
 
     056 media: extract MasterClock + color select into host-tested pure modules
 
 diff --git a/components/media/backends/android/android_impl/player.rs b/components/media/backends/android/android_impl/player.rs
-index 3c2c65faf..fedd74857 100644
+index 3c2c65faf..1be561d1d 100644
 --- a/components/media/backends/android/android_impl/player.rs
 +++ b/components/media/backends/android/android_impl/player.rs
 @@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
@@ -142,12 +142,21 @@ index 3c2c65faf..fedd74857 100644
                  },
              );
              match converted {
+@@ -1337,7 +1301,7 @@ impl Pipeline {
+         }
+         let channels = self.audio.as_ref().unwrap().channels.max(1) as usize;
+         if self.clock.audio_frames_written == 0 {
+-            self.clock.anchor_pts_us = pts_us;
++            self.clock.anchor_audio_start(pts_us);
+         }
+         let mut frames_left = samples.len() / channels;
+         let mut offset_frames = 0usize;
 diff --git a/components/media/backends/android/clock.rs b/components/media/backends/android/clock.rs
 new file mode 100644
-index 000000000..539d18823
+index 000000000..ef663ab14
 --- /dev/null
 +++ b/components/media/backends/android/clock.rs
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,141 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You obtain one at https://mozilla.org/MPL/2.0/. */
@@ -177,6 +186,12 @@ index 000000000..539d18823
 +            wall_started: None,
 +            wall_accumulated: Duration::ZERO,
 +        }
++    }
++
++    /// Anchor the clock to the first audio frame's PTS without touching wall
++    /// tracking (audio just (re)started; wall state stays as-is).
++    pub fn anchor_audio_start(&mut self, pts_us: i64) {
++        self.anchor_pts_us = pts_us;
 +    }
 +
 +    pub fn rebase(&mut self, anchor_pts_us: i64) {
