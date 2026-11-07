@@ -331,12 +331,8 @@ fun LibraryPage(
 }
 
 @Composable
-private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Clear history") },
-        text = {
-            Column {
+internal fun ClearHistoryDialogContent(onClear: (Long?) -> Unit) {
+    Column {
                 listOf(
                     Triple("Last hour", System.currentTimeMillis() - 3_600_000L, false),
                     Triple("Today", startOfTodayMs(), false),
@@ -352,8 +348,15 @@ private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) 
                                 .padding(vertical = 12.dp),
                     )
                 }
-            }
-        },
+    }
+}
+
+@Composable
+private fun ClearHistoryDialog(onDismiss: () -> Unit, onClear: (Long?) -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Clear history") },
+        text = { ClearHistoryDialogContent(onClear) },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -900,20 +903,23 @@ private fun SheetRow(icon: Int, label: String, enabled: Boolean, onClick: () -> 
 }
 
 @Composable
-fun AboutDialog(onDismiss: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Argon") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+internal fun AboutDialogContent() {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · package me.ik.argon", style = ArgonType.BodySmall)
                 Text("Web engine: Servo nightly 2026-11-05 (servo/servo@b6c9df76), MPL-2.0 · servo.org", style = ArgonType.BodySmall)
                 Text("Ad and tracker list: StevenBlack/hosts, MIT license", style = ArgonType.BodySmall)
                 Text("Interface direction informed by unslop by Damir Sokolovsky, CC BY 4.0", style = ArgonType.BodySmall)
                 Text("Reviewed against Apple's Human Interface Guidelines (apple-design-skill) and mobile-app-ui-design", style = ArgonType.BodySmall)
                 Text("Argon is an independent shell and is not affiliated with the Servo project.", style = ArgonType.Caption, color = ArgonColors.Text2)
-            }
-        },
+    }
+}
+
+@Composable
+fun AboutDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Argon") },
+        text = { AboutDialogContent() },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
     )
 }

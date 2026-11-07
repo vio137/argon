@@ -7,7 +7,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.Text
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -368,6 +374,36 @@ class ChromeScreenshotTest {
                     onAbout = {},
                     onExit = {},
                 )
+            }
+        }
+    }
+
+    /** Dialog CONTENT composables only: AlertDialog window chrome and slot
+     *  typography are not covered by this harness. */
+    @Test
+    fun clearHistoryDialogContent() {
+        paparazzi.snapshot {
+            Box(Modifier.background(ArgonColors.Surface).padding(24.dp)) {
+                CompositionLocalProvider(LocalContentColor provides ArgonColors.Text) {
+                    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        Text("Clear history", color = ArgonColors.Text, style = ArgonType.Heading)
+                        ClearHistoryDialogContent(onClear = {})
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun aboutDialogContent() {
+        paparazzi.snapshot {
+            Box(Modifier.background(ArgonColors.Surface).padding(24.dp)) {
+                CompositionLocalProvider(LocalContentColor provides ArgonColors.Text) {
+                    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        Text("Argon", color = ArgonColors.Text, style = ArgonType.Heading)
+                        AboutDialogContent()
+                    }
+                }
             }
         }
     }

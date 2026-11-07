@@ -5,6 +5,15 @@ import java.io.File
 
 object StartPage {
     fun write(context: Context, bookmarks: List<Bookmark>, history: List<HistoryEntry>, engine: SearchEngine): String {
+        val html = html(bookmarks, history, engine)
+        val file = File(context.filesDir, "startpage.html")
+        file.writeText(html)
+        return file.toURI().toString()
+    }
+
+    /** The exact markup the engine renders as the start page. Pure so the
+     *  host-render lane can screenshot real shipped output, not a mock. */
+    internal fun html(bookmarks: List<Bookmark>, history: List<HistoryEntry>, engine: SearchEngine): String {
         // Only web pages become start-page links: this HTML renders as a
         // local file page, so other schemes (javascript:, intent:, ...) are
         // never emitted as hrefs. esc() still guards every interpolated value.
@@ -21,8 +30,7 @@ object StartPage {
                 val host = hostOf(it.url)
                 """<a class="row" href="${esc(it.url)}"><span class="rglyph" style="--h:${hostHue(host)}">${esc(host.firstOrNull()?.uppercaseChar()?.toString() ?: "?")}</span><span class="rtext"><span class="rtitle">${esc(it.title)}</span><span class="rhost">${esc(host)}</span></span></a>"""
             }
-        val html =
-            """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Argon</title><style>
+        return """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Argon</title><style>
 :root{--bg:#0B0C10;--raise:#13151B;--surface:#181A22;--high:#21242E;--text:#F4F5F8;--text2:#A8AEBC;--text3:#6E7584;--accent:#9B8CFF;--accentsoft:#9B8CFF1F;--hair:#FFFFFF17;--hair2:#FFFFFF29}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Roboto,sans-serif;min-height:100vh;padding:40px 20px 96px}
@@ -69,9 +77,6 @@ input::placeholder{color:var(--text3)}
 <div class="stitle">Start</div><div class="grid">$tiles</div>${if (webBookmarks.isEmpty()) """<div class="empty">Pages you star from the menu land here.</div>""" else ""}${if (recent.isNotEmpty()) """<div class="recent"><div class="stitle">Recent</div><div class="rows">$recent</div></div>""" else ""}
 </div>
 </body></html>"""
-        val file = File(context.filesDir, "startpage.html")
-        file.writeText(html)
-        return file.toURI().toString()
     }
 
     /** Deterministic per-host hue (0-359), so a shortcut's tile keeps its own
