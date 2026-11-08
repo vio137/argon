@@ -1,0 +1,75 @@
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2469,20 +2469,17 @@
+ 
+     pub(crate) fn existing_audio_tracks(&self) -> Option<DomRoot<AudioTrackList>> { self.audio_tracks_list.get() }
+     pub(crate) fn existing_video_tracks(&self) -> Option<DomRoot<VideoTrackList>> { self.video_tracks_list.get() }
+-    pub(crate) fn set_audio_track(&self, idx: usize, enabled: bool) {
+-        if let Some(ref player) = *self.player.borrow() &&
+-            let Err(error) = player.lock().unwrap().set_audio_track(idx as i32, enabled)
+-        {
+-            warn!("Could not set audio track {error:?}");
+-        }
+-    }
+-
+-    pub(crate) fn set_video_track(&self, idx: usize, enabled: bool) {
+-        if let Some(ref player) = *self.player.borrow() &&
+-            let Err(error) = player.lock().unwrap().set_video_track(idx as i32, enabled)
+-        {
+-            warn!("Could not set video track: {error:?}");
+-        }
++    /// Append-backed selection must be accepted by the bounded worker queue
++    /// before the DOM list changes. Preserve existing progressive behavior.
++    pub(crate) fn set_audio_track(&self,idx:usize,enabled:bool)->bool {
++        let result=self.player.borrow().as_ref().map(|player|player.lock().unwrap().set_audio_track(idx as i32,enabled));
++        if let Some(Err(error))=result {warn!("Could not set audio track {error:?}");return self.attached_append_source.get().is_none();}
++        true
++    }
++    pub(crate) fn set_video_track(&self,idx:usize,enabled:bool)->bool {
++        let result=self.player.borrow().as_ref().map(|player|player.lock().unwrap().set_video_track(idx as i32,enabled));
++        if let Some(Err(error))=result {warn!("Could not set video track {error:?}");return self.attached_append_source.get().is_none();}
++        true
+     }
+ 
+     /// <https://html.spec.whatwg.org/multipage/#direction-of-playback>
+diff --git a/components/script/dom/audio/audiotracklist.rs b/components/script/dom/audio/audiotracklist.rs
+--- a/components/script/dom/audio/audiotracklist.rs
++++ b/components/script/dom/audio/audiotracklist.rs
+@@ -99,11 +99,11 @@
+         if track.enabled() == value {
+             return;
+         }
+-        // Set the tracks enabled status.
++        if let Some(media_element)=self.media_element.as_ref() {
++            if !media_element.set_audio_track(idx,value){return;}
++        }
++        // Queue acceptance precedes DOM mutation and the change event.
+         track.set_enabled(value);
+-        if let Some(media_element) = self.media_element.as_ref() {
+-            media_element.set_audio_track(idx, value);
+-        }
+ 
+         // Queue a task to fire an event named change.
+         let global = &self.global();
+diff --git a/components/script/dom/media/videotracklist.rs b/components/script/dom/media/videotracklist.rs
+--- a/components/script/dom/media/videotracklist.rs
++++ b/components/script/dom/media/videotracklist.rs
+@@ -100,14 +100,14 @@
+             return;
+         }
+ 
++        if let Some(media_element)=self.media_element.as_ref() {
++            if !media_element.set_video_track(idx,value){return;}
++        }
+         if let Some(current) = self.selected_index() {
+             self.tracks.borrow()[current].set_selected(false);
+         }
+ 
+         track.set_selected(value);
+-        if let Some(media_element) = self.media_element.as_ref() {
+-            media_element.set_video_track(idx, value);
+-        }
+ 
+         let this = Trusted::new(self);
+         self.global()
