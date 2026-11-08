@@ -1,0 +1,123 @@
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -203,12 +203,19 @@
+             .max()
+     }
+     pub fn stage_seek(&self, target_us: i64) -> Result<SeekPlan, SessionError> {
++        self.stage_seek_selected(target_us, |_| true)
++    }
++    pub fn stage_seek_selected(
++        &self,
++        target_us: i64,
++        selected: impl Fn(u32) -> bool,
++    ) -> Result<SeekPlan, SessionError> {
+         if self.failed {
+             return Err(SessionError::Failed);
+         }
+         let units = self
+             .store
+-            .replay_from(target_us)
++            .replay_selected_from(target_us, selected)
+             .map_err(|_| SessionError::Append)?;
+         let mut bridge = DecoderBridge::new(self.limit);
+         let mut delivery = Delivery::new(self.limit);
+@@ -320,6 +327,9 @@
+     pub fn buffered(&self) -> Vec<std::ops::Range<i64>> {
+         self.store.buffered()
+     }
++    pub fn buffered_selected(&self, selected: impl Fn(u32) -> bool) -> Vec<std::ops::Range<i64>> {
++        self.store.buffered_selected(selected)
++    }
+     pub fn ranges(&self, track: u32) -> Vec<std::ops::Range<i64>> {
+         self.store.ranges(track)
+     }
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -386,7 +386,12 @@
+     /// Buffered is the intersection across multiplexed tracks, never their
+     /// union. A range without audio is not sufficient audio/video coverage.
+     pub fn buffered(&self) -> Vec<std::ops::Range<i64>> {
+-        let mut tracks = self.tracks.keys();
++        self.buffered_selected(|_| true)
++    }
++    /// Playback coverage may ignore a disabled track. SourceBuffer.buffered
++    /// continues using buffered(), which intersects every registered track.
++    pub fn buffered_selected(&self, selected: impl Fn(u32) -> bool) -> Vec<std::ops::Range<i64>> {
++        let mut tracks = self.tracks.keys().filter(|id| selected(**id));
+         let Some(first) = tracks.next() else {
+             return vec![];
+         };
+@@ -411,17 +416,33 @@
+     /// recreate decoders and discard/trim preroll until target before output.
+     /// This does not mutate the append cursor or authorize displaying preroll.
+     pub fn replay_from(&self, target: i64) -> Result<Vec<AccessUnit>, StoreError> {
++        self.replay_selected_from(target, |_| true)
++    }
++    /// Stage only enabled tracks, preserving each original configuration epoch
++    /// and the preceding RAP. No selected tracks produces an empty replay, not
++    /// automatic end-of-stream or a seek-completion signal.
++    pub fn replay_selected_from(
++        &self,
++        target: i64,
++        selected: impl Fn(u32) -> bool,
++    ) -> Result<Vec<AccessUnit>, StoreError> {
++        if target < 0 || self.tracks.is_empty() {
++            return Err(StoreError::Timestamp);
++        }
++        if !self.tracks.keys().any(|id| selected(*id)) {
++            return Ok(vec![]);
++        }
+         if target < 0
+             || self.tracks.is_empty()
+             || !self
+-                .buffered()
++                .buffered_selected(&selected)
+                 .iter()
+                 .any(|r| r.start <= target && target < r.end)
+         {
+             return Err(StoreError::Timestamp);
+         }
+         let mut output = vec![];
+-        for frames in self.tracks.values() {
++        for (_, frames) in self.tracks.iter().filter(|(id, _)| selected(**id)) {
+             let start = frames
+                 .iter()
+                 .enumerate()
+@@ -924,4 +945,35 @@
+         );
+         assert_eq!(s.ranges(2), [0..10]);
+     }
++    #[test]
++    fn selected_coverage_and_replay_ignore_disabled_track_gaps_without_mutating_public_ranges() {
++        let mut s = FrameStore::new(128);
++        s.register_track(1).unwrap();
++        s.register_track(2).unwrap();
++        let mut other = f(20, true);
++        other.track_id = 2;
++        s.append(vec![f(0, true), f(10, false), other], 0, 0..100)
++            .unwrap();
++        let bytes = s.bytes();
++        assert!(s.buffered().is_empty());
++        assert_eq!(s.buffered_selected(|id| id == 1), [0..20]);
++        assert!(s.replay_from(5).is_err());
++        let replay = s.replay_selected_from(5, |id| id == 1).unwrap();
++        assert_eq!(replay.len(), 2);
++        assert!(replay.iter().all(|f| f.track_id == 1));
++        assert_eq!(replay[0].pts_us, 0);
++        assert!(s.replay_selected_from(20, |id| id == 1).is_err());
++        assert_eq!(s.bytes(), bytes);
++        assert_eq!(s.ranges(2), [20..30]);
++        assert!(s.buffered().is_empty());
++    }
++    #[test]
++    fn empty_selection_has_no_coverage_and_stages_no_packets_but_rejects_negative_time() {
++        let mut s = FrameStore::new(128);
++        s.append(vec![f(0, true)], 0, 0..100).unwrap();
++        assert!(s.buffered_selected(|_| false).is_empty());
++        assert!(s.replay_selected_from(100, |_| false).unwrap().is_empty());
++        assert!(s.replay_selected_from(-1, |_| false).is_err());
++        assert_eq!(s.ranges(1), [0..10]);
++    }
+ }
