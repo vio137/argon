@@ -1,0 +1,844 @@
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2799,11 +2799,13 @@
+         // in principle infinite), update the duration attribute to the value positive Infinity.
+         // Note: The user agent will queue a media element task given the media element to fire an
+         // event named durationchange at the element at this point.
+-        self.duration.set(
+-            metadata
+-                .duration
+-                .map_or(f64::INFINITY, |duration| duration.as_secs_f64()),
+-        );
++        let duration = metadata.duration.map_or(f64::INFINITY, |duration| duration.as_secs_f64());
++        // A synchronous MSE duration setter may be newer than this queued metadata.
++        let duration = self.attached_append_source.get()
++            .map(|source| source.backend_duration())
++            .filter(|duration| !duration.is_nan())
++            .unwrap_or(duration);
++        self.duration.set(duration);
+         self.queue_media_element_task_to_fire_event(atom!("durationchange"));
+         if let Some(source) = self.attached_append_source.get() {
+             source.set_backend_duration(self.duration.get());
+@@ -2877,7 +2879,9 @@
+     }
+ 
+     fn playback_duration_changed(&self, duration: Option<Duration>) {
+-        let duration = duration.map_or(f64::INFINITY, |duration| duration.as_secs_f64());
++        self.set_append_duration(duration.map_or(f64::INFINITY, |duration| duration.as_secs_f64()));
++    }
++    pub(crate) fn set_append_duration(&self, duration: f64) {
+ 
+         if self.duration.get() == duration {
+             return;
+@@ -4510,6 +4514,13 @@
+ 
+         match event {
+             PlayerEvent::DurationChanged(duration) => element.playback_duration_changed(duration),
++            PlayerEvent::AppendDurationChanged { generation, duration } => {
++                if let Some(source) = element.attached_append_source.get() {
++                    if source.accept_duration_update(generation, duration) {
++                        element.set_append_duration(duration);
++                    }
++                }
++            },
+             PlayerEvent::EndOfStream => element.playback_end(cx),
+             PlayerEvent::EnoughData => element.playback_enough_data(),
+             PlayerEvent::Error(ref error) => element.playback_error(cx, error),
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -62,6 +62,7 @@
+     source_buffers: MutNullableDom<SourceBufferList>,
+     active_buffers: MutNullableDom<SourceBufferList>,
+     duration: Cell<f64>,
++    duration_generation: Cell<u64>,
+ }
+ fn source_error(error: SourceError) -> Error {
+     match error {
+@@ -114,6 +115,7 @@
+                 source_buffers: MutNullableDom::new(None),
+                 active_buffers: MutNullableDom::new(None),
+                 duration: Cell::new(f64::NAN),
++                duration_generation: Cell::new(0),
+             }),
+             global,
+             proto,
+@@ -146,6 +148,7 @@
+         self.controller.detach();
+         self.media.set(None);
+         self.duration.set(f64::NAN);
++        self.duration_generation.set(0);
+         if let Some(list) = self.source_buffers.get() {
+             for buffer in list.buffers() {
+                 buffer.detached();
+@@ -158,6 +161,16 @@
+     }
+     pub(crate) fn seekable_ranges(&self) -> Vec<std::ops::Range<f64>> {
+         self.controller.seekable_ranges(self.duration.get())
++    }
++    pub(crate) fn accept_duration_update(&self, generation: u64, duration: f64) -> bool {
++        if self.controller.state() == SourceState::Closed
++            || generation < self.duration_generation.get()
++        {
++            return false;
++        }
++        self.duration_generation.set(generation);
++        self.duration.set(duration);
++        true
+     }
+     pub(crate) fn backend_duration(&self) -> f64 {
+         self.duration.get()
+@@ -239,10 +252,17 @@
+     fn Duration(&self) -> f64 {
+         self.duration.get()
+     }
+-    fn SetDuration(&self, _: f64) -> Fallible<()> {
+-        Err(Error::NotSupported(Some(
+-            "Duration changes require coordinated coded-frame removal".to_owned(),
+-        )))
++    fn SetDuration(&self, duration: f64) -> Fallible<()> {
++        let (duration, generation) = self
++            .controller
++            .set_duration(duration)
++            .map_err(source_error)?;
++        self.duration_generation.set(generation);
++        self.duration.set(duration);
++        if let Some(media) = self.media.get() {
++            media.set_append_duration(duration);
++        }
++        Ok(())
+     }
+     fn CanConstructInDedicatedWorker(_: &Window) -> bool {
+         false
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -77,6 +77,28 @@
+             }),
+             callback,
+         }))
++    }
++    pub fn set_duration(&self, duration: f64) -> Result<(f64, u64), SourceError> {
++        if duration.is_nan() || duration < 0.0 {
++            return Err(SourceError::Type);
++        }
++        let s = self.0.state.lock().unwrap();
++        if s.state != SourceState::Open || s.buffers.values().any(|b| b.updating) {
++            return Err(SourceError::InvalidState);
++        }
++        let result = s
++            .player
++            .as_ref()
++            .ok_or(SourceError::InvalidState)?
++            .lock()
++            .unwrap()
++            .append_set_duration(duration)
++            .map_err(|e| match e {
++                PlayerError::EnoughData => SourceError::Quota,
++                PlayerError::SeekOutOfRange => SourceError::InvalidState,
++                _ => SourceError::Backend,
++            });
++        result
+     }
+     pub fn set_live_seekable_range(&self, start: f64, end: f64) -> Result<(), SourceError> {
+         let mut s = self.0.state.lock().unwrap();
+diff --git a/components/media/player/append.rs b/components/media/player/append.rs
+--- a/components/media/player/append.rs
++++ b/components/media/player/append.rs
+@@ -63,3 +63,74 @@
+         assert_eq!(readiness(0,&[0..100_000],false,Some(100_000)),AppendReadiness::Metadata);
+     }
+ }
++
++
++/// MSE duration-change validation, independent of media timestamp precision.
++/// Reducing below a retained frame's start is an InvalidState failure; a
++/// surviving frame that crosses the requested end extends the final duration.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum DurationChangeError {
++    Type,
++    InvalidState,
++}
++pub fn changed_duration(
++    requested: f64,
++    current: f64,
++    highest_pts: Option<i64>,
++    highest_end: i64,
++) -> Result<f64, DurationChangeError> {
++    if requested.is_nan() || requested < 0.0 {
++        return Err(DurationChangeError::Type);
++    }
++    if requested == current {
++        return Ok(current);
++    }
++    if highest_pts.is_some_and(|pts| requested < (pts as f64 / 1e6)) {
++        return Err(DurationChangeError::InvalidState);
++    }
++    Ok(requested.max(highest_end as f64 / 1e6))
++}
++#[cfg(test)]
++mod duration_change_tests {
++    use super::*;
++    #[test]
++    fn invalid_values_reject_and_positive_infinity_is_preserved() {
++        for v in [f64::NAN, -1.0, f64::NEG_INFINITY] {
++            assert_eq!(
++                changed_duration(v, f64::NAN, None, 0),
++                Err(DurationChangeError::Type)
++            );
++        }
++        assert_eq!(
++            changed_duration(f64::INFINITY, 3.0, Some(500_000), 1_000_000),
++            Ok(f64::INFINITY)
++        );
++    }
++    #[test]
++    fn retained_frame_start_rejects_truncation_but_crossing_frame_end_extends_duration() {
++        assert_eq!(
++            changed_duration(0.499999, 2.0, Some(500_000), 1_000_000),
++            Err(DurationChangeError::InvalidState)
++        );
++        assert_eq!(
++            changed_duration(0.5, 2.0, Some(500_000), 1_000_000),
++            Ok(1.0)
++        );
++        assert_eq!(
++            changed_duration(1.5, 2.0, Some(500_000), 1_000_000),
++            Ok(1.5)
++        );
++    }
++    #[test]
++    fn exact_noop_precedes_frame_validation_and_empty_source_keeps_fractional_precision() {
++        assert_eq!(
++            changed_duration(0.25, 0.25, Some(500_000), 1_000_000),
++            Ok(0.25)
++        );
++        assert_eq!(
++            changed_duration(0.000000001, f64::NAN, None, 0),
++            Ok(0.000000001)
++        );
++        assert_eq!(changed_duration(0.0, f64::INFINITY, None, 0), Ok(0.0));
++    }
++}
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -75,6 +75,7 @@
+     MetadataUpdated(metadata::Metadata),
+     // The `None` value means the duration is unknown, in which case this is likely a live stream.
+     DurationChanged(Option<Duration>),
++    AppendDurationChanged {generation:u64,duration:f64},
+     /// The internal player queue is running out of data. The client should start
+     /// pushing more data.
+     NeedData,
+@@ -138,6 +139,7 @@
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
+     }
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1283,3 +1283,33 @@
+         }
+     }
+ }
++
++#[test]
++fn native_duration_keeps_exact_public_seconds_and_rejects_retained_frame_truncation() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.set_duration(1, 0.000000001).unwrap();
++    assert_eq!(p.pump().unwrap().duration_seconds, 0.000000001);
++    assert_eq!(p.duration_us(), Some(1));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    assert_eq!(p.duration_seconds, 1.0);
++    assert!(p.set_duration(2, 0.499999).is_err());
++    assert_eq!(p.duration_generation, 1);
++    assert_eq!(p.duration_seconds, 1.0);
++    assert_eq!(p.buffered(), [0..1_000_000]);
++    p.set_duration(2, 0.5).unwrap();
++    assert_eq!(p.duration_seconds, 1.0);
++    p.set_duration(3, 1e100).unwrap();
++    assert_eq!(p.duration_seconds, 1e100);
++    assert_eq!(p.duration_us(), Some(i64::MAX));
++    p.set_duration(4, f64::INFINITY).unwrap();
++    assert_eq!(p.duration_us(), None);
++    p.end_input().unwrap();
++    assert_eq!(p.duration_seconds, 1.0);
++    assert_eq!(p.duration_generation, 4);
++}
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -429,6 +429,10 @@
+     pub playing: bool,
+     pub position_us: i64,
+     pub duration_us: Option<i64>,
++    pub duration_seconds: f64,
++    pub duration_generation: u64,
++    pub highest_pts: Option<i64>,
++    pub highest_end: i64,
+     pub rendered_frames: u64,
+     pub video_size: Option<(u16, u16)>,
+     pub has_audio: bool,
+@@ -445,6 +449,8 @@
+     sessions: BTreeMap<u32, AppendSession>,
+     input_ended: bool,
+     declared_duration_us: Option<i64>,
++    duration_seconds: f64,
++    duration_generation: u64,
+     decoders: Decoders,
+     renderer: Arc<Mutex<dyn VideoFrameRenderer>>,
+     audio: AudioOutput,
+@@ -477,6 +483,8 @@
+             sessions: BTreeMap::new(),
+             input_ended: false,
+             declared_duration_us: None,
++            duration_seconds: f64::INFINITY,
++            duration_generation: 0,
+             decoders: Decoders {
+                 track_ids: BTreeMap::new(),
+                 next_track: 1,
+@@ -552,6 +560,29 @@
+             .max()
+             .unwrap_or(0)
+     }
++    pub fn set_duration(&mut self, generation: u64, requested: f64) -> Result<(), ()> {
++        if self.failed || self.input_ended || generation <= self.duration_generation {
++            return Err(());
++        }
++        let highest = self
++            .sessions
++            .values()
++            .filter_map(AppendSession::highest_presentation_timestamp)
++            .max();
++        let duration = servo_media_player::append::changed_duration(
++            requested,
++            self.duration_seconds,
++            highest,
++            self.largest_track_end(),
++        )
++        .map_err(|_| ())?;
++        self.duration_seconds = duration;
++        self.duration_generation = generation;
++        self.declared_duration_us = duration
++            .is_finite()
++            .then(|| (duration * 1e6).ceil().min(i64::MAX as f64) as i64);
++        Ok(())
++    }
+     fn duration_us(&self) -> Option<i64> {
+         self.declared_duration_us
+     }
+@@ -644,6 +675,11 @@
+         }
+         let r = session.append(bytes).map_err(|_| ());
+         self.checked(r)?;
++        if self.duration_seconds.is_finite() {
++            self.duration_seconds = self
++                .duration_seconds
++                .max(self.largest_track_end() as f64 / 1e6);
++        }
+         if let Some(duration) = self.declared_duration_us {
+             self.declared_duration_us = Some(duration.max(self.largest_track_end()));
+         }
+@@ -906,6 +942,7 @@
+         self.checked(result)?;
+         self.input_ended = true;
+         self.declared_duration_us = Some(self.largest_track_end());
++        self.duration_seconds = self.largest_track_end() as f64 / 1e6;
+         Ok(())
+     }
+     pub fn set_playing(&mut self, playing: bool) -> Result<(), ()> {
+@@ -979,6 +1016,14 @@
+             playing: self.playing,
+             position_us: self.clock.now_us(),
+             duration_us: self.duration_us(),
++            duration_seconds: self.duration_seconds,
++            duration_generation: self.duration_generation,
++            highest_pts: self
++                .sessions
++                .values()
++                .filter_map(AppendSession::highest_presentation_timestamp)
++                .max(),
++            highest_end: self.largest_track_end(),
+             rendered_frames: self.rendered_frames,
+             video_size: self.decoders.video_size.or_else(|| {
+                 self.sessions
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -48,6 +48,10 @@
+         offset_us: i64,
+     },
+     ChangeType(u32),
++    Duration {
++        generation: u64,
++        seconds: f64,
++    },
+     ReopenInput,
+     EndInput,
+     Playing(bool),
+@@ -72,6 +76,7 @@
+     Sequence(u32),
+     TimestampOffset(u32),
+     TypeChanged(u32),
++    Duration,
+     InputReopened,
+     InputEnded,
+     Playing,
+@@ -120,6 +125,8 @@
+                     let mut previous_size = None;
+                     let mut previous_audio = false;
+                     let mut previous_duration = None;
++                    let mut previous_duration_seconds = f64::NAN;
++                    let mut previous_duration_generation = 0;
+                     let mut previous_playing = false;
+                     let mut last_status = Instant::now();
+                     let mut pending_seek = None;
+@@ -157,6 +164,7 @@
+                                         Applied::TimestampOffset(*buffer_id)
+                                     },
+                                     Command::ChangeType(id) => Applied::TypeChanged(*id),
++                                    Command::Duration { .. } => Applied::Duration,
+                                     Command::ReopenInput => Applied::InputReopened,
+                                     Command::EndInput => Applied::InputEnded,
+                                     Command::Playing(_) => Applied::Playing,
+@@ -220,6 +228,10 @@
+                                         offset_us,
+                                     } => playback.set_timestamp_offset(buffer_id, offset_us),
+                                     Command::ChangeType(id) => playback.change_type(id),
++                                    Command::Duration {
++                                        generation,
++                                        seconds,
++                                    } => playback.set_duration(generation, seconds),
+                                     Command::ReopenInput => {
+                                         playback.reopen_input()?;
+                                         output_finished = false;
+@@ -261,7 +273,10 @@
+                                 break;
+                             },
+                         };
+-                        if status.duration_us != previous_duration
++                        if applied_ack.is_some()
++                            || status.duration_seconds != previous_duration_seconds
++                            || status.duration_generation != previous_duration_generation
++                            || status.duration_us != previous_duration
+                             || status.all_buffers_ready != previous_all_ready
+                             || status.current_data != previous_current_data
+                             || status.timestamp_offsets != previous_offsets
+@@ -277,6 +292,8 @@
+                         {
+                             event(Event::Status(status.clone()));
+                             previous_duration = status.duration_us;
++                            previous_duration_seconds = status.duration_seconds;
++                            previous_duration_generation = status.duration_generation;
+                             previous_ranges = status.buffer_ranges.clone();
+                             previous_parsing = status.parsing_media_segments.clone();
+                             previous_offsets = status.timestamp_offsets.clone();
+@@ -376,7 +393,7 @@
+         )
+         .unwrap();
+         assert!(worker.try_command(Command::Playing(false)).is_ok());
+-        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
++        while !rx.recv_timeout(Duration::from_secs(2)).unwrap() {}
+         drop(worker);
+     }
+     #[test]
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -38,6 +38,10 @@
+     input_ended: bool,
+     output_ended: bool,
+     duration_us: Option<i64>,
++    duration_seconds: f64,
++    duration_generation: u64,
++    highest_pts: Option<i64>,
++    highest_end: i64,
+     readiness: Option<servo_media_player::append::AppendReadiness>,
+     pending_seek: Option<u64>,
+     buffers: BTreeMap<u32, BufferState>,
+@@ -49,6 +53,24 @@
+     buffer_tracks: BTreeMap<u32, Vec<servo_media_player::append::AppendTrack>>,
+ }
+ impl State {
++    fn apply_duration_status(
++        &mut self,
++        generation: u64,
++        seconds: f64,
++        micros: Option<i64>,
++        initialized: bool,
++    ) -> bool {
++        if generation < self.duration_generation
++            || (!initialized && !seconds.is_finite() && generation == 0)
++        {
++            return false;
++        }
++        let changed = self.duration_seconds != seconds;
++        self.duration_us = micros;
++        self.duration_seconds = seconds;
++        self.duration_generation = generation;
++        changed
++    }
+     fn parsing_media_segment(&self, id: u32) -> bool {
+         !self.pending_parser_resets.contains_key(&id)
+             && self
+@@ -117,6 +139,10 @@
+             input_ended: false,
+             output_ended: false,
+             duration_us: None,
++            duration_seconds: f64::NAN,
++            duration_generation: 0,
++            highest_pts: None,
++            highest_end: 0,
+             readiness: None,
+             pending_seek: None,
+             buffers: BTreeMap::new(),
+@@ -259,6 +285,11 @@
+                             );
+                             old
+                         };
++                        {
++                            let mut s = shared.lock().unwrap();
++                            s.highest_pts = status.highest_pts;
++                            s.highest_end = status.highest_end;
++                        }
+                         shared.lock().unwrap().timestamp_offsets =
+                             status.timestamp_offsets.iter().copied().collect();
+                         shared.lock().unwrap().parsing_media_segments =
+@@ -342,16 +373,17 @@
+                                 send(PlayerEvent::AppendReadiness(readiness));
+                             }
+                         }
+-                        let duration_changed = {
+-                            let mut s = shared.lock().unwrap();
+-                            let changed = s.duration_us != status.duration_us;
+-                            s.duration_us = status.duration_us;
+-                            changed
+-                        };
++                        let duration_changed = shared.lock().unwrap().apply_duration_status(
++                            status.duration_generation,
++                            status.duration_seconds,
++                            status.duration_us,
++                            status.all_buffers_ready,
++                        );
+                         if duration_changed {
+-                            send(PlayerEvent::DurationChanged(status.duration_us.map(|us| {
+-                                std::time::Duration::from_micros(us.max(0) as u64)
+-                            })));
++                            send(PlayerEvent::AppendDurationChanged {
++                                generation: status.duration_generation,
++                                duration: status.duration_seconds,
++                            });
+                         }
+                         if status.rendered_frames != old_frames {
+                             send(PlayerEvent::VideoFrameUpdated);
+@@ -511,6 +543,30 @@
+     fn seek(&self, _: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
+     }
++    fn append_set_duration(&self, requested: f64) -> Result<(f64, u64), PlayerError> {
++        let mut s = self.state.lock().unwrap();
++        if s.stopped || s.input_ended || s.buffers.values().any(|b| b.updating) {
++            return Err(error());
++        }
++        let duration = servo_media_player::append::changed_duration(
++            requested,
++            s.duration_seconds,
++            s.highest_pts,
++            s.highest_end,
++        )
++        .map_err(|_| PlayerError::SeekOutOfRange)?;
++        let generation = s.duration_generation.checked_add(1).ok_or_else(error)?;
++        self.command(Command::Duration {
++            generation,
++            seconds: duration,
++        })?;
++        s.duration_seconds = duration;
++        s.duration_generation = generation;
++        s.duration_us = duration
++            .is_finite()
++            .then(|| (duration * 1e6).ceil().min(i64::MAX as f64) as i64);
++        Ok((duration, generation))
++    }
+     fn append_seek(&self, operation: u64, time: f64) -> Result<(), PlayerError> {
+         if !time.is_finite() || time < 0.0 || time * 1e6 >= i64::MAX as f64 {
+             return Err(PlayerError::SeekOutOfRange);
+@@ -1231,8 +1287,8 @@
+         let mut durations = 0;
+         loop {
+             match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+-                PlayerEvent::DurationChanged(Some(duration)) => {
+-                    assert_eq!(duration, Duration::ZERO);
++                PlayerEvent::AppendDurationChanged { duration, .. } => {
++                    assert_eq!(duration, 0.0);
+                     durations += 1;
+                 },
+                 PlayerEvent::EndOfStream => break,
+@@ -1465,4 +1521,98 @@
+         assert!(!s.output_ended);
+         assert_eq!(s.pending_seek, Some(88));
+     }
++    #[test]
++    fn duration_queue_rejection_preserves_exact_value_and_generation() {
++        let p = AndroidAppendPlayer::new(
++            92,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        assert_eq!(p.append_set_duration(1e100), Err(PlayerError::EnoughData));
++        {
++            let s = p.state.lock().unwrap();
++            assert!(s.duration_seconds.is_nan());
++            assert_eq!(s.duration_generation, 0);
++            assert_eq!(s.duration_us, None);
++        }
++        rx.recv().unwrap();
++        assert_eq!(p.append_set_duration(1e100), Ok((1e100, 1)));
++        let s = p.state.lock().unwrap();
++        assert_eq!(s.duration_seconds, 1e100);
++        assert_eq!(s.duration_generation, 1);
++        assert_eq!(s.duration_us, Some(i64::MAX));
++    }
++    #[test]
++    fn old_duration_status_cannot_overwrite_a_new_setter_and_uninitialized_infinity_stays_unknown()
++    {
++        let p = AndroidAppendPlayer::new(
++            93,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        let mut s = p.state.lock().unwrap();
++        assert!(!s.apply_duration_status(0, f64::INFINITY, None, false));
++        assert!(s.duration_seconds.is_nan());
++        s.duration_generation = 2;
++        s.duration_seconds = 1e100;
++        s.duration_us = Some(i64::MAX);
++        assert!(!s.apply_duration_status(1, 1.0, Some(1_000_000), true));
++        assert_eq!(s.duration_seconds, 1e100);
++        assert_eq!(s.duration_generation, 2);
++        assert!(!s.apply_duration_status(2, 1e100, Some(i64::MAX), true));
++        assert!(s.apply_duration_status(2, 1.0, Some(1_000_000), true));
++        assert_eq!(s.duration_seconds, 1.0);
++    }
++    #[test]
++    fn duration_can_be_queued_after_buffer_creation_before_ready_but_not_while_updating() {
++        let p = AndroidAppendPlayer::new(
++            94,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        rx.recv().unwrap();
++        {
++            let mut s = p.state.lock().unwrap();
++            s.buffers.insert(
++                1,
++                BufferState {
++                    ready: false,
++                    updating: false,
++                    removing: false,
++                    operation: 0,
++                    callback: Arc::new(|_| {}),
++                },
++            );
++        }
++        assert_eq!(p.append_set_duration(10.0), Ok((10.0, 1)));
++        {
++            p.state
++                .lock()
++                .unwrap()
++                .buffers
++                .get_mut(&1)
++                .unwrap()
++                .updating = true;
++        }
++        assert_eq!(
++            p.append_set_duration(5.0),
++            Err(PlayerError::BufferPushFailed)
++        );
++        assert_eq!(p.state.lock().unwrap().duration_generation, 1);
++    }
+ }
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -311,6 +311,9 @@
+     pub fn evict_before(&mut self, cutoff_us: i64) -> usize {
+         self.store.evict_before(cutoff_us)
+     }
++    pub fn highest_presentation_timestamp(&self) -> Option<i64> {
++        self.store.highest_presentation_timestamp()
++    }
+     pub fn descriptions(&self) -> &[super::TrackDescription] {
+         self.stream.descriptions()
+     }
+@@ -334,3 +337,22 @@
+         !self.failed && self.ended && self.delivery.is_empty()
+     }
+ }
++
++#[cfg(test)]
++mod duration_bound_tests {
++    use super::*;
++    #[test]
++    fn bounds_follow_actual_retained_frames_after_removal_not_track_buffer_end() {
++        let mut s = AppendSession::new(1 << 20, 64);
++        assert_eq!(s.highest_presentation_timestamp(), None);
++        s.append(include_bytes!(
++            "../hosttest/tests/fixtures/synthetic-fmp4.mp4"
++        ))
++        .unwrap();
++        assert_eq!(s.highest_presentation_timestamp(), Some(500_000));
++        let plan = s.stage_remove(500_000, 1_000_000, None).unwrap();
++        s.commit_remove(plan);
++        assert_eq!(s.highest_presentation_timestamp(), Some(0));
++        assert_eq!(s.ranges(1), [0..500_000]);
++    }
++}
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -93,6 +93,12 @@
+     pub fn bytes(&self) -> usize {
+         self.bytes
+     }
++    pub fn highest_presentation_timestamp(&self) -> Option<i64> {
++        self.tracks
++            .values()
++            .flat_map(|frames| frames.iter().map(|frame| frame.pts_us))
++            .max()
++    }
+     pub fn frames(&self, track: u32) -> &[StoredFrame] {
+         self.tracks.get(&track).map(Vec::as_slice).unwrap_or(&[])
+     }
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -503,3 +503,83 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod manual_duration_tests {
++    use crate::{
++        PlayerEvent, append::AppendEvent, append_source::*, generic_channel::GenericCallback,
++        mse_player::AndroidAppendPlayer,
++    };
++    use std::{
++        sync::{Arc, mpsc},
++        time::Duration,
++    };
++    #[test]
++    fn duration_validates_retained_frame_start_extends_to_frame_end_and_eos_overrides() {
++        let (tx, events) = mpsc::channel();
++        let player = AndroidAppendPlayer::new(
++            91,
++            GenericCallback::new(move |e| {
++                if let Ok(e) = e {
++                    let _ = tx.send(e);
++                }
++            })
++            .unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let (tx, rx) = mpsc::channel();
++        let source = AppendSource::new(Arc::new(move |e| {
++            let _ = tx.send(e);
++        }));
++        assert_eq!(source.set_duration(f64::NAN), Err(SourceError::Type));
++        assert_eq!(source.set_duration(5.0), Err(SourceError::InvalidState));
++        source.attach(player).unwrap();
++        assert_eq!(source.set_duration(0.000000001), Ok((0.000000001, 1)));
++        let buffer = source.add_buffer("video/mp4").unwrap();
++        loop {
++            if matches!(
++                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
++                SourceEvent::BufferEvent(_, AppendEvent::Ready, _)
++            ) {
++                break;
++            }
++        }
++        buffer
++            .append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec())
++            .unwrap();
++        loop {
++            if matches!(
++                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
++                SourceEvent::BufferEvent(_, AppendEvent::UpdateEnd, 1)
++            ) {
++                break;
++            }
++        }
++        assert_eq!(
++            source.set_duration(0.499999),
++            Err(SourceError::InvalidState)
++        );
++        assert_eq!(buffer.buffered(), [0.0..1.0]);
++        assert_eq!(source.set_duration(0.5), Ok((1.0, 2)));
++        assert_eq!(source.set_duration(50.000000001), Ok((50.000000001, 3)));
++        source.end_input().unwrap();
++        assert_eq!(source.set_duration(3.0), Err(SourceError::InvalidState));
++        loop {
++            match events.recv_timeout(Duration::from_secs(2)).unwrap() {
++                PlayerEvent::AppendDurationChanged {
++                    generation: 3,
++                    duration,
++                } if duration == 1.0 => break,
++                PlayerEvent::Error(e) => panic!("{e}"),
++                _ => (),
++            }
++        }
++        source.reopen().unwrap();
++        assert_eq!(source.set_duration(f64::INFINITY), Ok((f64::INFINITY, 4)));
++        source.detach();
++        assert_eq!(source.set_duration(-1.0), Err(SourceError::Type));
++        assert_eq!(source.set_duration(1.0), Err(SourceError::InvalidState));
++    }
++}
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -38,6 +38,7 @@
+     MetadataUpdated(metadata::Metadata),
+     // The `None` value means the duration is unknown, in which case this is likely a live stream.
+     DurationChanged(Option<Duration>),
++    AppendDurationChanged {generation:u64,duration:f64},
+     /// The internal player queue is running out of data. The client should start
+     /// pushing more data.
+     NeedData,
+@@ -100,6 +101,7 @@
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
+     }
