@@ -1,0 +1,137 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -431,6 +431,7 @@
+     pub duration_us: Option<i64>,
+     pub duration_seconds: f64,
+     pub duration_generation: u64,
++    pub buffer_duration_bounds: Vec<(u32, Option<i64>, i64)>,
+     pub highest_pts: Option<i64>,
+     pub highest_end: i64,
+     pub removal_generation: u64,
+@@ -1081,6 +1082,23 @@
+             duration_us: self.duration_us(),
+             duration_seconds: self.duration_seconds,
+             duration_generation: self.duration_generation,
++            buffer_duration_bounds: self
++                .sessions
++                .iter()
++                .map(|(id, session)| {
++                    (
++                        *id,
++                        session.highest_presentation_timestamp(),
++                        session
++                            .descriptions()
++                            .iter()
++                            .flat_map(|track| session.ranges(track.id))
++                            .map(|range| range.end)
++                            .max()
++                            .unwrap_or(0),
++                    )
++                })
++                .collect(),
+             highest_pts: self
+                 .sessions
+                 .values()
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -40,6 +40,7 @@
+     duration_us: Option<i64>,
+     duration_seconds: f64,
+     duration_generation: u64,
++    buffer_duration_bounds: BTreeMap<u32, (Option<i64>, i64)>,
+     highest_pts: Option<i64>,
+     highest_end: i64,
+     removal_generation: u64,
+@@ -142,6 +143,7 @@
+             duration_us: None,
+             duration_seconds: f64::NAN,
+             duration_generation: 0,
++            buffer_duration_bounds: BTreeMap::new(),
+             highest_pts: None,
+             highest_end: 0,
+             removal_generation: 0,
+@@ -287,6 +289,11 @@
+                             if status.removal_generation < s.removal_generation {
+                                 return;
+                             }
++                            s.buffer_duration_bounds = status
++                                .buffer_duration_bounds
++                                .iter()
++                                .map(|(id, pts, end)| (*id, (*pts, *end)))
++                                .collect();
+                             s.highest_pts = status.highest_pts;
+                             s.highest_end = status.highest_end;
+                             s.timestamp_offsets =
+@@ -573,6 +580,18 @@
+         self.command(Command::RemoveBuffer(id))?;
+         s.removal_generation = generation;
+         s.buffers.remove(&id);
++        s.buffer_duration_bounds.remove(&id);
++        s.highest_pts = s
++            .buffer_duration_bounds
++            .values()
++            .filter_map(|(pts, _)| *pts)
++            .max();
++        s.highest_end = s
++            .buffer_duration_bounds
++            .values()
++            .map(|(_, end)| *end)
++            .max()
++            .unwrap_or(0);
+         s.buffer_ranges.remove(&id);
+         s.buffer_tracks.remove(&id);
+         s.timestamp_offsets.remove(&id);
+@@ -1709,4 +1728,51 @@
+         assert!(!s.buffer_ranges.contains_key(&1));
+         assert_eq!(s.pending_seek, Some(99));
+     }
++    #[test]
++    fn accepted_buffer_removal_recalculates_duration_bounds_before_worker_status() {
++        let p = AndroidAppendPlayer::new(
++            99,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        rx.recv().unwrap();
++        {
++            let mut s = p.state.lock().unwrap();
++            for id in [1, 2] {
++                s.buffers.insert(
++                    id,
++                    BufferState {
++                        ready: true,
++                        updating: false,
++                        removing: false,
++                        operation: 0,
++                        callback: Arc::new(|_| {}),
++                    },
++                );
++            }
++            s.buffer_duration_bounds
++                .insert(1, (Some(9_000_000), 10_000_000));
++            s.buffer_duration_bounds
++                .insert(2, (Some(500_000), 1_000_000));
++            s.highest_pts = Some(9_000_000);
++            s.highest_end = 10_000_000;
++            s.duration_seconds = 10.0;
++        }
++        assert_eq!(p.append_set_duration(1.0), Err(PlayerError::SeekOutOfRange));
++        p.append_remove_buffer(1).unwrap();
++        {
++            let s = p.state.lock().unwrap();
++            assert_eq!(s.highest_pts, Some(500_000));
++            assert_eq!(s.highest_end, 1_000_000);
++            assert_eq!(s.removal_generation, 1);
++        }
++        rx.recv().unwrap();
++        assert_eq!(p.append_set_duration(0.5), Ok((1.0, 1)));
++    }
+ }
