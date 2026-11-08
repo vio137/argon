@@ -91,7 +91,7 @@ jobs:
           export ANDROID_NDK="$ANDROID_NDK_ROOT"
           export ANDROID_SDK_HOME="$ANDROID_SDK_ROOT"
           test -f "$ANDROID_NDK_ROOT/source.properties"
-          ./mach build --android --release
+          ./mach build --android --release --no-package
           df -h /
           find target -name '*.so' -path '*android*' | head -20
 
