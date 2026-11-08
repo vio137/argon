@@ -1,0 +1,46 @@
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -798,3 +798,42 @@
+     assert!(p.lock().unwrap().append_to_buffer(2,vec![]).is_err());
+     p.lock().unwrap().stop().unwrap();
+ }
++
++#[test]
++fn overlapping_configuration_append_crosses_worker_player_and_sourcebuffer_lifecycle() {
++ use crate::{Player,PlayerEvent,append::AppendEvent,generic_channel::GenericCallback,
++  mse_player::AndroidAppendPlayer,mse_demux::BoxFramer,append_source::{AppendSource,SourceEvent}};
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoovBox,SampleEntry}};
++ use std::{sync::{Arc,mpsc},time::{Duration,Instant}};
++ let(tx,events)=mpsc::channel();
++ let player=AndroidAppendPlayer::new(124,GenericCallback::new(move|e|{if let Ok(e)=e {let _=tx.send(e);}}).unwrap(),None,Box::new(||{})).unwrap();
++ let(tx,updates)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));
++ source.attach(player.clone()).unwrap();let buffer=source.add_buffer("video/mp4").unwrap();
++ let bytes=include_bytes!("../tests/fixtures/synthetic-fmp4.mp4");
++ let mut framer=BoxFramer::new(1<<20);framer.append(bytes).unwrap();let mut replacement=vec![];
++ while let Some(b)=framer.pop_box().unwrap(){if &b[4..8]==b"moov" {
++  let(mut m,_)=MoovBox::decode(&b).unwrap();
++  if let SampleEntry::Avc1(e)=&mut m.trak_boxes[0].mdia_box.minf_box.stbl_box.stsd_box.entries[0] {e.visual.width=64;}
++  replacement.extend(m.encode_to_vec().unwrap());
++ }else{replacement.extend(b);}}
++ for (index,bytes) in [bytes.to_vec(),replacement].into_iter().enumerate() {
++  buffer.append(bytes).unwrap();let mut lifecycle=vec![];
++  loop {match updates.recv_timeout(Duration::from_secs(2)).unwrap() {
++   SourceEvent::BufferEvent(id,e,_) if id==buffer.id()=> {
++    if e!=AppendEvent::Ready {lifecycle.push(e.clone());}
++    if e==AppendEvent::UpdateEnd {break;}
++   },_=>()
++  }}
++  assert_eq!(lifecycle,[AppendEvent::UpdateStart,AppendEvent::Update,AppendEvent::UpdateEnd]);
++  assert!(!buffer.updating());assert_eq!(buffer.buffered(),[0.0..1.0]);
++  let deadline=Instant::now()+Duration::from_secs(2);
++  loop {match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
++   PlayerEvent::AppendEpoch{event,..}=>match *event {
++    PlayerEvent::MetadataUpdated(m)=> {if index==0||m.width==64 {assert_eq!(m.width,if index==0 {32}else{64});break;}},
++    PlayerEvent::Error(e)=>panic!("{e}"),_=>()
++   },PlayerEvent::Error(e)=>panic!("{e}"),_=>()
++  }}
++ }
++ assert_eq!(source.buffers().len(),1);source.detach();
++ assert!(buffer.buffered().is_empty());assert!(player.lock().unwrap().append_to_buffer(1,vec![]).is_err());
++}
