@@ -1,0 +1,139 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -920,3 +920,44 @@
+   let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);assert_eq!(d.media(&media).unwrap().len(),1);
+  }
+ }
++
++#[test]
++fn single_rate_one_edit_maps_media_ticks_before_microsecond_quantization() {
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoovBox,EdtsBox,ElstBox,ElstEntry},FixedPointNumber};
++ use servo_media_android_hosttest::mse_demux::{Error,session::AppendSession};
++ for fixture in [include_bytes!("fixtures/synthetic-fmp4.mp4").as_slice(),include_bytes!("fixtures/synthetic-aac.mp4").as_slice()] {
++  let mut framer=BoxFramer::new(1<<20);framer.append(fixture).unwrap();let mut bs=vec![];
++  while let Some(b)=framer.pop_box().unwrap(){bs.push(b);}
++  let ftyp=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap();let bytes=bs.iter().find(|b|&b[4..8]==b"moov").unwrap();
++  let(mut moov,_)=MoovBox::decode(bytes).unwrap();let scale=moov.trak_boxes[0].mdia_box.mdhd_box.timescale.get();
++  let shift=if fixture.len()==include_bytes!("fixtures/synthetic-fmp4.mp4").len() {i64::from(scale)/2}else{1024};
++  moov.trak_boxes[0].edts_box=Some(EdtsBox{elst_box:Some(ElstBox{entries:vec![ElstEntry{edit_duration:0,media_time:shift,media_rate:FixedPointNumber{integer:1,fraction:0}}]}),unknown_boxes:vec![]});
++  let mut edited=ftyp.clone();edited.extend(moov.encode_to_vec().unwrap());
++  let mut d=Demux::new(1<<20,64);d.init(&edited).unwrap();
++  let mut output=vec![];for pair in bs.windows(2) {if &pair[0][4..8]==b"moof"&&&pair[1][4..8]==b"mdat" {let mut b=pair[0].clone();b.extend_from_slice(&pair[1]);edited.extend_from_slice(&b);output.extend(d.media(&b).unwrap());}}
++  assert!(output[0].pts_us<0);assert_eq!(output[1].pts_us,0);
++  for pair in output.windows(2){assert_eq!(pair[0].pts_us+pair[0].duration_us,pair[1].pts_us);}
++  let mut session=AppendSession::new(1<<20,64);session.append(&edited).unwrap();
++  assert_eq!(session.buffered()[0].start,0);
++  // Unsupported edits fail without replacing the last valid mapping.
++  for mode in 0..3 {
++   let mut bad=moov.clone();let entries=&mut bad.trak_boxes[0].edts_box.as_mut().unwrap().elst_box.as_mut().unwrap().entries;
++   if mode==0 {entries[0].media_time=-1;}else if mode==1 {entries[0].media_rate.integer=2;}else{entries.push(entries[0].clone());}
++   let mut init=ftyp.clone();init.extend(bad.encode_to_vec().unwrap());assert_eq!(d.init(&init),Err(Error::UnsupportedLayout));
++  }
++  let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();
++  let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);
++  assert_eq!(d.media(&media).unwrap()[0].pts_us,output[0].pts_us,"invalid edits cannot replace the active offset");
++  // A nonzero movie duration does not change the composition-time offset.
++  let edit=&mut moov.trak_boxes[0].edts_box.as_mut().unwrap().elst_box.as_mut().unwrap().entries[0];
++  edit.edit_duration=u64::from(u32::MAX)+1;
++  let mut long=ftyp.clone();long.extend(moov.encode_to_vec().unwrap());d.init(&long).unwrap();
++  assert_eq!(d.media(&media).unwrap()[0].pts_us,output[0].pts_us);
++  let count=long.windows(4).position(|b|b==b"elst").unwrap()+8;
++  long[count..count+4].copy_from_slice(&u32::MAX.to_be_bytes());
++  assert_eq!(d.init(&long),Err(Error::UnsupportedLayout),"hostile edit count rejected before allocation");
++  moov.trak_boxes[0].edts_box=None;
++  let mut reset=ftyp.clone();reset.extend(moov.encode_to_vec().unwrap());d.init(&reset).unwrap();
++  assert_eq!(d.media(&media).unwrap()[0].pts_us,0,"a later clear init removes its former edit offset");
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -166,7 +166,20 @@
+     if depth > 8 {
+         return Err(Error::Quota);
+     }
+-    for (kind, _, payload) in top_boxes(data)? {
++    let children=top_boxes(data)?;
++    if children.iter().filter(|x|x.0==*b"edts").count()>1 {return Err(Error::UnsupportedLayout);}
++    for (kind, _, payload) in children {
++        if kind==*b"edts" {
++            let edits=top_boxes(&data[payload.clone()])?;
++            if edits.len()!=1 || edits[0].0!=*b"elst" {return Err(Error::UnsupportedLayout);}
++            let raw=&data[payload.start+edits[0].2.start..payload.start+edits[0].2.end];
++            if raw.len()<8 {return Err(Error::Truncated);}
++            let expected=match raw[0] {0=>20,1=>28,_=>return Err(Error::UnsupportedLayout)};
++            // Bound the library's edit-entry allocation before decode.
++            if raw[1..4]!=[0,0,0] || raw[4..8]!=1u32.to_be_bytes() || raw.len()!=expected {
++                return Err(Error::UnsupportedLayout);
++            }
++        }
+         if unsupported_auxiliary(kind,&data[payload.clone()]) {return Err(Error::UnsupportedLayout);}
+         *budget = budget.checked_sub(1).ok_or(Error::Quota)?;
+         if kind == *b"trak" {
+@@ -184,9 +197,9 @@
+                 return Err(Error::InvalidBox);
+             }
+         }
+-        // Edits/encryption need explicit timestamp/decryption handling, not
+-        // silent ignore. DRM and nontrivial edit support are not implemented.
+-        if [*b"edts", *b"pssh", *b"senc"].contains(&kind) {
++        // Encryption requires explicit decryption handling, never silent ignore.
++        // Nontrivial edit support is rejected separately before library decode.
++        if [*b"pssh", *b"senc"].contains(&kind) {
+             return Err(Error::UnsupportedLayout);
+         }
+         if [*b"trak", *b"mdia", *b"minf", *b"stbl", *b"mvex"].contains(&kind) {
+@@ -285,6 +298,7 @@
+     max_samples: usize,
+     default_sizes: std::collections::BTreeMap<u32, u32>,
+     descriptions: Vec<TrackDescription>,
++    edit_media_times: std::collections::BTreeMap<u32,i64>,
+ }
+ impl Demux {
+     pub fn new(max_bytes: usize, max_samples: usize) -> Self {
+@@ -294,6 +308,7 @@
+             max_samples,
+             default_sizes: Default::default(),
+             descriptions: vec![],
++            edit_media_times: Default::default(),
+         }
+     }
+     pub fn init(&mut self, data: &[u8]) -> Result<(), Error> {
+@@ -314,7 +329,16 @@
+             return Err(Error::UnsupportedLayout);
+         }
+         let mut descriptions = vec![];
++        let mut edit_media_times=std::collections::BTreeMap::new();
+         for track in &moov.trak_boxes {
++            if let Some(edits)=&track.edts_box {
++                let entries=&edits.elst_box.as_ref().ok_or(Error::UnsupportedLayout)?.entries;
++                let edit=entries.first().ok_or(Error::UnsupportedLayout)?;
++                if entries.len()!=1 || edit.media_time<0 || edit.media_rate.integer!=1 || edit.media_rate.fraction!=0 {
++                    return Err(Error::UnsupportedLayout);
++                }
++                edit_media_times.insert(track.tkhd_box.track_id,edit.media_time);
++            }
+             let minf=&track.mdia_box.minf_box;
+             // All samples must refer to the single self-contained data source.
+             // The adapter neither resolves nor fetches external references.
+@@ -403,6 +427,7 @@
+         self.inner = next;
+         self.default_sizes = defaults;
+         self.descriptions = descriptions;
++        self.edit_media_times=edit_media_times;
+         Ok(())
+     }
+     pub fn descriptions(&self) -> &[TrackDescription] {
+@@ -554,7 +579,10 @@
+                 return Err(Error::InvalidSample);
+             }
+             let scale = s.track.timescale.get();
+-            let dts = i128::from(s.timestamp);
++            // Apply the rate-one media-to-movie offset in original track
++            // ticks before endpoint quantization, including negative preroll.
++            let edit=i128::from(*self.edit_media_times.get(&s.track.track_id).unwrap_or(&0));
++            let dts = i128::from(s.timestamp)-edit;
+             let pts = dts + i128::from(s.composition_time_offset.unwrap_or(0));
+             let rotation_degrees = self.descriptions.iter()
+                 .find(|track| track.id == s.track.track_id)
