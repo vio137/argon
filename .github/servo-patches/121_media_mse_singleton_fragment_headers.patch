@@ -1,0 +1,66 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -818,3 +818,32 @@
+  let mut protected_init=init.clone();protected_init.extend_from_slice(&pssh);
+  assert_eq!(Demux::new(1<<20,64).init(&protected_init),Err(Error::UnsupportedLayout));
+ }
++
++#[test]
++fn duplicate_fragment_singleton_headers_are_not_silently_ignored() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoofBox};
++ use servo_media_android_hosttest::mse_demux::Error;
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();
++ for kind in [*b"mfhd",*b"tfhd",*b"tfdt"] {
++  let(mut moof,_)=MoofBox::decode(&pair[0]).unwrap();
++  let old=moof.encode_to_vec().unwrap();
++  let h=old.windows(4).position(|w|w==kind).unwrap()-4;
++  let size=u32::from_be_bytes(old[h..h+4].try_into().unwrap())as usize;
++  let extra=old[h..h+size].to_vec();
++  for run in &mut moof.traf_boxes[0].trun_boxes {run.data_offset=run.data_offset.map(|o|o+extra.len()as i32);}
++  let mut encoded=moof.encode_to_vec().unwrap();
++  let t=encoded.windows(4).position(|w|w==b"traf").unwrap()-4;
++  let n=u32::from_be_bytes(encoded[t..t+4].try_into().unwrap())as usize;
++  if kind==*b"mfhd" {encoded.extend_from_slice(&extra);}else {
++   encoded.splice(t+n..t+n,extra.clone());
++   encoded[t..t+4].copy_from_slice(&((n+extra.len())as u32).to_be_bytes());
++  }
++  let n=encoded.len()as u32;encoded[..4].copy_from_slice(&n.to_be_bytes());encoded.extend_from_slice(&pair[1]);
++  let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();
++  assert_eq!(d.media_complete(&encoded),Err(Error::InvalidBox));
++  assert!(matches!(d.media(&encoded),Err(Error::InvalidBox)));
++  let mut clear=pair[0].clone();clear.extend_from_slice(&pair[1]);
++  assert_eq!(d.media(&clear).unwrap().len(),1);
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -200,12 +200,16 @@
+ fn preflight_moof(data: &[u8], sample_limit: usize) -> Result<(), Error> {
+     validate_auxiliary_boxes(data)?;
+     let top = top_boxes(data)?;
++    if top.iter().filter(|x|x.0==*b"moof").count()!=1 {return Err(Error::InvalidBox);}
+     let moof = top
+         .iter()
+         .find(|x| x.0 == *b"moof")
+         .ok_or(Error::InvalidBox)?;
+     validate_auxiliary_boxes(&data[moof.2.clone()])?;
+     let children = top_boxes(&data[moof.2.clone()])?;
++    // The dependency retains duplicate singleton headers as unknown boxes.
++    // Reject ambiguity before either coverage probing or demux state changes.
++    if children.iter().filter(|x|x.0==*b"mfhd").count()!=1 {return Err(Error::InvalidBox);}
+     let trafs: Vec<_> = children.iter().filter(|x| x.0 == *b"traf").collect();
+     if trafs.is_empty() || trafs.len() > 16 {
+         return Err(Error::InvalidBox);
+@@ -215,7 +219,8 @@
+         let body = &data[moof.2.start + traf.2.start..moof.2.start + traf.2.end];
+         validate_auxiliary_boxes(body)?;
+         let fields = top_boxes(body)?;
+-        if fields.iter().filter(|x| x.0 == *b"tfdt").count() != 1 {
++        if fields.iter().filter(|x| x.0 == *b"tfdt").count() != 1
++            || fields.iter().filter(|x| x.0 == *b"tfhd").count() != 1 {
+             return Err(Error::InvalidBox);
+         }
+         let tfhd = fields
