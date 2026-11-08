@@ -1,0 +1,49 @@
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2706,9 +2706,19 @@
+                 &Some(VideoTrackOrAudioTrackOrTextTrack::AudioTrack(audio_track)),
+             );
+ 
+-            event
+-                .upcast::<Event>()
+-                .fire(cx, audio_track_list.upcast::<EventTarget>());
++            if append {
++                // MSE initialization queues track events. Finish linking both
++                // lists and active buffers before script can observe them.
++                let event = Trusted::new(&*event);
++                let list = Trusted::new(&*audio_track_list);
++                self.global().task_manager().media_element_task_source().queue(
++                    task!(append_element_audio_track_added: move |cx| {
++                        event.root().upcast::<Event>().fire(cx, list.root().upcast::<EventTarget>());
++                    }),
++                );
++            } else {
++                event.upcast::<Event>().fire(cx, audio_track_list.upcast::<EventTarget>());
++            }
+         }
+ 
+         // => "If the media resource is found to have a video track"
+@@ -2777,9 +2787,19 @@
+                 &Some(VideoTrackOrAudioTrackOrTextTrack::VideoTrack(video_track)),
+             );
+ 
+-            event
+-                .upcast::<Event>()
+-                .fire(cx, video_track_list.upcast::<EventTarget>());
++            if append {
++                // MSE initialization queues track events. Finish linking both
++                // lists and active buffers before script can observe them.
++                let event = Trusted::new(&*event);
++                let list = Trusted::new(&*video_track_list);
++                self.global().task_manager().media_element_task_source().queue(
++                    task!(append_element_video_track_added: move |cx| {
++                        event.root().upcast::<Event>().fire(cx, list.root().upcast::<EventTarget>());
++                    }),
++                );
++            } else {
++                event.upcast::<Event>().fire(cx, video_track_list.upcast::<EventTarget>());
++            }
+         }
+ 
+         if let Some(source) = self.attached_append_source.get() {
