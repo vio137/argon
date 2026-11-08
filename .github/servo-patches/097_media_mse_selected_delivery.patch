@@ -1,0 +1,141 @@
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -324,10 +324,19 @@
+         self.store.ranges(track)
+     }
+     pub fn pump_input(&mut self, sink: &mut impl CodecInput) -> Result<bool, SessionError> {
++        self.pump_input_selected(sink, |_| true)
++    }
++    /// Selection is private until the native owner also gates clock, focus,
++    /// buffered/readiness and output epochs. This does not change DOM controls.
++    pub fn pump_input_selected(
++        &mut self,
++        sink: &mut impl CodecInput,
++        selected: impl Fn(u32) -> bool,
++    ) -> Result<bool, SessionError> {
+         if self.failed {
+             return Err(SessionError::Failed);
+         }
+-        self.delivery.pump(sink).map_err(|_| {
++        self.delivery.pump_selected(sink, selected).map_err(|_| {
+             self.failed = true;
+             SessionError::Delivery
+         })
+@@ -355,4 +364,33 @@
+         assert_eq!(s.highest_presentation_timestamp(), Some(0));
+         assert_eq!(s.ranges(1), [0..500_000]);
+     }
+-}
++    #[test]
++    fn disabled_delivery_keeps_coded_frames_for_reenabled_seek_replay() {
++        struct Count(usize);
++        impl CodecInput for Count {
++            fn configure(&mut self, _: &super::super::bridge::DecoderConfig) -> Result<(), ()> {
++                Ok(())
++            }
++            fn submit(&mut self, _: u32, _: &[u8], _: i64) -> Result<bool, ()> {
++                self.0 += 1;
++                Ok(true)
++            }
++        }
++        let mut s = AppendSession::new(1 << 20, 64);
++        s.append(include_bytes!(
++            "../hosttest/tests/fixtures/synthetic-fmp4.mp4"
++        ))
++        .unwrap();
++        let before = s.ranges(1);
++        let pts = s.highest_presentation_timestamp();
++        let mut sink = Count(0);
++        while s.pump_input_selected(&mut sink, |_| false).unwrap() {}
++        assert_eq!(sink.0, 0);
++        assert_eq!(s.ranges(1), before);
++        assert_eq!(s.highest_presentation_timestamp(), pts);
++        s.prepare_seek(0).unwrap();
++        while s.pump_input_selected(&mut sink, |_| true).unwrap() {}
++        assert_eq!(sink.0, 2);
++        assert_eq!(s.ranges(1), before);
++    }
++}
+diff --git a/components/media/backends/android/mse_demux/delivery.rs b/components/media/backends/android/mse_demux/delivery.rs
+--- a/components/media/backends/android/mse_demux/delivery.rs
++++ b/components/media/backends/android/mse_demux/delivery.rs
+@@ -67,12 +67,32 @@
+         Ok(())
+     }
+     pub fn pump(&mut self, sink: &mut impl CodecInput) -> Result<bool, DeliveryError> {
++        self.pump_selected(sink, |_| true)
++    }
++    /// Unselected packets leave only the delivery cursor. The coded frame store
++    /// remains with AppendSession so a staged seek can replay them on re-enable.
++    /// The caller must reset output and replay configuration when selection changes.
++    pub fn pump_selected(
++        &mut self,
++        sink: &mut impl CodecInput,
++        selected: impl Fn(u32) -> bool,
++    ) -> Result<bool, DeliveryError> {
+         if self.poisoned {
+             return Err(DeliveryError::Poisoned);
+         }
+         let Some(front) = self.packets.front_mut() else {
+             return Ok(false);
+         };
++        if !selected(front.packet.track_id) {
++            let f = self.packets.pop_front().unwrap();
++            self.bytes -= f.packet.bytes.len()
++                + f.packet
++                    .config
++                    .as_ref()
++                    .map(|c| c.csd0.len() + c.csd1.len())
++                    .unwrap_or(0);
++            return Ok(true);
++        }
+         if !front.configured {
+             if let Some(c) = front.packet.config.as_ref() {
+                 match sink.prepare_configuration(c) {
+@@ -235,4 +255,44 @@
+         p.pts_us = -1;
+         assert_eq!(d.push(p), Err(DeliveryError::InvalidTimestamp));
+     }
+-}
++    #[test]
++    fn disabled_delivery_never_configures_or_submits_and_releases_queue_quota() {
++        struct NoNative;
++        impl CodecInput for NoNative {
++            fn configure(&mut self, _: &DecoderConfig) -> Result<(), ()> {
++                panic!("disabled track configured")
++            }
++            fn submit(&mut self, _: u32, _: &[u8], _: i64) -> Result<bool, ()> {
++                panic!("disabled track submitted")
++            }
++        }
++        let mut d = Delivery::new(4);
++        d.push(packet()).unwrap();
++        assert_eq!(d.pump_selected(&mut NoNative, |_| false), Ok(true));
++        assert!(d.is_empty());
++        assert_eq!(d.bytes, 0);
++        d.push(packet()).unwrap();
++    }
++    #[test]
++    fn disabled_packet_does_not_block_selected_track_and_retry_is_preserved() {
++        let mut d = Delivery::new(16);
++        let mut disabled = packet();
++        disabled.track_id = 2;
++        disabled.config.as_mut().unwrap().track_id = 2;
++        d.push(disabled).unwrap();
++        d.push(packet()).unwrap();
++        let mut s = Fake {
++            configs: 0,
++            calls: 0,
++            ready: false,
++            fail: false,
++        };
++        assert_eq!(d.pump_selected(&mut s, |id| id == 1), Ok(true));
++        assert_eq!((s.configs, s.calls), (0, 0));
++        assert_eq!(d.pump_selected(&mut s, |id| id == 1), Ok(false));
++        s.ready = true;
++        assert_eq!(d.pump_selected(&mut s, |id| id == 1), Ok(true));
++        assert_eq!((s.configs, s.calls), (1, 2));
++        assert!(d.is_empty());
++    }
++}
