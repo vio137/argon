@@ -1,0 +1,448 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index e141c89fe..012f39a47 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -389,6 +389,7 @@ pub struct AppendPlayback {
+     audio_done: bool,
+     seek_target: Option<i64>,
+     removed_target: Option<i64>,
++    reopen_reset: bool,
+     video_seek_floor: Option<i64>,
+     seek_ready: bool,
+     seek_started: Option<Instant>,
+@@ -428,6 +429,7 @@ impl AppendPlayback {
+             audio_done: false,
+             seek_target: None,
+             removed_target: None,
++            reopen_reset: false,
+             video_seek_floor: None,
+             seek_ready: false,
+             seek_started: None,
+@@ -588,7 +590,7 @@ impl AppendPlayback {
+         end: i64,
+         target: i64,
+     ) -> Result<(), ()> {
+-        if self.failed || self.seek_target.is_some() {
++        if self.failed || (self.seek_target.is_some() && !self.reopen_reset) {
+             return Err(());
+         }
+         let removal = self
+@@ -632,7 +634,7 @@ impl AppendPlayback {
+         end: i64,
+         target: i64,
+     ) -> Result<(), ()> {
+-        if self.failed || self.seek_target.is_some() || target < 0 {
++        if self.failed || (self.seek_target.is_some() && !self.reopen_reset) || target < 0 {
+             return Err(());
+         }
+         let removal = self
+@@ -671,6 +673,7 @@ impl AppendPlayback {
+         Ok(())
+     }
+     fn reset_output_epoch(&mut self, target_us: i64, video_floor: Option<i64>) {
++        self.reopen_reset = false;
+         self.audio.close();
+         self.audio.pending = None;
+         self.decoders.reset_epoch();
+@@ -728,6 +731,7 @@ impl AppendPlayback {
+             None
+         };
+         self.reset_output_epoch(target, floor);
++        self.reopen_reset = covered;
+         if !covered {
+             self.seek_target = None;
+             self.seek_started = None;
+@@ -880,6 +884,7 @@ impl AppendPlayback {
+                 && (!has_audio || self.audio.pending.is_some())
+             {
+                 self.seek_target = None;
++                self.reopen_reset = false;
+                 self.video_seek_floor = None;
+                 self.seek_ready = true;
+                 self.seek_started = None;
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index 178c6d041..252cbf583 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -874,3 +874,30 @@ fn reopen_at_exclusive_end_waits_for_new_coverage_without_replaying_old_eos() {
+     assert_eq!(p.clock.now_us(), 1_000_000);
+     assert!(!p.pump().unwrap().finished);
+ }
++
++#[test]
++fn removal_may_supersede_internal_reopen_reset_but_not_a_later_explicit_seek() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.end_input().unwrap();
++    p.clock.rebase(750_000);
++    p.reopen_input().unwrap();
++    assert!(p.reopen_reset);
++    p.remove_and_stall_if_needed(1, 0, 250_000, 750_000)
++        .unwrap();
++    assert!(!p.reopen_reset);
++    assert_eq!(p.buffered(), [500_000..1_000_000]);
++    assert_eq!(p.seek_target, Some(750_000));
++    // The removal has established its own output reset. It no longer has the
++    // special permission to replace a pending reset without waiting.
++    assert!(
++        p.remove_and_stall_if_needed(1, 0, 250_000, 750_000)
++            .is_err()
++    );
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 46f9d52e6..5bc03358a 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -64,6 +64,25 @@ pub struct AndroidAppendPlayer {
+ fn error() -> PlayerError {
+     PlayerError::BufferPushFailed
+ }
++// Convert the half-open seconds interval to integer presentation timestamps.
++// Ceil both boundaries: flooring start would remove an earlier sample; flooring
++// end would retain a sample that lies strictly inside the requested interval.
++fn removal_interval_us(start: f64, end: f64) -> Result<Range<i64>, PlayerError> {
++    if !start.is_finite()
++        || start < 0.0
++        || end.is_nan()
++        || end <= start
++        || start * 1e6 >= i64::MAX as f64
++        || (end.is_finite() && end * 1e6 >= i64::MAX as f64)
++    {
++        return Err(PlayerError::SeekOutOfRange);
++    }
++    Ok((start * 1e6).ceil() as i64..if end == f64::INFINITY {
++        i64::MAX
++    } else {
++        (end * 1e6).ceil() as i64
++    })
++}
+ impl AndroidAppendPlayer {
+     pub fn new(
+         id: usize,
+@@ -598,15 +617,7 @@ impl Player for AndroidAppendPlayer {
+         Ok(())
+     }
+     fn append_remove(&self, id: u32, start: f64, end: f64) -> Result<u64, PlayerError> {
+-        if !start.is_finite()
+-            || start < 0.0
+-            || end.is_nan()
+-            || end <= start
+-            || start * 1e6 >= i64::MAX as f64
+-            || (end.is_finite() && end * 1e6 >= i64::MAX as f64)
+-        {
+-            return Err(PlayerError::SeekOutOfRange);
+-        }
++        let interval = removal_interval_us(start, end)?;
+         let mut s = self.state.lock().unwrap();
+         if s.stopped
+             || s.input_ended
+@@ -620,12 +631,8 @@ impl Player for AndroidAppendPlayer {
+         self.command(Command::Remove {
+             buffer_id: id,
+             operation,
+-            start: (start * 1e6) as i64,
+-            end: if end == f64::INFINITY {
+-                i64::MAX
+-            } else {
+-                (end * 1e6) as i64
+-            },
++            start: interval.start,
++            end: interval.end,
+         })?;
+         b.operation = operation;
+         b.updating = true;
+@@ -1194,11 +1201,61 @@ mod tests {
+     }
+     #[test]
+     fn rejected_reopen_preserves_ended_flags_and_next_operation_scope() {
+-        let p=seek_test_player();let p=p.lock().unwrap();
+-        drop(p.worker.lock().unwrap().take());let (worker,_rx)=Worker::saturated_for_test();*p.worker.lock().unwrap()=Some(worker);
+-        {let mut s=p.state.lock().unwrap();s.input_ended=true;s.output_ended=true;}
+-        assert_eq!(p.append_reopen(),Err(PlayerError::EnoughData));
+-        let s=p.state.lock().unwrap();assert!(s.input_ended);assert!(s.output_ended);assert!(!s.stopped);
++        let p = seek_test_player();
++        let p = p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, _rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut s = p.state.lock().unwrap();
++            s.input_ended = true;
++            s.output_ended = true;
++        }
++        assert_eq!(p.append_reopen(), Err(PlayerError::EnoughData));
++        let s = p.state.lock().unwrap();
++        assert!(s.input_ended);
++        assert!(s.output_ended);
++        assert!(!s.stopped);
+     }
++}
+ 
++#[cfg(test)]
++mod removal_interval_tests {
++    use super::*;
++    #[test]
++    fn fractional_removal_bounds_select_only_integer_pts_inside_interval() {
++        for (start, end) in [
++            (0.1e-6, 0.9e-6),
++            (0.1e-6, 1.1e-6),
++            (1e-6, 2e-6),
++            (1.1e-6, 2.9e-6),
++            (0.0, 3e-6),
++        ] {
++            let interval = removal_interval_us(start, end).unwrap();
++            for pts in 0..5 {
++                let time = pts as f64 / 1e6;
++                assert_eq!(interval.contains(&pts), time >= start && time < end);
++            }
++        }
++        assert_eq!(removal_interval_us(0.1e-6, 0.9e-6).unwrap(), 1..1);
++    }
++    #[test]
++    fn removal_bounds_validate_before_conversion_and_allow_positive_infinity() {
++        assert_eq!(
++            removal_interval_us(0.0, f64::INFINITY).unwrap(),
++            0..i64::MAX
++        );
++        for (start, end) in [
++            (f64::NAN, 1.0),
++            (-1.0, 1.0),
++            (f64::INFINITY, f64::INFINITY),
++            (0.0, f64::NAN),
++            (0.0, f64::NEG_INFINITY),
++            (1.0, 1.0),
++            (2.0, 1.0),
++            (0.0, i64::MAX as f64 / 1e6),
++        ] {
++            assert!(removal_interval_us(start, end).is_err());
++        }
++    }
+ }
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index cd71b7d23..18e93027b 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -149,6 +149,13 @@ impl Worker {
+                                         end,
+                                     } => {
+                                         let target = playback.position_us();
++                                        if start == end {
++                                            event(Event::AppendStarted(buffer_id, operation));
++                                            event(Event::CommandApplied(Applied::Removed(
++                                                buffer_id, operation,
++                                            )));
++                                            continue;
++                                        }
+                                         if playback
+                                             .remove_and_stall_if_needed(
+                                                 buffer_id, start, end, target,
+@@ -587,4 +594,37 @@ mod tests {
+             }
+         }
+     }
++    #[test]
++    fn submicrosecond_empty_removal_interval_keeps_update_lifecycle_without_reset() {
++        let (tx, rx) = mpsc::channel();
++        let w = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |e| {
++                let _ = tx.send(e);
++            }),
++        )
++        .unwrap();
++        assert!(
++            w.try_command(Command::Remove {
++                buffer_id: 1,
++                operation: 84,
++                start: 1,
++                end: 1
++            })
++            .is_ok()
++        );
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::AppendStarted(1, 84) => break,
++                Event::Error | Event::RemoveRejected(..) => {
++                    panic!("empty quantized removal rejected")
++                },
++                _ => (),
++            }
++        }
++        assert!(matches!(
++            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
++            Event::CommandApplied(Applied::Removed(1, 84))
++        ));
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index a26218aed..6018c71b8 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -287,3 +287,21 @@ mod pipeline_tests {
+   source.detach();assert!(source.reopen().is_err());
+  }
+ }
++
++#[cfg(test)] mod reopened_removal_tests {
++ use crate::{append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ #[test] fn reopen_then_remove_has_open_before_update_and_no_async_rejection() {
++  let p=AndroidAppendPlayer::new(84,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p).unwrap();
++  let b=source.add_buffer("video/mp4").unwrap();loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  for _ in rx.try_iter(){}
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,1)){break;}}
++  source.end_input().unwrap();assert_eq!(rx.recv().unwrap(),SourceEvent::Ended);
++  source.reopen().unwrap();assert_eq!(rx.recv().unwrap(),SourceEvent::Open);
++  b.remove(0.0,0.25).unwrap();
++  for e in [AppendEvent::UpdateStart,AppendEvent::Update,AppendEvent::UpdateEnd]{assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(b.id(),e,2));}
++  assert_eq!(b.buffered(),[0.5..1.0]);source.detach();
++ }
++}
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+index efab5fef9..0f47268f0 100644
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -156,6 +156,18 @@ impl MediaSource {
+             list.clear();
+         }
+     }
++    pub(crate) fn backend_duration(&self) -> f64 {
++        self.duration.get()
++    }
++    pub(crate) fn reopen_if_ended(&self) -> Fallible<()> {
++        if self.controller.state() == SourceState::Ended {
++            self.controller.reopen().map_err(source_error)?;
++        }
++        if self.controller.state() != SourceState::Open {
++            return Err(Error::InvalidState(None));
++        }
++        Ok(())
++    }
+     pub(crate) fn set_backend_duration(&self, duration: f64) {
+         if self.controller.state() != SourceState::Closed {
+             self.duration.set(duration);
+@@ -245,7 +257,7 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
+             .controller
+             .add_buffer(&mime.to_string())
+             .map_err(source_error)?;
+-        let buffer = SourceBuffer::new(cx, &self.global(), handle, &media);
++        let buffer = SourceBuffer::new(cx, &self.global(), handle, &media, self);
+         self.SourceBuffers(cx).add(&buffer);
+         // Active membership MUST be populated from initialization track metadata,
+         // not simply from addSourceBuffer. No fabricated active list here.
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+index dcdca9024..468cb7980 100644
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -15,6 +15,7 @@ use crate::dom::{
+     eventtarget::EventTarget,
+     globalscope::GlobalScope,
+     htmlmediaelement::HTMLMediaElement,
++    mediasource::MediaSource,
+     texttracklist::TextTrackList,
+     timeranges::{TimeRanges, TimeRangesContainer},
+     videotracklist::VideoTrackList,
+@@ -42,6 +43,8 @@ pub(crate) struct SourceBuffer {
+     #[ignore_malloc_size_of = "private backend controller"]
+     buffer: AppendBuffer,
+     media: Dom<HTMLMediaElement>,
++    source: Dom<MediaSource>,
++    removing: Cell<bool>,
+     last_offset: Cell<f64>,
+     last_start: Cell<f64>,
+     last_end: Cell<f64>,
+@@ -68,6 +71,7 @@ impl SourceBuffer {
+         global: &GlobalScope,
+         buffer: AppendBuffer,
+         media: &HTMLMediaElement,
++        source: &MediaSource,
+     ) -> DomRoot<Self> {
+         reflect_dom_object(
+             cx,
+@@ -75,6 +79,8 @@ impl SourceBuffer {
+                 event_target: EventTarget::new_inherited(),
+                 buffer,
+                 media: Dom::from_ref(media),
++                source: Dom::from_ref(source),
++                removing: Cell::new(false),
+                 last_offset: Cell::new(0.0),
+                 last_start: Cell::new(0.0),
+                 last_end: Cell::new(f64::INFINITY),
+@@ -153,6 +159,7 @@ impl SourceBuffer {
+     }
+     pub(crate) fn detached(&self) {
+         self.updating.set(false);
++        self.removing.set(false);
+     }
+     pub(crate) fn buffer_id(&self) -> u32 {
+         self.buffer.id()
+@@ -171,7 +178,8 @@ impl SourceBuffer {
+         // worker before its completion event has been delivered to script.
+         match event {
+             AppendEvent::Update | AppendEvent::Error | AppendEvent::Closed => {
+-                self.updating.set(false)
++                self.updating.set(false);
++                self.removing.set(false);
+             },
+             _ => (),
+         }
+@@ -267,6 +275,7 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+             .or_init(|| TextTrackList::new(cx, &self.media, self.global().as_window(), &[]))
+     }
+     fn AppendBuffer(&self, data: ArrayBufferViewOrArrayBuffer) -> Fallible<()> {
++        self.buffer.options().map_err(source_error)?;
+         if self.updating.get() {
+             return Err(Error::InvalidState(None));
+         }
+@@ -275,11 +284,18 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+             ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
+         }
+         .ok_or_else(|| Error::Type(c"Buffer is detached".to_owned()))?;
++        if self.media.GetError().is_some() {
++            return Err(Error::InvalidState(None));
++        }
++        self.source.reopen_if_ended()?;
+         self.buffer.append(bytes).map_err(source_error)?;
+         self.updating.set(true);
+         Ok(())
+     }
+     fn Abort(&self) -> Fallible<()> {
++        if self.removing.get() {
++            return Err(Error::InvalidState(None));
++        }
+         self.buffer.abort().map_err(source_error)?;
+         let was_updating = self.updating.replace(false);
+         self.last_start.set(0.0);
+@@ -307,10 +323,20 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+             "Decoder format replacement is not implemented".to_owned(),
+         )))
+     }
+-    fn Remove(&self, _: Finite<f64>, _: f64) -> Fallible<()> {
+-        Err(Error::NotSupported(Some(
+-            "Live decoder removal synchronization is not implemented".to_owned(),
+-        )))
++    fn Remove(&self, start: Finite<f64>, end: f64) -> Fallible<()> {
++        self.buffer.options().map_err(source_error)?;
++        if self.updating.get() {
++            return Err(Error::InvalidState(None));
++        }
++        let duration = self.source.backend_duration();
++        if *start < 0.0 || duration.is_nan() || *start > duration || end.is_nan() || end <= *start {
++            return Err(Error::Type(c"Invalid removal range".to_owned()));
++        }
++        self.source.reopen_if_ended()?;
++        self.buffer.remove(*start, end).map_err(source_error)?;
++        self.removing.set(true);
++        self.updating.set(true);
++        Ok(())
+     }
+     event_handler!(updatestart, GetOnupdatestart, SetOnupdatestart);
+     event_handler!(update, GetOnupdate, SetOnupdate);
