@@ -1,0 +1,546 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 012f39a47..9161c625e 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -362,6 +362,7 @@ pub struct PumpStatus {
+     pub all_buffers_ready: bool,
+     pub buffered: Vec<std::ops::Range<i64>>,
+     pub buffer_ranges: Vec<(u32, Vec<std::ops::Range<i64>>)>,
++    pub parsing_media_segments: Vec<(u32, bool)>,
+     pub buffer_tracks: Vec<(u32, Vec<crate::mse_demux::TrackDescription>)>,
+ }
+ 
+@@ -483,7 +484,7 @@ impl AppendPlayback {
+         offset_us: i64,
+         window: std::ops::Range<i64>,
+     ) -> Result<(), ()> {
+-        if self.failed || self.input_ended {
++        if self.failed {
+             return Err(());
+         }
+         self.sessions
+@@ -852,6 +853,11 @@ impl AppendPlayback {
+             current_data: self.has_current_data(),
+             buffered: self.buffered(),
+             buffer_ranges: self.buffer_ranges(),
++            parsing_media_segments: self
++                .sessions
++                .iter()
++                .map(|(id, s)| (*id, s.parsing_media_segment()))
++                .collect(),
+             buffer_tracks: self
+                 .sessions
+                 .iter()
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index 252cbf583..107fe01ed 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -901,3 +901,20 @@ fn removal_may_supersede_internal_reopen_reset_but_not_a_later_explicit_seek() {
+             .is_err()
+     );
+ }
++
++#[test]
++fn quantized_equal_removal_uses_the_native_epoch_path_with_a_real_buffer() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.rendered_frames = 3;
++    p.remove_and_stall_if_needed(1, 1, 1, 0).unwrap();
++    assert_eq!(p.rendered_frames, 0);
++    assert_eq!(p.seek_target, Some(0));
++    assert_eq!(p.buffered(), [0..1_000_000]);
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 5bc03358a..5005d195f 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -43,9 +43,27 @@ struct State {
+     buffers: BTreeMap<u32, BufferState>,
+     buffered: Vec<Range<f64>>,
+     buffer_ranges: BTreeMap<u32, Vec<Range<f64>>>,
++    pending_parser_resets: BTreeMap<u32, usize>,
++    parsing_media_segments: BTreeMap<u32, bool>,
+     buffer_tracks: BTreeMap<u32, Vec<servo_media_player::append::AppendTrack>>,
+ }
+ impl State {
++    fn parsing_media_segment(&self, id: u32) -> bool {
++        !self.pending_parser_resets.contains_key(&id)
++            && self
++                .parsing_media_segments
++                .get(&id)
++                .copied()
++                .unwrap_or(false)
++    }
++    fn parser_reset_applied(&mut self, id: u32) {
++        if let Some(count) = self.pending_parser_resets.get_mut(&id) {
++            *count -= 1;
++            if *count == 0 {
++                self.pending_parser_resets.remove(&id);
++            }
++        }
++    }
+     fn finish_seek(&mut self, operation: u64) -> bool {
+         if self.pending_seek != Some(operation) || self.stopped {
+             return false;
+@@ -103,6 +121,8 @@ impl AndroidAppendPlayer {
+             buffers: BTreeMap::new(),
+             buffered: vec![],
+             buffer_ranges: BTreeMap::new(),
++            pending_parser_resets: BTreeMap::new(),
++            parsing_media_segments: BTreeMap::new(),
+             buffer_tracks: BTreeMap::new(),
+         }));
+         let shared = state.clone();
+@@ -177,6 +197,9 @@ impl AndroidAppendPlayer {
+                             });
+                         }
+                     },
++                    Event::CommandApplied(Applied::AppendAborted(id)) => {
++                        shared.lock().unwrap().parser_reset_applied(id);
++                    },
+                     Event::CommandApplied(Applied::BufferAdded(id)) => {
+                         let cb = {
+                             let mut s = shared.lock().unwrap();
+@@ -232,6 +255,8 @@ impl AndroidAppendPlayer {
+                             );
+                             old
+                         };
++                        shared.lock().unwrap().parsing_media_segments =
++                            status.parsing_media_segments.iter().copied().collect();
+                         shared.lock().unwrap().buffered = status
+                             .buffered
+                             .iter()
+@@ -654,6 +679,7 @@ impl Player for AndroidAppendPlayer {
+         self.command(Command::AbortAppend(id))?;
+         buffer.operation = operation;
+         buffer.updating = false;
++        *s.pending_parser_resets.entry(id).or_default() += 1;
+         Ok(operation)
+     }
+     fn append_add_buffer_operations(
+@@ -706,7 +732,7 @@ impl Player for AndroidAppendPlayer {
+             return Err(error());
+         }
+         let s = self.state.lock().unwrap();
+-        if s.stopped || s.input_ended || s.buffers.get(&id).is_none_or(|b| b.updating) {
++        if s.stopped || s.buffers.get(&id).is_none_or(|b| b.updating) {
+             return Err(error());
+         }
+         self.command(Command::Options {
+@@ -715,6 +741,9 @@ impl Player for AndroidAppendPlayer {
+             window: start..end,
+         })
+     }
++    fn append_parsing_media_segment(&self, id: u32) -> bool {
++        self.state.lock().unwrap().parsing_media_segment(id)
++    }
+     fn append_tracks(&self, id: u32) -> Vec<servo_media_player::append::AppendTrack> {
+         self.state
+             .lock()
+@@ -1259,3 +1288,32 @@ mod removal_interval_tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod parser_reset_state_tests {
++    use super::*;
++    #[test]
++    fn accepted_abort_masks_stale_parser_reports_until_all_resets_are_applied() {
++        let p = AndroidAppendPlayer::new(
++            85,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        let mut s = p.state.lock().unwrap();
++        s.parsing_media_segments.insert(1, true);
++        assert!(s.parsing_media_segment(1));
++        s.pending_parser_resets.insert(1, 2);
++        assert!(!s.parsing_media_segment(1));
++        s.parser_reset_applied(1);
++        assert!(!s.parsing_media_segment(1));
++        s.parsing_media_segments.insert(1, false);
++        s.parser_reset_applied(1);
++        assert!(!s.parsing_media_segment(1));
++        assert!(!s.pending_parser_resets.contains_key(&1));
++        s.parsing_media_segments.insert(1, true);
++        assert!(s.parsing_media_segment(1));
++    }
++}
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index 18e93027b..b8b69c68f 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -101,6 +101,7 @@ impl Worker {
+                     let mut playback = AppendPlayback::new(renderer);
+                     let mut previous_current_data = false;
+                     let mut previous_all_ready = false;
++                    let mut previous_parsing = vec![];
+                     let mut previous_ranges = vec![];
+                     let mut previous_frames = 0;
+                     let mut previous_size = None;
+@@ -149,13 +150,6 @@ impl Worker {
+                                         end,
+                                     } => {
+                                         let target = playback.position_us();
+-                                        if start == end {
+-                                            event(Event::AppendStarted(buffer_id, operation));
+-                                            event(Event::CommandApplied(Applied::Removed(
+-                                                buffer_id, operation,
+-                                            )));
+-                                            continue;
+-                                        }
+                                         if playback
+                                             .remove_and_stall_if_needed(
+                                                 buffer_id, start, end, target,
+@@ -240,6 +234,7 @@ impl Worker {
+                         if status.duration_us != previous_duration
+                             || status.all_buffers_ready != previous_all_ready
+                             || status.current_data != previous_current_data
++                            || status.parsing_media_segments != previous_parsing
+                             || status.buffer_ranges != previous_ranges
+                             || status.rendered_frames != previous_frames
+                             || status.video_size != previous_size
+@@ -252,6 +247,7 @@ impl Worker {
+                             event(Event::Status(status.clone()));
+                             previous_duration = status.duration_us;
+                             previous_ranges = status.buffer_ranges.clone();
++                            previous_parsing = status.parsing_media_segments.clone();
+                             previous_current_data = status.current_data;
+                             previous_all_ready = status.all_buffers_ready;
+                             previous_frames = status.rendered_frames;
+@@ -595,7 +591,7 @@ mod tests {
+         }
+     }
+     #[test]
+-    fn submicrosecond_empty_removal_interval_keeps_update_lifecycle_without_reset() {
++    fn quantized_equal_removal_still_validates_the_buffer_instead_of_faking_success() {
+         let (tx, rx) = mpsc::channel();
+         let w = Worker::spawn(
+             Arc::new(Mutex::new(Renderer)),
+@@ -615,16 +611,13 @@ mod tests {
+         );
+         loop {
+             match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+-                Event::AppendStarted(1, 84) => break,
+-                Event::Error | Event::RemoveRejected(..) => {
+-                    panic!("empty quantized removal rejected")
++                Event::RemoveRejected(1, 84) => break,
++                Event::AppendStarted(..) | Event::CommandApplied(Applied::Removed(..)) => {
++                    panic!("invalid buffer removal reported success")
+                 },
++                Event::Error => panic!("recoverable removal poisoned worker"),
+                 _ => (),
+             }
+         }
+-        assert!(matches!(
+-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+-            Event::CommandApplied(Applied::Removed(1, 84))
+-        ));
+     }
+ }
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index b9b248642..99838d1e9 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -132,6 +132,7 @@ pub trait Player: Send + MediaInstance {
+     fn append_buffered(&self, _id: u32) -> Vec<Range<f64>> {
+         vec![]
+     }
++    fn append_parsing_media_segment(&self, _id: u32) -> bool { false }
+     fn append_tracks(&self, _id: u32) -> Vec<append::AppendTrack> { vec![] }
+ 
+ }
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index 6018c71b8..8a965bcf9 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -305,3 +305,52 @@ mod pipeline_tests {
+   assert_eq!(b.buffered(),[0.5..1.0]);source.detach();
+  }
+ }
++
++#[cfg(test)] mod ended_options_tests {
++ use crate::{append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ #[test] fn ended_window_update_keeps_source_ended_without_sourceopen_and_survives_reopen() {
++  let p=AndroidAppendPlayer::new(85,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p).unwrap();
++  let b=source.add_buffer("video/mp4").unwrap();loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  for _ in rx.try_iter(){}
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,1)){break;}}
++  source.end_input().unwrap();assert_eq!(rx.recv().unwrap(),SourceEvent::Ended);
++  b.set_options(0.0,0.25..0.75).unwrap();
++  assert_eq!(source.state(),SourceState::Ended);assert!(rx.try_recv().is_err());
++  assert_eq!(b.options().unwrap(),(0.0,0.25..0.75));
++  assert_eq!(b.set_options(0.0,0.75..0.25),Err(SourceError::Type));
++  assert_eq!(b.options().unwrap(),(0.0,0.25..0.75));
++  source.reopen().unwrap();assert_eq!(rx.recv().unwrap(),SourceEvent::Open);
++  assert_eq!(b.options().unwrap(),(0.0,0.25..0.75));
++  b.remove(0.0,0.25).unwrap();
++  for e in [AppendEvent::UpdateStart,AppendEvent::Update,AppendEvent::UpdateEnd]{assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(b.id(),e,2));}
++  source.detach();assert_eq!(b.set_options(0.0,0.0..1.0),Err(SourceError::InvalidState));
++ }
++}
++
++#[cfg(test)] mod parser_state_routing_tests {
++ use crate::{append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer,mse_demux::BoxFramer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ #[test] fn parser_state_is_visible_before_updateend_even_when_buffered_ranges_do_not_change() {
++  let p=AndroidAppendPlayer::new(85,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p).unwrap();
++  let b=source.add_buffer("video/mp4").unwrap();loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  for _ in rx.try_iter(){}
++  let mut f=BoxFramer::new(1<<20);f.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4")).unwrap();let mut init=vec![];let mut media=vec![];
++  while let Some(boxdata)=f.pop_box().unwrap(){match &boxdata[4..8]{b"ftyp"|b"moov"=>init.extend(boxdata),b"moof"|b"mdat"=>media.extend(boxdata),_=>()}}
++  init.extend_from_slice(&media[..8]);b.append(init).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,1)){break;}}
++  assert!(b.buffered().is_empty());assert!(b.parsing_media_segment().unwrap());
++  b.append(media[8..].to_vec()).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,2)){break;}}
++  assert!(!b.parsing_media_segment().unwrap());assert_eq!(b.buffered(),[0.0..1.0]);
++  b.append(media[..8].to_vec()).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,3)){break;}}
++  assert!(b.parsing_media_segment().unwrap());
++  b.abort().unwrap();assert!(!b.parsing_media_segment().unwrap());b.append(vec![]).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,5)){break;}}
++  assert!(!b.parsing_media_segment().unwrap());source.detach();assert_eq!(b.parsing_media_segment(),Err(SourceError::InvalidState));
++ }
++}
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index 312a98479..7e8124df9 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -594,3 +594,29 @@ fn session_reopen_retains_initialization_and_accepts_more_media_after_clean_eos(
+  s.set_append_options(1_000_000,0..i64::MAX).unwrap();s.append(&media).unwrap();
+  assert_eq!(s.buffered(),[0..2_000_000]);s.end_of_stream().unwrap();assert!(s.can_reopen());
+ }
++
++#[test]
++fn session_window_can_change_while_ended_without_reopening_or_mutating_retained_frames() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let bs=boxes();let init=bs.iter().filter(|b| &b[4..8]==b"ftyp" || &b[4..8]==b"moov").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let media=bs.iter().filter(|b| &b[4..8]==b"moof" || &b[4..8]==b"mdat").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let mut s=AppendSession::new(1<<20,100);s.append(&init).unwrap();s.append(&media).unwrap();s.end_of_stream().unwrap();
++ let before=s.buffered();s.set_append_options(1_000_000,1_500_000..2_000_000).unwrap();
++ assert!(s.can_reopen());assert_eq!(s.buffered(),before);
++ s.reopen().unwrap();s.append(&media).unwrap();assert_eq!(s.buffered(),[0..1_000_000,1_500_000..2_000_000]);
++}
++
++#[test]
++fn parsing_media_state_tracks_partial_moof_until_complete_mdat_and_clears_on_abort() {
++ use servo_media_android_hosttest::mse_demux::append::AppendStream;
++ let bs=boxes();let init=bs.iter().filter(|b| &b[4..8]==b"ftyp" || &b[4..8]==b"moov").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let pair=bs.windows(2).find(|p| &p[0][4..8]==b"moof" && &p[1][4..8]==b"mdat").unwrap();
++ let (moof,mdat)=(&pair[0],&pair[1]);
++ let mut s=AppendStream::new(1<<20,100);s.append(&init).unwrap();assert!(!s.parsing_media_segment());
++ s.append(&moof[..7]).unwrap();assert!(!s.parsing_media_segment());
++ s.append(&moof[7..8]).unwrap();assert!(s.parsing_media_segment());
++ s.append(&moof[8..]).unwrap();assert!(s.parsing_media_segment());
++ s.append(&mdat[..mdat.len()-1]).unwrap();assert!(s.parsing_media_segment());
++ s.append(&mdat[mdat.len()-1..]).unwrap();assert!(!s.parsing_media_segment());
++ s.append(&moof[..8]).unwrap();assert!(s.parsing_media_segment());s.abort();assert!(!s.parsing_media_segment());
++}
+diff --git a/components/media/backends/android/mse_demux/append.rs b/components/media/backends/android/mse_demux/append.rs
+index 336469048..8850f0186 100644
+--- a/components/media/backends/android/mse_demux/append.rs
++++ b/components/media/backends/android/mse_demux/append.rs
+@@ -140,6 +140,9 @@ impl AppendStream {
+         }
+         result
+     }
++    pub fn parsing_media_segment(&self) -> bool {
++        self.has_moof || self.framer.pending_box_type() == Some(*b"moof")
++    }
+     pub fn descriptions(&self) -> &[super::TrackDescription] {
+         if self.initialized {
+             self.demux.descriptions()
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+index 5ed311eaf..b96bfdc62 100644
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -52,6 +52,11 @@ impl BoxFramer {
+         }
+         Ok(Some(self.pending.drain(..size).collect()))
+     }
++    pub fn pending_box_type(&self) -> Option<[u8; 4]> {
++        self.pending
++            .get(4..8)
++            .map(|bytes| bytes.try_into().unwrap())
++    }
+     pub fn finish(&self) -> Result<(), Error> {
+         if self.pending.is_empty() {
+             Ok(())
+@@ -75,7 +80,7 @@ fn box_len(data: &[u8]) -> Result<Option<usize>, Error> {
+                 return Ok(None);
+             }
+             u64::from_be_bytes(data[8..16].try_into().unwrap())
+-        }
++        },
+         n => n as u64,
+     };
+     let min = if small == 1 { 16 } else { 8 };
+@@ -304,7 +309,7 @@ impl Demux {
+                         sample_rate: 0,
+                         channels: 0,
+                     }
+-                }
++                },
+                 SampleEntry::Mp4a(entry) => {
+                     let desc = &entry.esds_box.es.dec_config_descr;
+                     let asc = &desc
+@@ -329,7 +334,7 @@ impl Demux {
+                         sample_rate: u32::from(entry.audio.samplerate.integer),
+                         channels: entry.audio.channelcount,
+                     }
+-                }
++                },
+                 _ => return Err(Error::UnsupportedLayout),
+             };
+             if descriptions.iter().any(|t| t.mime == description.mime) {
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index 2ab8da069..d5e7aa268 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -60,6 +60,9 @@ impl AppendSession {
+             limit,
+         }
+     }
++    pub fn parsing_media_segment(&self) -> bool {
++        self.stream.parsing_media_segment()
++    }
+     pub fn can_reopen(&self) -> bool {
+         !self.failed && self.ended
+     }
+@@ -134,7 +137,7 @@ impl AppendSession {
+         offset_us: i64,
+         window: std::ops::Range<i64>,
+     ) -> Result<(), SessionError> {
+-        if self.failed || self.ended || window.start < 0 || window.end <= window.start {
++        if self.failed || window.start < 0 || window.end <= window.start {
+             return Err(SessionError::Failed);
+         }
+         self.offset_us = offset_us;
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+index 3c8171a6e..25d5b1367 100644
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -206,7 +206,10 @@ impl FrameStore {
+         Ok(staged)
+     }
+     pub fn remove(&mut self, start: i64, end: i64) -> Result<(), StoreError> {
+-        if start < 0 || end <= start {
++        // The public seconds interval is validated as strictly positive before
++        // quantization. Equal integer bounds can still reach the next RAP and
++        // must run the dependency-aware removal rather than becoming a no-op.
++        if start < 0 || end < start {
+             return Err(StoreError::Window);
+         }
+         let mut reset_dependencies = false;
+@@ -394,6 +397,26 @@ mod tests {
+         assert_eq!(s.bytes(), 8);
+     }
+     #[test]
++    fn equal_quantized_bounds_still_remove_through_the_next_random_access_point() {
++        let mut s = FrameStore::new(128);
++        s.append(
++            vec![f(0, true), f(10, false), f(20, false), f(30, true)],
++            0,
++            0..100,
++        )
++        .unwrap();
++        s.remove(1, 1).unwrap();
++        assert_eq!(
++            s.frames(1).iter().map(|f| f.pts_us).collect::<Vec<_>>(),
++            [0, 30]
++        );
++        assert_eq!(s.bytes(), 8);
++        // An exact endpoint RAP survives, even with equal integer bounds.
++        s.remove(30, 30).unwrap();
++        assert_eq!(s.frames(1).len(), 2);
++        assert!(s.remove(2, 1).is_err());
++    }
++    #[test]
+     fn timestamp_overflow_does_not_change_store() {
+         let mut s = FrameStore::new(128);
+         assert_eq!(
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+index c316bdaa6..7f657027a 100644
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -269,7 +269,7 @@ impl AppendBuffer {
+         let player = {
+             let s = inner.state.lock().unwrap();
+             if s.epoch != self.epoch
+-                || s.state != SourceState::Open
++                || s.state == SourceState::Closed
+                 || s.buffers.get(&self.id).is_none_or(|b| b.updating)
+             {
+                 return Err(SourceError::InvalidState);
+@@ -298,6 +298,18 @@ impl AppendBuffer {
+         b.window = window;
+         Ok(())
+     }
++    pub fn parsing_media_segment(&self) -> Result<bool, SourceError> {
++        let inner = self.owner.upgrade().ok_or(SourceError::InvalidState)?;
++        let player = {
++            let s = inner.state.lock().unwrap();
++            if s.epoch != self.epoch || s.state == SourceState::Closed || !s.buffers.contains_key(&self.id) {
++                return Err(SourceError::InvalidState);
++            }
++            s.player.clone().ok_or(SourceError::InvalidState)?
++        };
++        let parsing = player.lock().unwrap().append_parsing_media_segment(self.id);
++        Ok(parsing)
++    }
+     pub fn tracks(&self) -> Result<Vec<crate::append::AppendTrack>, SourceError> {
+         let inner = self.owner.upgrade().ok_or(SourceError::InvalidState)?;
+         let player = {
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 350a12026..845d9607e 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -170,6 +170,7 @@ pub trait Player: Send + MediaInstance {
+     fn append_buffered(&self, _id: u32) -> Vec<Range<f64>> {
+         vec![]
+     }
++    fn append_parsing_media_segment(&self, _id: u32) -> bool { false }
+     fn append_tracks(&self, _id: u32) -> Vec<append::AppendTrack> { vec![] }
+ 
+ }
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+index 468cb7980..375749662 100644
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -207,6 +207,10 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+                 "Sequence append mode is not implemented".to_owned(),
+             )));
+         }
++        self.source.reopen_if_ended()?;
++        if self.buffer.parsing_media_segment().map_err(source_error)? {
++            return Err(Error::InvalidState(None));
++        }
+         Ok(())
+     }
+     fn Updating(&self) -> bool {
+@@ -228,6 +232,10 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+             return Err(Error::InvalidState(None));
+         }
+         let (_, window) = self.buffer.options().map_err(source_error)?;
++        self.source.reopen_if_ended()?;
++        if self.buffer.parsing_media_segment().map_err(source_error)? {
++            return Err(Error::InvalidState(None));
++        }
+         self.buffer
+             .set_options(*value, window)
+             .map_err(source_error)?;
