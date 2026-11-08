@@ -1,0 +1,80 @@
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -100,7 +100,13 @@
+                 let Some(target)=target.upgrade() else{return;};
+                 let this={ let target=target.lock().unwrap(); target.source.root() };
+                 let Some(this)=this else{return;};
+-                if this.generation.load(Ordering::Acquire)==generation {this.backend_event(cx,event);}
++                // Lifecycle tasks belong to this MediaSource object even if
++                // a terminal error detached it before the task runs. Buffer
++                // notifications still require the current attachment epoch.
++                if matches!(event, SourceEvent::Open | SourceEvent::Ended | SourceEvent::Closed)
++                    || this.generation.load(Ordering::Acquire)==generation {
++                    this.backend_event(cx,event);
++                }
+             }));
+         }));
+         let this = reflect_weak_referenceable_dom_object_with_proto(
+@@ -309,7 +315,7 @@
+         list.remove(buffer);
+         Ok(())
+     }
+-    fn EndOfStream(&self, error: Option<EndOfStreamError>) -> Fallible<()> {
++    fn EndOfStream(&self, cx: &mut JSContext, error: Option<EndOfStreamError>) -> Fallible<()> {
+         if self
+             .source_buffers
+             .get()
+@@ -317,10 +323,11 @@
+         {
+             return Err(Error::InvalidState(None));
+         }
+-        if error.is_some() {
+-            return Err(Error::NotSupported(Some(
+-                "Error endOfStream propagation is not implemented".to_owned(),
+-            )));
++        if let Some(error) = error {
++            let media = self.media.get().ok_or(Error::InvalidState(None))?;
++            self.controller.fail_input().map_err(source_error)?;
++            media.append_input_failed(cx, matches!(error, EndOfStreamError::Network));
++            return Ok(());
+         }
+         self.controller.end_input().map_err(source_error)
+     }
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2606,6 +2606,21 @@
+         }
+     }
+ 
++    /// MSE endOfStream(network/decode) follows the same pre/post-metadata
++    /// failure steps as the resource fetch algorithm. The controller already
++    /// stopped native output without synthesizing a successful EOS.
++    pub(crate) fn append_input_failed(&self, cx: &mut JSContext, network: bool) {
++        if self.attached_append_source.get().is_none() || self.in_error_state() {
++            return;
++        }
++        if self.ready_state.get() == ReadyState::HaveNothing {
++            self.media_data_processing_failure_steps(cx);
++        } else {
++            self.media_data_processing_fatal_steps(cx,
++                if network { MEDIA_ERR_NETWORK } else { MEDIA_ERR_DECODE });
++        }
++    }
++
+     fn playback_error(&self, cx: &mut JSContext, error: &str) {
+         error!("Player error: {:?}", error);
+ 
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -1711,7 +1711,7 @@
+     'cx': ['Enqueue', 'Error', 'Terminate']
+ },
+ 
+-'MediaSource': { 'weakReferenceable': True, 'cx': ['SourceBuffers', 'ActiveSourceBuffers', 'AddSourceBuffer'] },
++'MediaSource': { 'weakReferenceable': True, 'cx': ['SourceBuffers', 'ActiveSourceBuffers', 'AddSourceBuffer', 'EndOfStream'] },
+ 'SourceBuffer': { 'cx': ['GetBuffered', 'AudioTracks', 'VideoTracks', 'TextTracks'] },
+ 'SourceBufferList': { 'cx': ['IndexedGetter'] },
+ }
