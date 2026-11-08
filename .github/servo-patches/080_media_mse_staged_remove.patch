@@ -1,0 +1,235 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index 264504683..6a4916486 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -550,3 +550,35 @@ fn a_known_empty_track_prevents_false_muxed_buffer_coverage() {
+     assert_eq!(s.video_frame_at(500_000),Some(500_000));assert_eq!(s.video_frame_at(750_000),Some(500_000));
+     assert_eq!(s.video_frame_at(1_000_000),None);assert_eq!(s.video_frame_at(-1),None);
+ }
++
++#[test]
++fn staged_session_remove_rejects_removed_target_without_mutating_live_ranges() {
++    let mut session=servo_media_android_hosttest::mse_demux::session::AppendSession::new(1<<20,128);
++    session.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();
++    let before=session.buffered();
++    assert!(session.stage_remove_retaining_target(0,1_000_000,250_000).is_err());
++    assert_eq!(session.buffered(),before);
++    // Empty removal at a future time still stages a full target replay; dropping
++    // the plan must not change the live delivery cursor or store.
++    let plan=session.stage_remove_retaining_target(3_000_000,4_000_000,250_000).unwrap();
++    drop(plan);assert_eq!(session.buffered(),before);
++}
++
++#[test]
++fn committed_retained_target_removal_replaces_queued_packets_and_replays_configuration() {
++    use servo_media_android_hosttest::mse_demux::{session::AppendSession,delivery::CodecInput,bridge::DecoderConfig};
++    struct Sink {pts:Vec<i64>,configs:usize}
++    impl CodecInput for Sink {
++        fn configure(&mut self,_:&DecoderConfig)->Result<(),()>{self.configs+=1;Ok(())}
++        fn submit(&mut self,_:u32,_:&[u8],pts:i64)->Result<bool,()>{self.pts.push(pts);Ok(true)}
++    }
++    let mut s=AppendSession::new(1<<20,128);
++    s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();s.end_of_stream().unwrap();
++    let plan=s.stage_remove_retaining_target(0,250_000,750_000).unwrap();
++    assert_eq!(s.buffered(),[0..1_000_000]);
++    // Only the coordinator may commit after native reset. This pure-session
++    // test checks retained packets/config, not a native flush or playback.
++    s.commit_remove(plan);assert_eq!(s.buffered(),[500_000..1_000_000]);
++    let mut sink=Sink{pts:vec![],configs:0};while s.pump_input(&mut sink).unwrap(){}
++    assert_eq!(sink.pts,[500_000]);assert_eq!(sink.configs,1);assert!(s.input_exhausted());
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index d41b6afde..5b898aa3f 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -18,6 +18,13 @@ pub struct SeekPlan {
+     bridge: DecoderBridge,
+     delivery: Delivery,
+ }
++/// Private staged removal plus retained-target replay. The caller must reset
++/// native codecs/output before committing. A removed/unbuffered resume target
++/// rejects the plan without altering the live store or its queued packets.
++pub struct RemovePlan {
++    store: super::timeline::FrameStore,
++    seek: SeekPlan,
++}
+ pub struct AppendSession {
+     stream: AppendStream,
+     store: super::timeline::FrameStore,
+@@ -154,6 +161,41 @@ impl AppendSession {
+         }
+         Ok(SeekPlan { bridge, delivery })
+     }
++    pub fn stage_remove_retaining_target(
++        &self,
++        start: i64,
++        end: i64,
++        target: i64,
++    ) -> Result<RemovePlan, SessionError> {
++        if self.failed {
++            return Err(SessionError::Failed);
++        }
++        let store = self
++            .store
++            .stage_remove(start, end)
++            .map_err(|_| SessionError::Append)?;
++        let units = store
++            .replay_from(target)
++            .map_err(|_| SessionError::Append)?;
++        let mut bridge = DecoderBridge::new(self.limit);
++        let mut delivery = Delivery::new(self.limit);
++        for unit in units {
++            let packet = bridge
++                .prepare(unit)
++                .map_err(|_| SessionError::Configuration)?;
++            delivery.push(packet).map_err(|_| SessionError::Delivery)?;
++        }
++        Ok(RemovePlan {
++            store,
++            seek: SeekPlan { bridge, delivery },
++        })
++    }
++    /// Internal primitive only. Requires successful native reset before this
++    /// commit; swapping a coded store cannot revoke submitted decoder buffers.
++    pub fn commit_remove(&mut self, plan: RemovePlan) {
++        self.store = plan.store;
++        self.commit_seek(plan.seek);
++    }
+     pub fn commit_seek(&mut self, plan: SeekPlan) {
+         self.bridge = plan.bridge;
+         self.delivery = plan.delivery;
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+index e5bcf7fd0..62e6d16c7 100644
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -7,6 +7,7 @@ pub enum StoreError {
+     Timestamp,
+     Window,
+ }
++#[derive(Clone)]
+ pub struct FrameStore {
+     tracks: BTreeMap<u32, Vec<AccessUnit>>,
+     configs: BTreeMap<u32, shiguredo_mp4::boxes::SampleEntry>,
+@@ -192,28 +193,56 @@ impl FrameStore {
+         self.bytes -= freed;
+         freed
+     }
++    /// Stage a removal on an independent store. Native delivery/output must
++    /// be reset by the owner before committing this snapshot. No queued packet
++    /// or already decoded frame is implicitly revoked by changing this store.
++    pub fn stage_remove(&self, start: i64, end: i64) -> Result<Self, StoreError> {
++        let mut staged = self.clone();
++        staged.remove(start, end)?;
++        Ok(staged)
++    }
+     pub fn remove(&mut self, start: i64, end: i64) -> Result<(), StoreError> {
+         if start < 0 || end <= start {
+             return Err(StoreError::Window);
+         }
++        let mut reset_dependencies = false;
+         for (&id, frames) in &mut self.tracks {
++            // Removal reaches the next RAP at or after end, even when [start,
++            // end) lies between frame starts. A RAP exactly at end survives.
++            let remove_end = frames
++                .iter()
++                .filter(|f| f.keyframe && f.pts_us >= end)
++                .map(|f| f.pts_us)
++                .min()
++                .unwrap_or(i64::MAX);
+             let first = frames
+                 .iter()
+-                .position(|f| f.pts_us >= start && f.pts_us < end);
++                .position(|f| f.pts_us >= start && f.pts_us < remove_end);
+             if let Some(first) = first {
+                 let last = frames
+                     .iter()
+-                    .rposition(|f| f.pts_us >= start && f.pts_us < end)
++                    .rposition(|f| f.pts_us >= start && f.pts_us < remove_end)
+                     .unwrap();
+                 let stop = (last + 1..frames.len())
+                     .find(|&i| frames[i].keyframe)
+                     .unwrap_or(frames.len());
+                 for old in frames.drain(first..stop) {
++                    if self
++                        .last_decode
++                        .get(&id)
++                        .is_some_and(|&(dts, _)| dts == old.dts_us)
++                    {
++                        reset_dependencies = true;
++                    }
+                     self.bytes -= old.data.len();
+                 }
+-                self.need_random_access.insert(id);
+             }
+         }
++        // The last decode timestamp reset affects every track buffer in this
++        // SourceBuffer, not just the track whose frame happened to be removed.
++        if reset_dependencies {
++            self.discontinuity();
++        }
+         Ok(())
+     }
+     /// Buffered is the intersection across multiplexed tracks, never their
+@@ -474,4 +503,62 @@ mod tests {
+         s.append(vec![a, b], 0, 0..100).unwrap();
+         assert_eq!(s.frames(1).len(), 2);
+     }
++    #[test]
++    fn remove_between_frame_starts_still_drops_dependents_before_next_rap() {
++        let mut s = FrameStore::new(128);
++        s.append(
++            vec![f(0, true), f(10, false), f(20, false), f(30, true)],
++            0,
++            0..100,
++        )
++        .unwrap();
++        s.remove(5, 6).unwrap();
++        assert_eq!(s.ranges(1), [0..10, 30..40]);
++        assert_eq!(s.bytes(), 8);
++    }
++    #[test]
++    fn removal_exact_rap_endpoint_is_exclusive() {
++        let mut s = FrameStore::new(128);
++        s.append(
++            vec![f(0, true), f(10, false), f(20, true), f(30, false)],
++            0,
++            0..100,
++        )
++        .unwrap();
++        s.remove(0, 20).unwrap();
++        assert_eq!(s.ranges(1), [20..40]);
++        // Kept last decode timestamp: removing old history must not reset
++        // the live append chain and discard a valid dependent successor.
++        s.append(vec![f(40, false)], 0, 0..100).unwrap();
++        assert_eq!(s.ranges(1), [20..50]);
++    }
++    #[test]
++    fn staged_remove_can_be_rejected_without_changing_live_frames() {
++        let mut s = FrameStore::new(128);
++        s.append(vec![f(0, true), f(10, false), f(20, true)], 0, 0..100)
++            .unwrap();
++        let p = s.stage_remove(0, 10).unwrap();
++        assert_eq!(p.ranges(1), [20..30]);
++        assert_eq!(s.ranges(1), [0..30]);
++        assert_eq!(s.bytes(), 12);
++        assert!(s.stage_remove(-1, 10).is_err());
++        assert_eq!(s.bytes(), 12);
++    }
++    #[test]
++    fn removing_last_decode_frame_resets_all_track_dependency_chains() {
++        let mut s = FrameStore::new(128);
++        let mut audio = f(0, true);
++        audio.track_id = 2;
++        s.append(vec![f(0, true), f(10, false), audio], 0, 0..100)
++            .unwrap();
++        s.remove(10, 11).unwrap();
++        let mut dependent = f(10, false);
++        dependent.track_id = 2;
++        assert!(
++            s.append_collect(vec![dependent], 0, 0..100)
++                .unwrap()
++                .is_empty()
++        );
++        assert_eq!(s.ranges(2), [0..10]);
++    }
+ }
