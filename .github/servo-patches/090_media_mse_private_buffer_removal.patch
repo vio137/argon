@@ -1,0 +1,570 @@
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -266,6 +266,17 @@
+             owner: Arc::downgrade(&self.0),
+         })
+     }
++    /// Private controller removal. The DOM still needs abort/updateend and
++    /// track-list synchronization before exposing removeSourceBuffer().
++    pub fn remove_buffer(&self,buffer:&AppendBuffer)->Result<(),SourceError> {
++        let owner=buffer.owner.upgrade().ok_or(SourceError::InvalidState)?;
++        if !Arc::ptr_eq(&owner,&self.0){return Err(SourceError::InvalidState);}
++        let mut s=self.0.state.lock().unwrap();
++        if s.state==SourceState::Closed||s.epoch!=buffer.epoch||!s.buffers.contains_key(&buffer.id){return Err(SourceError::InvalidState);}
++        s.player.as_ref().ok_or(SourceError::InvalidState)?.lock().unwrap().append_remove_buffer(buffer.id)
++            .map_err(|e|if e==PlayerError::EnoughData{SourceError::Quota}else{SourceError::Backend})?;
++        s.buffers.remove(&buffer.id);Ok(())
++    }
+     pub fn buffers(&self) -> Vec<AppendBuffer> {
+         let s = self.0.state.lock().unwrap();
+         s.buffers
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -139,6 +139,7 @@
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_remove_buffer(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1313,3 +1313,59 @@
+     assert_eq!(p.duration_seconds, 1.0);
+     assert_eq!(p.duration_generation, 4);
+ }
++
++#[test]
++fn removing_one_buffer_drops_its_native_epoch_and_replays_only_surviving_coverage() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.add_buffer(2).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.append(
++        2,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4"),
++    )
++    .unwrap();
++    let before = p.buffer_ranges();
++    assert!(p.remove_buffer(99).is_err());
++    assert_eq!(p.buffer_ranges(), before);
++    p.remove_buffer(1).unwrap();
++    assert!(!p.sessions.contains_key(&1));
++    assert!(p.sessions.contains_key(&2));
++    assert!(p.decoders.video.is_none());
++    assert!(p.decoders.audio.is_none());
++    assert_eq!(p.seek_target, Some(0));
++    assert!(!p.take_seek_ready());
++    assert_eq!(p.buffer_ranges().len(), 1);
++    assert_eq!(p.buffer_ranges()[0].0, 2);
++}
++#[test]
++fn removing_last_buffer_cancels_wait_and_frees_store_without_fabricating_seek_completion() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.seek_or_wait_for_coverage(2_000_000).unwrap();
++    p.remove_buffer(1).unwrap();
++    assert!(p.sessions.is_empty());
++    assert!(p.buffered().is_empty());
++    assert_eq!(p.removed_target, None);
++    assert_eq!(p.seek_target, None);
++    assert!(!p.take_seek_ready());
++    assert!(!p.pump().unwrap().finished);
++    p.add_buffer(2).unwrap();
++    p.append(
++        2,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    assert_eq!(p.buffered(), [0..1_000_000]);
++}
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -433,6 +433,7 @@
+     pub duration_generation: u64,
+     pub highest_pts: Option<i64>,
+     pub highest_end: i64,
++    pub removal_generation: u64,
+     pub rendered_frames: u64,
+     pub video_size: Option<(u16, u16)>,
+     pub has_audio: bool,
+@@ -447,6 +448,7 @@
+ 
+ pub struct AppendPlayback {
+     sessions: BTreeMap<u32, AppendSession>,
++    removal_generation: u64,
+     input_ended: bool,
+     declared_duration_us: Option<i64>,
+     duration_seconds: f64,
+@@ -481,6 +483,7 @@
+     pub fn new(renderer: Arc<Mutex<dyn VideoFrameRenderer>>) -> Self {
+         Self {
+             sessions: BTreeMap::new(),
++            removal_generation: 0,
+             input_ended: false,
+             declared_duration_us: None,
+             duration_seconds: f64::INFINITY,
+@@ -532,6 +535,66 @@
+         }
+         result
+     }
++    /// Stage all surviving delivery cursors before destroying the removed
++    /// buffer and its native output epoch. A gap waits for future coverage.
++    /// This private primitive does not implement the DOM removal/track events.
++    pub fn remove_buffer(&mut self, id: u32) -> Result<(), ()> {
++        if self.failed || !self.sessions.contains_key(&id) {
++            return Err(());
++        }
++        let generation = self.removal_generation.checked_add(1).ok_or(())?;
++        let target = self.position_us();
++        let covered = self
++            .sessions
++            .iter()
++            .filter(|(key, _)| **key != id)
++            .all(|(_, session)| {
++                session
++                    .buffered()
++                    .iter()
++                    .any(|range| range.contains(&target))
++            })
++            && self.sessions.len() > 1;
++        let plans = self
++            .sessions
++            .iter()
++            .filter(|(key, _)| **key != id)
++            .map(|(key, session)| {
++                let plan = if covered {
++                    session.stage_seek(target)
++                } else {
++                    session.empty_delivery_plan()
++                }
++                .map_err(|_| ())?;
++                Ok((*key, plan))
++            })
++            .collect::<Result<Vec<_>, ()>>()?;
++        let floor = covered
++            .then(|| {
++                self.sessions
++                    .iter()
++                    .filter(|(key, _)| **key != id)
++                    .filter_map(|(_, session)| session.video_frame_at(target))
++                    .max()
++            })
++            .flatten();
++        self.reset_output_epoch(target, floor);
++        if !covered {
++            self.seek_target = None;
++            self.seek_started = None;
++        }
++        self.seek_ready = false;
++        self.sessions.remove(&id);
++        self.removal_generation = generation;
++        self.removed_target = (!covered && !self.sessions.is_empty()).then_some(target);
++        for (key, plan) in plans {
++            self.sessions.get_mut(&key).ok_or(())?.commit_seek(plan);
++        }
++        Ok(())
++    }
++    pub fn has_buffers(&self) -> bool {
++        !self.sessions.is_empty()
++    }
+     pub fn add_buffer(&mut self, id: u32) -> Result<(), ()> {
+         if self.failed
+             || self.input_ended
+@@ -1024,6 +1087,7 @@
+                 .filter_map(AppendSession::highest_presentation_timestamp)
+                 .max(),
+             highest_end: self.largest_track_end(),
++            removal_generation: self.removal_generation,
+             rendered_frames: self.rendered_frames,
+             video_size: self.decoders.video_size.or_else(|| {
+                 self.sessions
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -18,6 +18,7 @@
+ 
+ pub enum Command {
+     AddBuffer(u32),
++    RemoveBuffer(u32),
+     Remove {
+         buffer_id: u32,
+         operation: u64,
+@@ -68,6 +69,7 @@
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Applied {
+     BufferAdded(u32),
++    BufferRemoved(u32),
+     Removed(u32, u64),
+     SeekStarted(u64),
+     AppendAborted(u32),
+@@ -151,6 +153,7 @@
+                                         Applied::Options(*buffer_id)
+                                     },
+                                     Command::AddBuffer(id) => Applied::BufferAdded(*id),
++                                    Command::RemoveBuffer(id) => Applied::BufferRemoved(*id),
+                                     Command::AbortAppend(id) => Applied::AppendAborted(*id),
+                                     Command::Append {
+                                         buffer_id,
+@@ -210,6 +213,16 @@
+                                         window,
+                                     } => playback.set_options(buffer_id, offset_us, window),
+                                     Command::AddBuffer(id) => playback.add_buffer(id),
++                                    Command::RemoveBuffer(id) => {
++                                        playback.remove_buffer(id)?;
++                                        if !playback.has_buffers() {
++                                            if let Some((operation, _)) = pending_seek.take() {
++                                                event(Event::SeekRejected(operation));
++                                            }
++                                        }
++                                        output_finished = false;
++                                        Ok(())
++                                    },
+                                     Command::AbortAppend(id) => playback.abort_append(id),
+                                     Command::Append {
+                                         buffer_id,
+@@ -669,4 +682,55 @@
+             }
+         }
+     }
++    #[test]
++    fn removing_last_buffer_rejects_pending_seek_instead_of_losing_its_completion() {
++        let (tx, rx) = mpsc::channel();
++        let worker = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |e| {
++                let _ = tx.send(e);
++            }),
++        )
++        .unwrap();
++        let send = |c| assert!(worker.try_command(c).is_ok());
++        send(Command::AddBuffer(1));
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::CommandApplied(Applied::BufferAdded(1)) => break,
++                Event::Error => panic!("worker failed"),
++                _ => (),
++            }
++        }
++        send(Command::Seek {
++            operation: 97,
++            target_us: 500_000,
++        });
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::CommandApplied(Applied::SeekStarted(97)) => break,
++                Event::Error | Event::SeekRejected(_) | Event::SeekReady { .. } => {
++                    panic!("wait became failure/completion")
++                },
++                _ => (),
++            }
++        }
++        send(Command::RemoveBuffer(1));
++        let mut rejected = false;
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::SeekRejected(97) => {
++                    assert!(!rejected);
++                    rejected = true;
++                },
++                Event::CommandApplied(Applied::BufferRemoved(1)) => {
++                    assert!(rejected);
++                    break;
++                },
++                Event::Error | Event::SeekReady { .. } => {
++                    panic!("removal falsely completed or failed")
++                },
++                _ => (),
++            }
++        }
++    }
+ }
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -42,6 +42,7 @@
+     duration_generation: u64,
+     highest_pts: Option<i64>,
+     highest_end: i64,
++    removal_generation: u64,
+     readiness: Option<servo_media_player::append::AppendReadiness>,
+     pending_seek: Option<u64>,
+     buffers: BTreeMap<u32, BufferState>,
+@@ -143,6 +144,7 @@
+             duration_generation: 0,
+             highest_pts: None,
+             highest_end: 0,
++            removal_generation: 0,
+             readiness: None,
+             pending_seek: None,
+             buffers: BTreeMap::new(),
+@@ -273,6 +275,58 @@
+                     },
+                     Event::CommandApplied(_) => (),
+                     Event::Status(status) => {
++                        let duration_changed = {
++                            let mut s = shared.lock().unwrap();
++                            if status.removal_generation < s.removal_generation {
++                                return;
++                            }
++                            s.highest_pts = status.highest_pts;
++                            s.highest_end = status.highest_end;
++                            s.timestamp_offsets =
++                                status.timestamp_offsets.iter().copied().collect();
++                            s.parsing_media_segments =
++                                status.parsing_media_segments.iter().copied().collect();
++                            s.buffered = status
++                                .buffered
++                                .iter()
++                                .map(|r| r.start as f64 / 1e6..r.end as f64 / 1e6)
++                                .collect();
++                            s.buffer_ranges = status
++                                .buffer_ranges
++                                .iter()
++                                .map(|(id, ranges)| {
++                                    (
++                                        *id,
++                                        ranges
++                                            .iter()
++                                            .map(|r| r.start as f64 / 1e6..r.end as f64 / 1e6)
++                                            .collect(),
++                                    )
++                                })
++                                .collect();
++                            s.buffer_tracks = status
++                                .buffer_tracks
++                                .iter()
++                                .map(|(id, tracks)| {
++                                    (
++                                        *id,
++                                        tracks
++                                            .iter()
++                                            .map(|t| servo_media_player::append::AppendTrack {
++                                                id: t.id,
++                                                mime: t.mime.to_owned(),
++                                            })
++                                            .collect(),
++                                    )
++                                })
++                                .collect();
++                            s.apply_duration_status(
++                                status.duration_generation,
++                                status.duration_seconds,
++                                status.duration_us,
++                                status.all_buffers_ready,
++                            )
++                        };
+                         let (old_frames, old_metadata, old_playing, old_ready, old_initialized) = {
+                             let mut h = history.lock().unwrap();
+                             let old = *h;
+@@ -285,49 +339,6 @@
+                             );
+                             old
+                         };
+-                        {
+-                            let mut s = shared.lock().unwrap();
+-                            s.highest_pts = status.highest_pts;
+-                            s.highest_end = status.highest_end;
+-                        }
+-                        shared.lock().unwrap().timestamp_offsets =
+-                            status.timestamp_offsets.iter().copied().collect();
+-                        shared.lock().unwrap().parsing_media_segments =
+-                            status.parsing_media_segments.iter().copied().collect();
+-                        shared.lock().unwrap().buffered = status
+-                            .buffered
+-                            .iter()
+-                            .map(|r| r.start as f64 / 1e6..r.end as f64 / 1e6)
+-                            .collect();
+-                        shared.lock().unwrap().buffer_ranges = status
+-                            .buffer_ranges
+-                            .iter()
+-                            .map(|(id, ranges)| {
+-                                (
+-                                    *id,
+-                                    ranges
+-                                        .iter()
+-                                        .map(|r| r.start as f64 / 1e6..r.end as f64 / 1e6)
+-                                        .collect(),
+-                                )
+-                            })
+-                            .collect();
+-                        shared.lock().unwrap().buffer_tracks = status
+-                            .buffer_tracks
+-                            .iter()
+-                            .map(|(id, tracks)| {
+-                                (
+-                                    *id,
+-                                    tracks
+-                                        .iter()
+-                                        .map(|t| servo_media_player::append::AppendTrack {
+-                                            id: t.id,
+-                                            mime: t.mime.to_owned(),
+-                                        })
+-                                        .collect(),
+-                                )
+-                            })
+-                            .collect();
+                         let ready = status.all_buffers_ready && status.current_data;
+                         if status.all_buffers_ready
+                             && (!old_initialized
+@@ -365,6 +376,9 @@
+                             );
+                             let changed = {
+                                 let mut s = shared.lock().unwrap();
++                                if status.removal_generation < s.removal_generation {
++                                    return;
++                                }
+                                 let changed = s.readiness != Some(readiness);
+                                 s.readiness = Some(readiness);
+                                 changed
+@@ -373,12 +387,6 @@
+                                 send(PlayerEvent::AppendReadiness(readiness));
+                             }
+                         }
+-                        let duration_changed = shared.lock().unwrap().apply_duration_status(
+-                            status.duration_generation,
+-                            status.duration_seconds,
+-                            status.duration_us,
+-                            status.all_buffers_ready,
+-                        );
+                         if duration_changed {
+                             send(PlayerEvent::AppendDurationChanged {
+                                 generation: status.duration_generation,
+@@ -396,6 +404,9 @@
+                         if status.finished {
+                             {
+                                 let mut s = shared.lock().unwrap();
++                                if status.removal_generation < s.removal_generation {
++                                    return;
++                                }
+                                 s.paused = true;
+                                 s.output_ended = true;
+                                 s.pending_seek = None;
+@@ -542,6 +553,24 @@
+     }
+     fn seek(&self, _: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
++    }
++    fn append_remove_buffer(&self, id: u32) -> Result<(), PlayerError> {
++        let mut s = self.state.lock().unwrap();
++        if s.stopped || !s.buffers.contains_key(&id) {
++            return Err(error());
++        }
++        let generation = s.removal_generation.checked_add(1).ok_or_else(error)?;
++        self.command(Command::RemoveBuffer(id))?;
++        s.removal_generation = generation;
++        s.buffers.remove(&id);
++        s.buffer_ranges.remove(&id);
++        s.buffer_tracks.remove(&id);
++        s.timestamp_offsets.remove(&id);
++        s.parsing_media_segments.remove(&id);
++        s.pending_parser_resets.remove(&id);
++        s.buffered.clear();
++        s.readiness = None;
++        Ok(())
+     }
+     fn append_set_duration(&self, requested: f64) -> Result<(f64, u64), PlayerError> {
+         let mut s = self.state.lock().unwrap();
+@@ -1615,4 +1644,47 @@
+         );
+         assert_eq!(p.state.lock().unwrap().duration_generation, 1);
+     }
++    #[test]
++    fn remove_buffer_queue_rejection_preserves_identity_callbacks_and_pending_seek() {
++        let p = AndroidAppendPlayer::new(
++            96,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut s = p.state.lock().unwrap();
++            s.buffers.insert(
++                1,
++                BufferState {
++                    ready: false,
++                    updating: true,
++                    removing: false,
++                    operation: 42,
++                    callback: Arc::new(|_| {}),
++                },
++            );
++            s.pending_seek = Some(99);
++            s.buffer_ranges.insert(1, vec![0.0..1.0]);
++        }
++        assert_eq!(p.append_remove_buffer(1), Err(PlayerError::EnoughData));
++        {
++            let s = p.state.lock().unwrap();
++            assert_eq!(s.buffers[&1].operation, 42);
++            assert!(s.buffers[&1].updating);
++            assert_eq!(s.pending_seek, Some(99));
++            assert_eq!(s.buffer_ranges[&1], [0.0..1.0]);
++        }
++        rx.recv().unwrap();
++        assert_eq!(p.append_remove_buffer(1), Ok(()));
++        let s = p.state.lock().unwrap();
++        assert!(!s.buffers.contains_key(&1));
++        assert!(!s.buffer_ranges.contains_key(&1));
++        assert_eq!(s.pending_seek, Some(99));
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -583,3 +583,24 @@
+         assert_eq!(source.set_duration(1.0), Err(SourceError::InvalidState));
+     }
+ }
++
++#[cfg(test)] mod private_buffer_removal_tests {
++ use crate::{append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ fn source()->(AppendSource,mpsc::Receiver<SourceEvent>) {
++  let(tx,rx)=mpsc::channel();let s=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));
++  s.attach(AndroidAppendPlayer::new(95,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap()).unwrap();(s,rx)
++ }
++ #[test] fn removing_controller_buffer_invalidates_old_identity_and_other_source_cannot_remove_it() {
++  let(s,rx)=source();let b=s.add_buffer("video/mp4").unwrap();loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,1)){break;}}
++  let(other,_)=source();assert_eq!(other.remove_buffer(&b),Err(SourceError::InvalidState));assert_eq!(s.buffers().len(),1);
++  s.remove_buffer(&b).unwrap();assert!(s.buffers().is_empty());assert!(b.buffered().is_empty());assert_eq!(b.append(vec![]),Err(SourceError::InvalidState));assert_eq!(s.remove_buffer(&b),Err(SourceError::InvalidState));
++  let next=s.add_buffer("video/mp4").unwrap();assert_ne!(next.id(),b.id());assert!(!next.same_buffer(&b));s.detach();
++ }
++ #[test] fn removing_unready_or_updating_buffer_drops_late_callbacks_without_resurrecting_it() {
++  let(s,rx)=source();let b=s.add_buffer("video/mp4").unwrap();s.remove_buffer(&b).unwrap();assert!(s.buffers().is_empty());
++  let next=s.add_buffer("video/mp4").unwrap();loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(id,AppendEvent::Ready,_ )if id==next.id()){break;}}
++  next.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();s.remove_buffer(&next).unwrap();assert!(s.buffers().is_empty());assert_eq!(next.append(vec![]),Err(SourceError::InvalidState));s.detach();
++ }
++}
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -101,6 +101,7 @@
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_remove_buffer(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
