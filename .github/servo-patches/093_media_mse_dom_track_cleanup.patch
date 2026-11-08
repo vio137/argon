@@ -1,7 +1,61 @@
+diff --git a/components/script/dom/audio/audiotrack.rs b/components/script/dom/audio/audiotrack.rs
+index 842ae517b..d09ca93f4 100644
+--- a/components/script/dom/audio/audiotrack.rs
++++ b/components/script/dom/audio/audiotrack.rs
+@@ -23,6 +23,7 @@ pub(crate) struct AudioTrack {
+     label: TracedDOMString,
+     language: TracedDOMString,
+     enabled: Cell<bool>,
++    source_buffer: MutNullableDom<crate::dom::sourcebuffer::SourceBuffer>,
+     track_list: MutNullableDom<AudioTrackList>,
+ }
+ 
+@@ -41,6 +42,7 @@ impl AudioTrack {
+             label: label.traced(),
+             language: language.traced(),
+             enabled: Cell::new(false),
++            source_buffer: MutNullableDom::new(None),
+             track_list: MutNullableDom::new(track_list),
+         }
+     }
+@@ -83,12 +85,21 @@ impl AudioTrack {
+         self.track_list.set(Some(track_list));
+     }
+ 
++    pub(crate) fn set_source_buffer(
++        &self,
++        source: Option<&crate::dom::sourcebuffer::SourceBuffer>,
++    ) {
++        self.source_buffer.set(source);
++    }
+     pub(crate) fn remove_track_list(&self) {
+         self.track_list.set(None);
+     }
+ }
+ 
+ impl AudioTrackMethods<crate::DomTypeHolder> for AudioTrack {
++    fn GetSourceBuffer(&self) -> Option<DomRoot<crate::dom::sourcebuffer::SourceBuffer>> {
++        self.source_buffer.get()
++    }
+     /// <https://html.spec.whatwg.org/multipage/#dom-audiotrack-id>
+     fn Id(&self) -> DOMString {
+         self.id()
+@@ -116,8 +127,8 @@ impl AudioTrackMethods<crate::DomTypeHolder> for AudioTrack {
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dom-audiotrack-enabled>
+     fn SetEnabled(&self, value: bool) {
+-        if let Some(list) = self.track_list.get() &&
+-            let Some(idx) = list.find(self)
++        if let Some(list) = self.track_list.get()
++            && let Some(idx) = list.find(self)
+         {
+             list.set_enabled(idx, value);
+         }
 diff --git a/components/script/dom/audio/audiotracklist.rs b/components/script/dom/audio/audiotracklist.rs
+index 7b35610f9..ca0a1b952 100644
 --- a/components/script/dom/audio/audiotracklist.rs
 +++ b/components/script/dom/audio/audiotracklist.rs
-@@ -121,6 +121,37 @@
+@@ -121,6 +121,37 @@ impl AudioTrackList {
          track.add_track_list(self);
      }
  
@@ -39,26 +93,40 @@ diff --git a/components/script/dom/audio/audiotracklist.rs b/components/script/d
      pub(crate) fn clear(&self) {
          if self.owns_tracks {
              self.tracks
-diff --git a/components/script/dom/audio/audiotrack.rs b/components/script/dom/audio/audiotrack.rs
---- a/components/script/dom/audio/audiotrack.rs
-+++ b/components/script/dom/audio/audiotrack.rs
-@@ -23,6 +23,7 @@
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 1c0fd5c8e..d4b5c68c8 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2467,6 +2467,8 @@ impl HTMLMediaElement {
+         }
+     }
+ 
++    pub(crate) fn existing_audio_tracks(&self) -> Option<DomRoot<AudioTrackList>> { self.audio_tracks_list.get() }
++    pub(crate) fn existing_video_tracks(&self) -> Option<DomRoot<VideoTrackList>> { self.video_tracks_list.get() }
+     pub(crate) fn set_audio_track(&self, idx: usize, enabled: bool) {
+         if let Some(ref player) = *self.player.borrow() &&
+             let Err(error) = player.lock().unwrap().set_audio_track(idx as i32, enabled)
+diff --git a/components/script/dom/media/videotrack.rs b/components/script/dom/media/videotrack.rs
+index 8b84387bb..ae9afa1e7 100644
+--- a/components/script/dom/media/videotrack.rs
++++ b/components/script/dom/media/videotrack.rs
+@@ -23,6 +23,7 @@ pub(crate) struct VideoTrack {
      label: TracedDOMString,
      language: TracedDOMString,
-     enabled: Cell<bool>,
+     selected: Cell<bool>,
 +    source_buffer: MutNullableDom<crate::dom::sourcebuffer::SourceBuffer>,
-     track_list: MutNullableDom<AudioTrackList>,
+     track_list: MutNullableDom<VideoTrackList>,
  }
  
-@@ -41,6 +42,7 @@
+@@ -41,6 +42,7 @@ impl VideoTrack {
              label: label.traced(),
              language: language.traced(),
-             enabled: Cell::new(false),
+             selected: Cell::new(false),
 +            source_buffer: MutNullableDom::new(None),
              track_list: MutNullableDom::new(track_list),
          }
      }
-@@ -83,12 +85,21 @@
+@@ -83,12 +85,21 @@ impl VideoTrack {
          self.track_list.set(Some(track_list));
      }
  
@@ -73,40 +141,29 @@ diff --git a/components/script/dom/audio/audiotrack.rs b/components/script/dom/a
      }
  }
  
- impl AudioTrackMethods<crate::DomTypeHolder> for AudioTrack {
+ impl VideoTrackMethods<crate::DomTypeHolder> for VideoTrack {
 +    fn GetSourceBuffer(&self) -> Option<DomRoot<crate::dom::sourcebuffer::SourceBuffer>> {
 +        self.source_buffer.get()
 +    }
-     /// <https://html.spec.whatwg.org/multipage/#dom-audiotrack-id>
+     /// <https://html.spec.whatwg.org/multipage/#dom-videotrack-id>
      fn Id(&self) -> DOMString {
          self.id()
-@@ -116,8 +127,8 @@
+@@ -116,8 +127,8 @@ impl VideoTrackMethods<crate::DomTypeHolder> for VideoTrack {
  
-     /// <https://html.spec.whatwg.org/multipage/#dom-audiotrack-enabled>
-     fn SetEnabled(&self, value: bool) {
+     /// <https://html.spec.whatwg.org/multipage/#dom-videotrack-selected>
+     fn SetSelected(&self, value: bool) {
 -        if let Some(list) = self.track_list.get() &&
 -            let Some(idx) = list.find(self)
 +        if let Some(list) = self.track_list.get()
 +            && let Some(idx) = list.find(self)
          {
-             list.set_enabled(idx, value);
+             list.set_selected(idx, value);
          }
-diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
---- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
-+++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
-@@ -2467,6 +2467,8 @@
-         }
-     }
- 
-+    pub(crate) fn existing_audio_tracks(&self) -> Option<DomRoot<AudioTrackList>> { self.audio_tracks_list.get() }
-+    pub(crate) fn existing_video_tracks(&self) -> Option<DomRoot<VideoTrackList>> { self.video_tracks_list.get() }
-     pub(crate) fn set_audio_track(&self, idx: usize, enabled: bool) {
-         if let Some(ref player) = *self.player.borrow() &&
-             let Err(error) = player.lock().unwrap().set_audio_track(idx as i32, enabled)
 diff --git a/components/script/dom/media/videotracklist.rs b/components/script/dom/media/videotracklist.rs
+index 65f0bc57f..b1ff40bd2 100644
 --- a/components/script/dom/media/videotracklist.rs
 +++ b/components/script/dom/media/videotracklist.rs
-@@ -129,6 +129,37 @@
+@@ -129,6 +129,37 @@ impl VideoTrackList {
          track.add_track_list(self);
      }
  
@@ -144,62 +201,11 @@ diff --git a/components/script/dom/media/videotracklist.rs b/components/script/d
      pub(crate) fn clear(&self) {
          if self.owns_tracks {
              self.tracks
-diff --git a/components/script/dom/media/videotrack.rs b/components/script/dom/media/videotrack.rs
---- a/components/script/dom/media/videotrack.rs
-+++ b/components/script/dom/media/videotrack.rs
-@@ -23,6 +23,7 @@
-     label: TracedDOMString,
-     language: TracedDOMString,
-     selected: Cell<bool>,
-+    source_buffer: MutNullableDom<crate::dom::sourcebuffer::SourceBuffer>,
-     track_list: MutNullableDom<VideoTrackList>,
- }
- 
-@@ -41,6 +42,7 @@
-             label: label.traced(),
-             language: language.traced(),
-             selected: Cell::new(false),
-+            source_buffer: MutNullableDom::new(None),
-             track_list: MutNullableDom::new(track_list),
-         }
-     }
-@@ -83,12 +85,21 @@
-         self.track_list.set(Some(track_list));
-     }
- 
-+    pub(crate) fn set_source_buffer(
-+        &self,
-+        source: Option<&crate::dom::sourcebuffer::SourceBuffer>,
-+    ) {
-+        self.source_buffer.set(source);
-+    }
-     pub(crate) fn remove_track_list(&self) {
-         self.track_list.set(None);
-     }
- }
- 
- impl VideoTrackMethods<crate::DomTypeHolder> for VideoTrack {
-+    fn GetSourceBuffer(&self) -> Option<DomRoot<crate::dom::sourcebuffer::SourceBuffer>> {
-+        self.source_buffer.get()
-+    }
-     /// <https://html.spec.whatwg.org/multipage/#dom-videotrack-id>
-     fn Id(&self) -> DOMString {
-         self.id()
-@@ -116,8 +127,8 @@
- 
-     /// <https://html.spec.whatwg.org/multipage/#dom-videotrack-selected>
-     fn SetSelected(&self, value: bool) {
--        if let Some(list) = self.track_list.get() &&
--            let Some(idx) = list.find(self)
-+        if let Some(list) = self.track_list.get()
-+            && let Some(idx) = list.find(self)
-         {
-             list.set_selected(idx, value);
-         }
 diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+index fd3fe3c33..3428a75c6 100644
 --- a/components/script/dom/mse/sourcebuffer.rs
 +++ b/components/script/dom/mse/sourcebuffer.rs
-@@ -127,6 +127,7 @@
+@@ -127,6 +127,7 @@ impl SourceBuffer {
              return false;
          }
          if let Some(track) = audio {
@@ -207,7 +213,7 @@ diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/m
              let list = self.AudioTracks(cx);
              list.add_shared(&track);
              let event = TrackEvent::new(
-@@ -142,6 +143,7 @@
+@@ -142,6 +143,7 @@ impl SourceBuffer {
              self.global().task_manager().media_element_task_source().queue(task!(append_audio_track_added:move|cx| {event.root().upcast::<Event>().fire(cx,list.root().upcast::<EventTarget>());}));
          }
          if let Some(track) = video {
@@ -215,7 +221,7 @@ diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/m
              let list = self.VideoTracks(cx);
              list.add_shared(&track);
              let event = TrackEvent::new(
-@@ -159,7 +161,66 @@
+@@ -159,7 +161,66 @@ impl SourceBuffer {
          self.tracks_synced.set(true);
          true
      }
@@ -235,7 +241,7 @@ diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/m
 +                .task_manager()
 +                .media_element_task_source()
 +                .queue(task!(removed_source_buffer_updateend: move |cx| {
-+                    this.root().upcast::<EventTarget>().fire_event(cx, atom!("updateend"));
++                    this.root().upcast::<EventTarget>().fire_event(cx, stylo_atoms::Atom::from("updateend"));
 +                }));
 +        }
 +        self.removing.set(false);
@@ -282,24 +288,26 @@ diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/m
          self.updating.set(false);
          self.removing.set(false);
      }
-diff --git a/components/script_bindings/webidls/VideoTrack.webidl b/components/script_bindings/webidls/VideoTrack.webidl
---- a/components/script_bindings/webidls/VideoTrack.webidl
-+++ b/components/script_bindings/webidls/VideoTrack.webidl
-@@ -6,6 +6,7 @@
- 
- [Exposed=Window]
- interface VideoTrack {
-+  [Pref="dom_media_source_extensions_enabled"] readonly attribute SourceBuffer? sourceBuffer;
-   readonly attribute DOMString id;
-   readonly attribute DOMString kind;
-   readonly attribute DOMString label;
 diff --git a/components/script_bindings/webidls/AudioTrack.webidl b/components/script_bindings/webidls/AudioTrack.webidl
+index 2fa2ec9a5..cfde68578 100644
 --- a/components/script_bindings/webidls/AudioTrack.webidl
 +++ b/components/script_bindings/webidls/AudioTrack.webidl
 @@ -6,6 +6,7 @@
  
  [Exposed=Window]
  interface AudioTrack {
++  [Pref="dom_media_source_extensions_enabled"] readonly attribute SourceBuffer? sourceBuffer;
+   readonly attribute DOMString id;
+   readonly attribute DOMString kind;
+   readonly attribute DOMString label;
+diff --git a/components/script_bindings/webidls/VideoTrack.webidl b/components/script_bindings/webidls/VideoTrack.webidl
+index 90d6c487e..c56754253 100644
+--- a/components/script_bindings/webidls/VideoTrack.webidl
++++ b/components/script_bindings/webidls/VideoTrack.webidl
+@@ -6,6 +6,7 @@
+ 
+ [Exposed=Window]
+ interface VideoTrack {
 +  [Pref="dom_media_source_extensions_enabled"] readonly attribute SourceBuffer? sourceBuffer;
    readonly attribute DOMString id;
    readonly attribute DOMString kind;
