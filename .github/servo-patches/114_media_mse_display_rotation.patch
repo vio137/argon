@@ -1,0 +1,494 @@
+diff --git a/components/media/backends/android/android_impl/mse_codec.rs b/components/media/backends/android/android_impl/mse_codec.rs
+--- a/components/media/backends/android/android_impl/mse_codec.rs
++++ b/components/media/backends/android/android_impl/mse_codec.rs
+@@ -43,6 +43,9 @@
+         if !self.codec.is_null() {
+             return Err(());
+         } // No uncoordinated format replacement.
++        if !matches!(c.rotation_degrees, 0 | 90 | 180 | 270) {
++            return Err(());
++        }
+         if c.csd0.is_empty() || c.csd0.len() > 64 * 1024 || c.csd1.len() > 64 * 1024 {
+             return Err(());
+         }
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -62,7 +62,7 @@
+     }
+     /// Acquisition is retried on later worker ticks, not assumed synchronous
+     /// with releaseOutputBuffer. Exactly one surface frame is outstanding.
+-    fn acquire(&self, standard: Option<i32>, range: Option<i32>) -> Result<Option<VideoFrame>, ()> {
++    fn acquire(&self, standard: Option<i32>, range: Option<i32>, rotation: i32) -> Result<Option<VideoFrame>, ()> {
+         let mut image = ptr::null_mut();
+         let status = unsafe { sys::AImageReader_acquireLatestImage(self.reader, &mut image) };
+         if status == sys::AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE {
+@@ -166,7 +166,10 @@
+         )
+         .ok_or(())?;
+         let (width, height) = (crop.right - crop.left, crop.bottom - crop.top);
+-        let (w, h) = (width as usize, height as usize);
++        let color_height = height;
++        let (packed, w, h) = crate::rotate::rotate_i420(
++            &packed, width as usize, height as usize, rotation).ok_or(())?;
++        let (width, height) = (w as i32, h as i32);
+         let (cw, ch) = (w / 2, h / 2);
+         let planar = YuvPlanarImage {
+             width: width as u32,
+@@ -179,7 +182,7 @@
+             v_plane: &packed[w * h + cw * ch..],
+         };
+         let mut bgra = vec![0; w * h * 4];
+-        let (matrix, range) = color::select(height, standard, range);
++        let (matrix, range) = color::select(color_height, standard, range);
+         yuv420_to_bgra(
+             &planar,
+             &mut bgra,
+@@ -250,7 +253,8 @@
+     }
+ }
+ fn same_configuration(a: &DecoderConfig, b: &DecoderConfig) -> bool {
+-    a.mime == b.mime
++    a.rotation_degrees == b.rotation_degrees
++        && a.mime == b.mime
+         && a.width == b.width
+         && a.height == b.height
+         && a.sample_rate == b.sample_rate
+@@ -301,13 +305,7 @@
+ 
+     fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()> {
+         if let Some(old) = self.configs.get(&config.track_id) {
+-            return if old.mime == config.mime
+-                && old.width == config.width
+-                && old.height == config.height
+-                && old.sample_rate == config.sample_rate
+-                && old.channels == config.channels
+-                && old.csd0 == config.csd0
+-                && old.csd1 == config.csd1
++            return if same_configuration(old, config)
+             {
+                 Ok(())
+             } else {
+@@ -341,7 +339,7 @@
+                 i32::from(config.height),
+             )?);
+             self.surface = Some(surface.clone());
+-            self.video_size = Some((config.width, config.height));
++            self.video_size = Some(crate::rotate::display_size(config.width, config.height, config.rotation_degrees));
+             Some(surface)
+         } else {
+             None
+@@ -1243,7 +1241,7 @@
+                     .values()
+                     .flat_map(|s| s.descriptions())
+                     .find(|d| d.mime == "video/avc")
+-                    .map(|d| (d.width, d.height))
++                    .map(|d| crate::rotate::display_size(d.width, d.height, d.rotation_degrees))
+             }),
+             has_audio: self
+                 .sessions
+@@ -1483,7 +1481,10 @@
+                     .surface
+                     .as_ref()
+                     .ok_or(())?
+-                    .acquire(self.video_color.0, self.video_color.1)?
++                    .acquire(self.video_color.0, self.video_color.1,
++                        self.decoders.video.as_ref()
++                            .and_then(|(id, _)| self.decoders.configs.get(id))
++                            .ok_or(())?.rotation_degrees)?
+                 {
+                     self.decoders.video_size =
+                         Some((frame.get_width() as u16, frame.get_height() as u16));
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1,6 +1,8 @@
+ use super::*;
+ use std::cell::Cell;
+ thread_local! { static READY: Cell<bool> = const { Cell::new(false) }; static DELETED: Cell<u32> = const { Cell::new(0) }; }
++thread_local! { static PATTERN: Cell<bool> = const { Cell::new(false) }; }
++static Y_PATTERN: [u8; 32] = [16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,220,200];
+ static Y: [u8; 32] = [41; 32];
+ static U: [u8; 8] = [240; 8];
+ static V: [u8; 8] = [110; 8];
+@@ -9,9 +11,9 @@
+     READY.with(|r| r.set(false));
+     DELETED.with(|r| r.set(0));
+     let surface = VideoSurface::new(8, 4).unwrap();
+-    assert!(surface.acquire(None, None).unwrap().is_none());
++    assert!(surface.acquire(None, None, 0).unwrap().is_none());
+     READY.with(|r| r.set(true));
+-    let frame = surface.acquire(None, None).unwrap().unwrap();
++    let frame = surface.acquire(None, None, 0).unwrap().unwrap();
+     assert_eq!((frame.get_width(), frame.get_height()), (4, 2));
+     let pixels = frame.get_data();
+     assert_eq!(pixels.len(), 32);
+@@ -52,7 +54,7 @@
+         video: None,
+         audio: None,
+     };
+-    let mut config = DecoderConfig {
++    let mut config = DecoderConfig { rotation_degrees: 0,
+         track_id: 1,
+         mime: "video/avc",
+         width: 8,
+@@ -115,7 +117,11 @@
+     READY.with(|r| r.set(false));
+     let frames = Arc::new(Mutex::new(Vec::new()));
+     let mut playback = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames.clone()))));
+-    playback.decoders.surface = Some(Rc::new(VideoSurface::new(8, 4).unwrap()));
++    playback.decoders.configure(&DecoderConfig {
++        rotation_degrees: 0,track_id:1,mime:"video/avc",width:8,height:4,
++        sample_rate:0,channels:0,csd0:vec![1],csd1:vec![2],
++    }).unwrap();
++    playback.video_done = true;
+     playback.video_pending = Some(Instant::now());
+     playback.set_playing(true).unwrap();
+     assert_eq!(playback.pump().unwrap().rendered_frames, 0);
+@@ -392,7 +398,7 @@
+     len: *mut i32,
+ ) -> i32 {
+     let data: &[u8] = match p {
+-        0 => &Y,
++        0 => if PATTERN.with(|p|p.get()) { &Y_PATTERN } else { &Y },
+         1 => &U,
+         _ => &V,
+     };
+@@ -961,7 +967,7 @@
+ fn changed_native_configuration_retries_until_old_output_is_confirmed_drained() {
+     let frames = Arc::new(Mutex::new(Vec::new()));
+     let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
+-    let config = DecoderConfig {
++    let config = DecoderConfig { rotation_degrees: 0,
+         track_id: 1,
+         mime: "video/avc",
+         width: 8,
+@@ -1042,7 +1048,7 @@
+     let frames = Arc::new(Mutex::new(Vec::new()));
+     let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
+     p.decoders
+-        .configure(&DecoderConfig {
++        .configure(&DecoderConfig { rotation_degrees: 0,
+             track_id: 1,
+             mime: "video/avc",
+             width: 8,
+@@ -1054,7 +1060,7 @@
+         })
+         .unwrap();
+     p.decoders
+-        .configure(&DecoderConfig {
++        .configure(&DecoderConfig { rotation_degrees: 0,
+             track_id: 2,
+             mime: "audio/mp4a-latm",
+             width: 0,
+@@ -1553,3 +1559,44 @@
+     );
+     assert_eq!(p.rendered_frames, 9);
+ }
++
++#[test]
++fn cropped_surface_rotation_matches_clockwise_pixels_before_renderer_handoff() {
++    PATTERN.with(|p|p.set(true));
++    let surface=VideoSurface::new(8,4).unwrap();
++    READY.with(|p|p.set(true));
++    let original=surface.acquire(None,None,0).unwrap().unwrap();
++    let src=original.get_data();
++    for angle in [0,90,180,270] {
++        READY.with(|p|p.set(true));
++        let frame=surface.acquire(None,None,angle).unwrap().unwrap();
++        let (w,h)=crate::rotate::display_size(4,2,angle);
++        assert_eq!((frame.get_width(),frame.get_height()),(w as i32,h as i32));
++        let actual=frame.get_data();
++        for y in 0..2usize {for x in 0..4usize {
++            let (ox,oy)=match angle {0=>(x,y),90=>(1-y,x),180=>(3-x,1-y),_ =>(y,3-x)};
++            assert_eq!(&actual[(oy*w as usize+ox)*4..(oy*w as usize+ox+1)*4],&src[(y*4+x)*4..(y*4+x+1)*4]);
++        }}
++        let mut ppm=format!("P6\n{w} {h}\n255\n").into_bytes();
++        for p in actual.chunks_exact(4) {ppm.extend_from_slice(&[p[2],p[1],p[0]]);}
++        std::fs::write(format!("/tmp/mse114-rotation-{angle}.ppm"),ppm).unwrap();
++    }
++    PATTERN.with(|p|p.set(false));
++}
++
++#[test]
++fn rotation_only_decoder_change_requires_old_output_drain_and_updates_size() {
++    let frames=Arc::new(Mutex::new(vec![]));
++    let mut p=AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    let config=DecoderConfig {rotation_degrees:0,track_id:1,mime:"video/avc",width:8,height:4,
++        sample_rate:0,channels:0,csd0:vec![1],csd1:vec![2]};
++    p.decoders.configure(&config).unwrap();
++    let next=DecoderConfig {rotation_degrees:90,..config.clone()};
++    assert!(!same_configuration(&config,&next));
++    assert_eq!(p.decoders.prepare_configuration(&next),Ok(false));
++    assert_eq!(p.decoders.video_size,Some((8,4)));
++    p.decoders.output_drained.insert(1);
++    assert_eq!(p.decoders.prepare_configuration(&next),Ok(true));
++    assert_eq!(p.decoders.video_size,Some((4,8)));
++    assert_eq!(p.decoders.configs[&1].rotation_degrees,90);
++}
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -180,7 +180,7 @@
+     };
+     let mut b = DecoderBridge::new(1024);
+     b.reset();
+-    let u = AccessUnit {
++    let u = AccessUnit { rotation_degrees: 0,
+         track_id: 1,
+         dts_us: 0,
+         pts_us: 0,
+@@ -373,7 +373,7 @@
+ #[test]
+ fn frame_store_intersects_tracks_and_replay_starts_at_random_access() {
+     use servo_media_android_hosttest::mse_demux::{timeline::FrameStore,AccessUnit};
+-    let frame=|track,t,key|AccessUnit {track_id:track,dts_us:t,pts_us:t,duration_us:10,keyframe:key,codec_config:None,data:vec![1]};
++    let frame=|track,t,key|AccessUnit { rotation_degrees: 0,track_id:track,dts_us:t,pts_us:t,duration_us:10,keyframe:key,codec_config:None,data:vec![1]};
+     let mut store=FrameStore::new(128);
+     store.append(vec![frame(1,0,true),frame(1,10,false),frame(1,20,true),frame(2,10,true),frame(2,20,true)],0,0..100).unwrap();
+     assert_eq!(store.buffered(),vec![10..30]);
+@@ -448,7 +448,7 @@
+ fn a_known_empty_track_prevents_false_muxed_buffer_coverage() {
+     use servo_media_android_hosttest::mse_demux::{timeline::FrameStore,AccessUnit};
+     let mut store=FrameStore::new(128);store.register_track(1).unwrap();store.register_track(2).unwrap();
+-    store.append(vec![AccessUnit{track_id:1,dts_us:0,pts_us:0,duration_us:10,keyframe:true,codec_config:None,data:vec![1]}],0,0..100).unwrap();
++    store.append(vec![AccessUnit{ rotation_degrees: 0,track_id:1,dts_us:0,pts_us:0,duration_us:10,keyframe:true,codec_config:None,data:vec![1]}],0,0..100).unwrap();
+     assert_eq!(store.ranges(1),vec![0..10]);assert!(store.buffered().is_empty());
+ }
+ 
+@@ -524,7 +524,7 @@
+ }
+ #[test] fn failed_seek_preserves_queued_delivery_and_rejects_unbuffered_gaps() {
+     use servo_media_android_hosttest::mse_demux::{timeline::FrameStore,AccessUnit,session::AppendSession,delivery::CodecInput,bridge::DecoderConfig};
+-    let f=|t|AccessUnit{track_id:1,dts_us:t,pts_us:t,duration_us:10,keyframe:true,codec_config:None,data:vec![1]};
++    let f=|t|AccessUnit{ rotation_degrees: 0,track_id:1,dts_us:t,pts_us:t,duration_us:10,keyframe:true,codec_config:None,data:vec![1]};
+     let mut store=FrameStore::new(128);assert!(store.replay_from(0).is_err());
+     store.append(vec![f(0),f(30)],0,0..100).unwrap();assert!(store.replay_from(20).is_err());assert!(store.replay_from(40).is_err());assert!(store.replay_from(30).is_ok());
+     struct Sink(usize);impl CodecInput for Sink {fn configure(&mut self,_:&DecoderConfig)->Result<(),()>{Ok(())}fn submit(&mut self,_:u32,_:&[u8],_:i64)->Result<bool,()>{self.0+=1;Ok(true)}}
+@@ -709,3 +709,33 @@
+  let mut s=AppendSession::new(1<<20,100);s.append(&init).unwrap();s.append(&media[..8]).unwrap();assert!(s.parsing_media_segment());
+  s.change_type().unwrap();assert!(!s.parsing_media_segment());s.append(&init[..8]).unwrap();s.abort_append().unwrap();assert!(s.append(&media).is_err());
+ }
++
++#[test]
++fn init_display_matrix_reaches_decoder_and_retains_each_rotation_epoch_during_seek() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoovBox};
++ use servo_media_android_hosttest::mse_demux::{session::AppendSession,delivery::CodecInput,bridge::DecoderConfig};
++ struct Sink(Vec<i32>);
++ impl CodecInput for Sink {
++  fn configure(&mut self,c:&DecoderConfig)->Result<(),()>{self.0.push(c.rotation_degrees);Ok(())}
++  fn submit(&mut self,_:u32,_:&[u8],_:i64)->Result<bool,()>{Ok(true)}
++ }
++ let transformed=|matrix:[i32;9]| {
++  let mut data=vec![];
++  for b in boxes(){if &b[4..8]==b"moov" {
++   let(mut moov,_)=MoovBox::decode(&b).unwrap();moov.trak_boxes[0].tkhd_box.matrix=matrix;
++   data.extend(moov.encode_to_vec().unwrap());
++  }else{data.extend(b);}}
++  data
++ };
++ let rotated=transformed([0,65536,0,-65536,0,0,32*65536,0,0x40000000]);
++ let mut d=Demux::new(1<<20,100);d.init(&rotated).unwrap();assert_eq!(d.descriptions()[0].rotation_degrees,90);
++ let mut s=AppendSession::new(1<<20,100);s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();
++ s.set_append_options(1_000_000,0..i64::MAX).unwrap();s.append(&rotated).unwrap();
++ let mut sink=Sink(vec![]);while s.pump_input(&mut sink).unwrap(){}assert_eq!(sink.0,[0,90]);
++ s.prepare_seek(0).unwrap();let mut sink=Sink(vec![]);while s.pump_input(&mut sink).unwrap(){}assert_eq!(sink.0,[0,90]);
++ s.prepare_seek(1_500_000).unwrap();let mut sink=Sink(vec![]);while s.pump_input(&mut sink).unwrap(){}assert_eq!(sink.0,[90]);
++ let old=d.descriptions().to_vec();
++ for matrix in [[65536,0,0,0,-65536,0,0,0,0x40000000],[131072,0,0,0,65536,0,0,0,0x40000000],[65536,0,1,0,65536,0,0,0,0x40000000]] {
++  assert!(d.init(&transformed(matrix)).is_err());assert_eq!(d.descriptions(),old);
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/bridge.rs b/components/media/backends/android/mse_demux/bridge.rs
+--- a/components/media/backends/android/mse_demux/bridge.rs
++++ b/components/media/backends/android/mse_demux/bridge.rs
+@@ -14,6 +14,7 @@
+ }
+ #[derive(Clone)]
+ pub struct DecoderConfig {
++    pub rotation_degrees: i32,
+     pub track_id: u32,
+     pub mime: &'static str,
+     pub width: u16,
+@@ -75,6 +76,7 @@
+                 _ => BridgeError::InvalidSample,
+             })?;
+         let update = replacement.as_ref().map(|c| DecoderConfig {
++            rotation_degrees: unit.rotation_degrees,
+             track_id: unit.track_id,
+             mime: "video/avc",
+             width: c.width,
+@@ -128,6 +130,7 @@
+                 return Err(BridgeError::UnsupportedConfiguration);
+             }
+             Some(DecoderConfig {
++                rotation_degrees: 0,
+                 track_id: unit.track_id,
+                 mime: "audio/mp4a-latm",
+                 width: 0,
+diff --git a/components/media/backends/android/mse_demux/delivery.rs b/components/media/backends/android/mse_demux/delivery.rs
+--- a/components/media/backends/android/mse_demux/delivery.rs
++++ b/components/media/backends/android/mse_demux/delivery.rs
+@@ -146,7 +146,7 @@
+             pts_us: 3,
+             keyframe: true,
+             bytes: vec![1, 2],
+-            config: Some(DecoderConfig {
++            config: Some(DecoderConfig { rotation_degrees: 0,
+                 track_id: 1,
+                 mime: "video/avc",
+                 width: 32,
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -238,6 +238,7 @@
+ }
+ #[derive(Debug, Clone)]
+ pub struct AccessUnit {
++    pub rotation_degrees: i32,
+     pub track_id: u32,
+     pub dts_us: i64,
+     pub pts_us: i64,
+@@ -248,6 +249,7 @@
+ }
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct TrackDescription {
++    pub rotation_degrees: i32,
+     pub id: u32,
+     pub mime: &'static str,
+     pub width: u16,
+@@ -286,6 +288,9 @@
+             .find(|b| b.0 == *b"moov")
+             .ok_or(Error::InvalidBox)?;
+         let (moov, _) = MoovBox::decode(&data[moov.1.clone()]).map_err(|_| Error::Demux)?;
++        if moov.mvhd_box.matrix != shiguredo_mp4::boxes::TkhdBox::DEFAULT_MATRIX {
++            return Err(Error::UnsupportedLayout);
++        }
+         let mut descriptions = vec![];
+         for track in &moov.trak_boxes {
+             let entries = &track.mdia_box.minf_box.stbl_box.stsd_box.entries;
+@@ -297,6 +302,8 @@
+             {
+                 return Err(Error::UnsupportedLayout);
+             }
++            let rotation = crate::rotate::mp4_rotation(track.tkhd_box.matrix)
++                .ok_or(Error::UnsupportedLayout)?;
+             let description = match &entries[0] {
+                 SampleEntry::Avc1(_) => {
+                     let config = avc::AvcConfig::from_entry(&entries[0], self.max_bytes)
+@@ -304,6 +311,7 @@
+                     TrackDescription {
+                         id: track.tkhd_box.track_id,
+                         mime: "video/avc",
++                        rotation_degrees: rotation,
+                         width: config.width,
+                         height: config.height,
+                         sample_rate: 0,
+@@ -329,6 +337,7 @@
+                     TrackDescription {
+                         id: track.tkhd_box.track_id,
+                         mime: "audio/mp4a-latm",
++                        rotation_degrees: 0,
+                         width: 0,
+                         height: 0,
+                         sample_rate: u32::from(entry.audio.samplerate.integer),
+@@ -477,7 +486,11 @@
+             let scale = s.track.timescale.get();
+             let dts = i128::from(s.timestamp);
+             let pts = dts + i128::from(s.composition_time_offset.unwrap_or(0));
++            let rotation_degrees = self.descriptions.iter()
++                .find(|track| track.id == s.track.track_id)
++                .ok_or(Error::InvalidSample)?.rotation_degrees;
+             output.push(AccessUnit {
++                rotation_degrees,
+                 track_id: s.track.track_id,
+                 dts_us: micros(dts, scale)?,
+                 pts_us: micros(pts, scale)?,
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -8,6 +8,7 @@
+ };
+ #[derive(Clone)]
+ struct ConfigEpoch {
++    rotation_degrees: i32,
+     entry: SampleEntry,
+     bytes: usize,
+ }
+@@ -168,7 +169,7 @@
+                 let changed = self
+                     .configs
+                     .get(&track)
+-                    .is_none_or(|old| old.entry != entry);
++                    .is_none_or(|old| old.entry != entry || old.rotation_degrees != frame.rotation_degrees);
+                 if changed {
+                     // Configuration changes start a new dependency chain. Native
+                     // replacement still requires the owner to drain/reset output.
+@@ -180,7 +181,7 @@
+                     let mut encoded = vec![0; self.limit.min(64 * 1024)];
+                     let bytes = entry.encode(&mut encoded).map_err(|_| StoreError::Quota)?;
+                     self.configs
+-                        .insert(track, Arc::new(ConfigEpoch { entry, bytes }));
++                        .insert(track, Arc::new(ConfigEpoch { entry, bytes, rotation_degrees: frame.rotation_degrees }));
+                     self.need_random_access.insert(track);
+                 }
+             }
+@@ -491,7 +492,7 @@
+ mod tests {
+     use super::*;
+     fn f(t: i64, key: bool) -> AccessUnit {
+-        AccessUnit {
++        AccessUnit { rotation_degrees: 0,
+             track_id: 1,
+             dts_us: t,
+             pts_us: t,
+diff --git a/components/media/backends/android/rotate.rs b/components/media/backends/android/rotate.rs
+--- a/components/media/backends/android/rotate.rs
++++ b/components/media/backends/android/rotate.rs
+@@ -9,6 +9,27 @@
+ //!
+ //! Input/output are tightly packed I420 (Y plane w*h, then U and V planes at
+ //! half resolution), which is exactly what yuv_pack::pack_i420 produces.
++
++/// Extract a normalized clockwise right-angle transform from an ISO BMFF
++/// row-vector display matrix. Translation only positions the transformed
++/// bounding box and is removed when producing a standalone video frame.
++/// Scaling, reflection and perspective require a different rendering path.
++pub fn mp4_rotation(matrix: [i32; 9]) -> Option<i32> {
++    if matrix[2] != 0 || matrix[5] != 0 || matrix[8] != 0x40000000 {
++        return None;
++    }
++    match (matrix[0], matrix[1], matrix[3], matrix[4]) {
++        (65536, 0, 0, 65536) => Some(0),
++        (0, 65536, -65536, 0) => Some(90),
++        (-65536, 0, 0, -65536) => Some(180),
++        (0, -65536, 65536, 0) => Some(270),
++        _ => None,
++    }
++}
++
++pub fn display_size(width: u16, height: u16, rotation: i32) -> (u16, u16) {
++    if rotation == 90 || rotation == 270 { (height, width) } else { (width, height) }
++}
+ 
+ /// Rotate a packed I420 frame by `degrees` (must be a multiple of 90).
+ /// Returns (buffer, out_width, out_height); 90/270 swap the dimensions.
+@@ -185,3 +206,18 @@
+         assert_eq!(twice, direct);
+     }
+ }
++
++#[cfg(test)]
++mod matrix_tests {
++    use super::*;
++    #[test]
++    fn fixed_point_display_matrices_accept_only_right_angle_rotation() {
++        for (linear,angle) in [([65536,0,0,65536],0),([0,65536,-65536,0],90),([-65536,0,0,-65536],180),([0,-65536,65536,0],270)] {
++            let m=[linear[0],linear[1],0,linear[2],linear[3],0,123,456,0x40000000];
++            assert_eq!(mp4_rotation(m),Some(angle));
++        }
++        for m in [[65536,0,0,0,-65536,0,0,0,0x40000000],[65536,0,1,0,65536,0,0,0,0x40000000],[65536,0,0,0,65536,0,0,0,0]] {
++            assert_eq!(mp4_rotation(m),None);
++        }
++    }
++}
