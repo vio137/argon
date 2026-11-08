@@ -1,0 +1,77 @@
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -312,6 +312,21 @@
+         (self.0.callback)(SourceEvent::Open);
+         Ok(())
+     }
++    /// Terminal network/decode failure, not a clean EOS. Do not drain or
++    /// shorten duration to the final buffered frame. The DOM owns error kind.
++    pub fn fail_input(&self) -> Result<(), SourceError> {
++        let (player, epoch) = {
++            let s = self.0.state.lock().unwrap();
++            if s.state != SourceState::Open || s.buffers.values().any(|b| b.updating) {
++                return Err(SourceError::InvalidState);
++            }
++            (s.player.clone().ok_or(SourceError::InvalidState)?, s.epoch)
++        };
++        player.lock().unwrap().stop().map_err(|_| SourceError::Backend)?;
++        self.0.state.lock().unwrap().commit_end_input(epoch)?;
++        (self.0.callback)(SourceEvent::Ended);
++        Ok(())
++    }
+     pub fn end_input(&self) -> Result<(), SourceError> {
+         let (player, epoch) = {
+             let s = self.0.state.lock().unwrap();
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -630,3 +630,48 @@
+  loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){PlayerEvent::AppendEpoch{generation:0,selection_generation:1,event}=>{assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}|PlayerEvent::EndOfStream));break;},PlayerEvent::Error(e)=>panic!("{e}"),_=>()}}
+  player.lock().unwrap().stop().unwrap();
+ }
++
++#[test]
++fn input_failure_stops_player_without_success_eos_and_ends_source_once() {
++    use crate::{append_source::*, Player, PlayerEvent, generic_channel::GenericCallback,
++        mse_player::AndroidAppendPlayer};
++    use std::{sync::{Arc,Mutex,mpsc}, time::Duration};
++    let (tx, events) = mpsc::channel();
++    let player = AndroidAppendPlayer::new(110, GenericCallback::new(move |e| {
++        if let Ok(e) = e { let _ = tx.send(e); }
++    }).unwrap(), None, Box::new(|| {})).unwrap();
++    let (tx, source_events) = mpsc::channel();
++    let source = AppendSource::new(Arc::new(move |e| { let _ = tx.send(e); }));
++    let shared: Arc<Mutex<dyn Player>> = player.clone();
++    source.attach(shared).unwrap();
++    assert_eq!(source_events.recv().unwrap(), SourceEvent::Open);
++    source.fail_input().unwrap();
++    assert_eq!(source.state(), SourceState::Ended);
++    assert!(!player.lock().unwrap().can_resume());
++    assert_eq!(source_events.recv().unwrap(), SourceEvent::Ended);
++    assert_eq!(source.fail_input(), Err(SourceError::InvalidState));
++    assert_eq!(source.reopen(), Err(SourceError::Backend));
++    assert!(source_events.try_recv().is_err());
++    while let Ok(event) = events.recv_timeout(Duration::from_millis(30)) {
++        let event = match event { PlayerEvent::AppendEpoch {event,..} => *event, other => other };
++        assert!(!matches!(event, PlayerEvent::EndOfStream | PlayerEvent::AppendDurationChanged {..}));
++    }
++}
++#[test]
++fn input_failure_requires_open_source_and_does_not_synthesize_ended() {
++    use crate::append_source::*;
++    use std::sync::{Arc,Mutex};
++    let source = AppendSource::new(Arc::new(|_| {}));
++    assert_eq!(source.fail_input(), Err(SourceError::InvalidState));
++    let calls = Arc::new(Mutex::new(0));
++    let counter = calls.clone();
++    let source = AppendSource::new(Arc::new(move |e| {
++        if e == SourceEvent::Ended { *counter.lock().unwrap() += 1; }
++    }));
++    // Actual ready player path is covered above. Closed failure must not
++    // synthesize sourceended or turn a detached source into ended.
++    source.detach();
++    assert_eq!(source.fail_input(), Err(SourceError::InvalidState));
++    assert_eq!(*calls.lock().unwrap(), 0);
++    assert_eq!(source.state(), SourceState::Closed);
++}
