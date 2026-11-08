@@ -1,0 +1,78 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -961,3 +961,35 @@
+   assert_eq!(d.media(&media).unwrap()[0].pts_us,0,"a later clear init removes its former edit offset");
+  }
+ }
++
++#[test]
++fn ambiguous_fragment_defaults_rejected_without_replacing_prior_init() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoovBox};
++ use servo_media_android_hosttest::mse_demux::Error;
++ for fixture in [include_bytes!("fixtures/synthetic-fmp4.mp4").as_slice(),include_bytes!("fixtures/synthetic-aac.mp4").as_slice()] {
++  let mut framer=BoxFramer::new(1<<20);framer.append(fixture).unwrap();let mut bs=vec![];
++  while let Some(b)=framer.pop_box().unwrap(){bs.push(b);}
++  let ftyp=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap();let bytes=bs.iter().find(|b|&b[4..8]==b"moov").unwrap();
++  let(moov,_)=MoovBox::decode(bytes).unwrap();let mut original=ftyp.clone();original.extend_from_slice(bytes);
++  for mode in 0..5 {
++   let mut bad=moov.clone();let defaults=&mut bad.mvex_box.as_mut().unwrap().trex_boxes;
++   match mode {
++    0=>{let duplicate=defaults[0].clone();defaults.push(duplicate);},
++    1=>{let mut duplicate=defaults[0].clone();duplicate.default_sample_size=999;defaults.push(duplicate);},
++    2=>{defaults[0].track_id=999;},
++    3=>{let mut orphan=defaults[0].clone();orphan.track_id=999;defaults.push(orphan);},
++    _=>{defaults.clear();},
++   }
++   let mut init=ftyp.clone();init.extend(bad.encode_to_vec().unwrap());
++   let mut d=Demux::new(1<<20,64);d.init(&original).unwrap();
++   assert_eq!(d.init(&init),Err(Error::UnsupportedLayout),"mode={mode}");
++   let mut baseline=Demux::new(1<<20,64);baseline.init(&original).unwrap();
++   for pair in bs.windows(2) {if &pair[0][4..8]==b"moof"&&&pair[1][4..8]==b"mdat" {
++    let mut segment=pair[0].clone();segment.extend_from_slice(&pair[1]);
++    assert_eq!(d.media_complete(&segment),Ok(true));
++    let got=d.media(&segment).unwrap();let expected=baseline.media(&segment).unwrap();
++    assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.track_id,a.pts_us,a.duration_us),(b.track_id,b.pts_us,b.duration_us));}
++   }}
++  }
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -317,8 +317,6 @@
+         }
+         validate_init(data)?;
+         // New init can update codec configuration. Swap only after successful parse.
+-        let mut next = Fmp4SegmentDemuxer::new();
+-        next.handle_init_segment(data).map_err(|_| Error::Demux)?;
+         let boxes = top_boxes(data)?;
+         let moov = boxes
+             .iter()
+@@ -417,13 +415,19 @@
+         {
+             return Err(Error::UnsupportedLayout);
+         }
+-        let defaults = moov
+-            .mvex_box
+-            .ok_or(Error::InvalidBox)?
+-            .trex_boxes
+-            .into_iter()
+-            .map(|t| (t.track_id, t.default_sample_size))
+-            .collect();
++        // The dependency chooses the first trex for a track. A map collect
++        // would silently choose the last, splitting coverage/offset defaults
++        // from actual demux. Require exactly one default per accepted track.
++        let mut defaults=std::collections::BTreeMap::new();
++        for entry in moov.mvex_box.ok_or(Error::InvalidBox)?.trex_boxes {
++            if !descriptions.iter().any(|track|track.id==entry.track_id)
++                || defaults.insert(entry.track_id,entry.default_sample_size).is_some() {
++                return Err(Error::UnsupportedLayout);
++            }
++        }
++        if defaults.len()!=descriptions.len() {return Err(Error::UnsupportedLayout);}
++        let mut next = Fmp4SegmentDemuxer::new();
++        next.handle_init_segment(data).map_err(|_| Error::Demux)?;
+         self.inner = next;
+         self.default_sizes = defaults;
+         self.descriptions = descriptions;
