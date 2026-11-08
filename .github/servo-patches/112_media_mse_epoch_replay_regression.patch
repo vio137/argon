@@ -1,0 +1,55 @@
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -675,3 +675,51 @@
+     assert_eq!(*calls.lock().unwrap(), 0);
+     assert_eq!(source.state(), SourceState::Closed);
+ }
++
++#[test]
++fn selection_epoch_replays_actual_metadata_through_production_worker_and_player() {
++    use crate::{Player, PlayerEvent, append::AppendEvent, generic_channel::GenericCallback,
++        mse_player::AndroidAppendPlayer};
++    use std::{sync::mpsc, time::{Duration,Instant}};
++    let (tx, events) = mpsc::channel();
++    let p = AndroidAppendPlayer::new(112, GenericCallback::new(move |e| {
++        if let Ok(e) = e { let _ = tx.send(e); }
++    }).unwrap(), None, Box::new(|| {})).unwrap();
++    let (tx, updates) = mpsc::channel();
++    p.lock().unwrap().append_add_buffer(1,Box::new(move |e| {let _=tx.send(e);})).unwrap();
++    assert_eq!(updates.recv_timeout(Duration::from_secs(2)).unwrap(),AppendEvent::Ready);
++    p.lock().unwrap().append_to_buffer(1,include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();
++    while updates.recv_timeout(Duration::from_secs(2)).unwrap()!=AppendEvent::UpdateEnd {}
++    let metadata = |epoch: u64| {
++        let deadline=Instant::now()+Duration::from_secs(2);
++        loop {
++            match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
++                PlayerEvent::AppendEpoch {selection_generation,event,..} if selection_generation==epoch =>
++                    match *event { PlayerEvent::MetadataUpdated(m) => break m,
++                        PlayerEvent::Error(e)=>panic!("{e}"), _=>() },
++                PlayerEvent::Error(e)=>panic!("{e}"), _=>()
++            }
++        }
++    };
++    let initial=metadata(0);
++    assert_eq!(initial.video_tracks,["video/avc"]);
++    p.lock().unwrap().set_video_track(0,false).unwrap();
++    let disabled=metadata(1);
++    assert_eq!(disabled.video_tracks,initial.video_tracks);
++    assert_eq!((disabled.width,disabled.height),(initial.width,initial.height));
++    p.lock().unwrap().set_video_track(0,true).unwrap();
++    let enabled=metadata(2);
++    assert_eq!(enabled.video_tracks,initial.video_tracks);
++    assert_eq!((enabled.width,enabled.height),(initial.width,initial.height));
++    // A repeated accepted no-op must not advance the epoch or flood metadata.
++    p.lock().unwrap().set_video_track(0,true).unwrap();
++    assert_eq!(p.lock().unwrap().append_selection_epoch(),2);
++    let deadline=Instant::now()+Duration::from_millis(50);
++    while let Ok(event)=events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
++        if let PlayerEvent::AppendEpoch {selection_generation:2,event,..}=event {
++            assert!(!matches!(*event,PlayerEvent::MetadataUpdated(_)));
++        }
++        if Instant::now()>=deadline {break;}
++    }
++    p.lock().unwrap().stop().unwrap();
++}
