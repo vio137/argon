@@ -1,0 +1,142 @@
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -123,6 +123,25 @@
+         }
+         self.pending_seek = None;
+         true
++    }
++}
++// Script may discard an already-queued snapshot after a selection/removal.
++// Replay the next accepted snapshot even when its values have not changed.
++#[derive(Clone, Copy, Default)]
++struct EventHistory {
++    epochs: Option<(u64, u64)>,
++    frames: u64,
++    metadata: (Option<(u16, u16)>, bool),
++    playing: bool,
++    ready: bool,
++    initialized: bool,
++}
++impl EventHistory {
++    fn replace(&mut self, next: Self) -> (Self, bool) {
++        let old = *self;
++        let replay = old.epochs != next.epochs;
++        *self = next;
++        (old, replay)
+     }
+ }
+ pub struct AndroidAppendPlayer {
+@@ -190,10 +209,9 @@
+         }));
+         let shared = state.clone();
+         let sender = Arc::new(Mutex::new(sender));
+-        let metadata: (Option<(u16, u16)>, bool) = (None, false);
+         // Metadata history is worker-local behind this mutex because the event
+         // callback is Fn, while Worker invokes it serially on its own thread.
+-        let history = Arc::new(Mutex::new((0u64, metadata, false, false, false)));
++        let history = Arc::new(Mutex::new(EventHistory::default()));
+         struct DiscardVideo;
+         impl VideoFrameRenderer for DiscardVideo {
+             fn render(&mut self, _: servo_media_player::video::VideoFrame) {}
+@@ -369,22 +387,18 @@
+                                 status.all_buffers_ready,
+                             )
+                         };
+-                        let (old_frames, old_metadata, old_playing, old_ready, old_initialized) = {
+-                            let mut h = history.lock().unwrap();
+-                            let old = *h;
+-                            *h = (
+-                                status.rendered_frames,
+-                                (status.video_size, status.has_audio),
+-                                status.playing,
+-                                status.all_buffers_ready && status.current_data,
+-                                status.all_buffers_ready,
+-                            );
+-                            old
+-                        };
++                        let (old, replay) = history.lock().unwrap().replace(EventHistory {
++                            epochs: Some((status.removal_generation, status.selection_generation)),
++                            frames: status.rendered_frames,
++                            metadata: (status.video_size, status.has_audio),
++                            playing: status.playing,
++                            ready: status.all_buffers_ready && status.current_data,
++                            initialized: status.all_buffers_ready,
++                        });
+                         let ready = status.all_buffers_ready && status.current_data;
+                         if status.all_buffers_ready
+-                            && (!old_initialized
+-                                || old_metadata != (status.video_size, status.has_audio))
++                            && (replay || !old.initialized
++                                || old.metadata != (status.video_size, status.has_audio))
+                         {
+                             let (width, height) = status.video_size.unwrap_or((0, 0));
+                             send(PlayerEvent::MetadataUpdated(Metadata {
+@@ -423,7 +437,7 @@
+                                 {
+                                     return;
+                                 }
+-                                let changed = s.readiness != Some(readiness);
++                                let changed = replay || s.readiness != Some(readiness);
+                                 s.readiness = Some(readiness);
+                                 changed
+                             };
+@@ -431,13 +445,13 @@
+                                 send(PlayerEvent::AppendReadiness(readiness));
+                             }
+                         }
+-                        if duration_changed {
++                        if duration_changed || (replay && status.all_buffers_ready && !status.duration_seconds.is_nan()) {
+                             send(PlayerEvent::AppendDurationChanged {
+                                 generation: status.duration_generation,
+                                 duration: status.duration_seconds,
+                             });
+                         }
+-                        if status.rendered_frames != old_frames {
++                        if status.rendered_frames != old.frames {
+                             send(PlayerEvent::VideoFrameUpdated);
+                         }
+                         send(PlayerEvent::PositionChanged(if status.finished {
+@@ -459,7 +473,7 @@
+                             }
+                             send(PlayerEvent::EndOfStream);
+                             send(PlayerEvent::StateChanged(PlaybackState::Paused));
+-                        } else if ready && (!old_ready || status.playing != old_playing) {
++                        } else if ready && (replay || !old.ready || status.playing != old.playing) {
+                             send(PlayerEvent::StateChanged(if status.playing {
+                                 PlaybackState::Playing
+                             } else {
+@@ -1960,4 +1974,33 @@
+         assert_eq!(p.append_selection_epoch(), 1);
+         assert!(rx.try_recv().is_err());
+     }
++    #[test]
++    fn selection_epoch_replays_unchanged_snapshot_after_script_may_discard_it() {
++        let snapshot = EventHistory { epochs: Some((2, 4)), frames: 7,
++            metadata: (Some((640, 360)), true), playing: true, ready: true,
++            initialized: true };
++        let mut history = EventHistory::default();
++        assert!(history.replace(snapshot).1);
++        assert!(!history.replace(snapshot).1);
++        let next = EventHistory { epochs: Some((2, 5)), ..snapshot };
++        let (old, replay) = history.replace(next);
++        assert_eq!(old.metadata, next.metadata);
++        assert!(replay);
++        assert!(!history.replace(next).1);
++    }
++    #[test]
++    fn removal_epoch_replays_once_even_with_identical_metadata_and_readiness() {
++        let snapshot = EventHistory { epochs: Some((8, 3)),
++            metadata: (None, true), ready: true, initialized: true,
++            ..EventHistory::default() };
++        let mut history = snapshot;
++        assert!(!history.replace(snapshot).1);
++        let next = EventHistory { epochs: Some((9, 3)), ..snapshot };
++        let (old, replay) = history.replace(next);
++        assert_eq!(old.ready, next.ready);
++        assert_eq!(old.metadata, next.metadata);
++        assert!(replay);
++        assert!(!history.replace(next).1);
++    }
++
+ }
