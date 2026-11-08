@@ -1,0 +1,66 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1038,3 +1038,38 @@
+   }
+  }
+ }
++
++#[test]
++fn ignored_prefixes_preserve_original_sample_bounds_with_explicit_and_implicit_runs() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoofBox};
++ use servo_media_android_hosttest::mse_demux::{Error,append::AppendStream};
++ for fixture in [include_bytes!("fixtures/synthetic-fmp4.mp4").as_slice(),include_bytes!("fixtures/synthetic-aac.mp4").as_slice()] {
++  let mut framer=BoxFramer::new(1<<20);framer.append(fixture).unwrap();let mut bs=vec![];
++  while let Some(b)=framer.pop_box().unwrap(){bs.push(b);}
++  let mut init=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap().clone();init.extend_from_slice(bs.iter().find(|b|&b[4..8]==b"moov").unwrap());
++  let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();
++  for implicit in [false,true] {
++   let(mut moof,_)=MoofBox::decode(&pair[0]).unwrap();
++   let first=moof.traf_boxes[0].trun_boxes[0].clone();let mut second=first.clone();second.data_offset=if implicit{None}else{Some(0)};
++   moof.traf_boxes[0].trun_boxes.push(second);
++   let len=moof.encode_to_vec().unwrap().len();let payload=&pair[1][8..];
++   moof.traf_boxes[0].trun_boxes[0].data_offset=Some(len as i32+8);
++   if !implicit {moof.traf_boxes[0].trun_boxes[1].data_offset=Some((len+8+payload.len())as i32);}
++   let mut plain=moof.encode_to_vec().unwrap();plain.extend_from_slice(&((8+payload.len()*2)as u32).to_be_bytes());plain.extend_from_slice(b"mdat");plain.extend_from_slice(payload);plain.extend_from_slice(payload);
++   let mut baseline=Demux::new(1<<20,64);baseline.init(&init).unwrap();let expected=baseline.media(&plain).unwrap();
++   // Multiple legal ignored boxes, including a64bit box header, must not
++   // make parser-relative offsets point into unrelated prefix bytes.
++   let mut prefix=vec![0,0,0,8,b'f',b'r',b'e',b'e',0,0,0,1,b's',b'k',b'i',b'p'];prefix.extend_from_slice(&19u64.to_be_bytes());prefix.extend_from_slice(&[5,6,7]);
++   let mut prefixed=prefix.clone();prefixed.extend_from_slice(&plain);
++   let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert_eq!(d.media_complete(&prefixed),Ok(true));let got=d.media(&prefixed).unwrap();
++   assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.pts_us,a.dts_us,a.duration_us),(b.pts_us,b.dts_us,b.duration_us));}
++   let mut stream=AppendStream::new(1<<20,64);stream.append(&init).unwrap();let mut split=vec![];
++   for chunk in prefixed.chunks(7) {split.extend(stream.append(chunk).unwrap());}
++   assert_eq!(split.iter().map(|u|&u.data).collect::<Vec<_>>(),expected.iter().map(|u|&u.data).collect::<Vec<_>>());
++   // Header bytes remain forbidden despite envelope prefix removal.
++   moof.traf_boxes[0].trun_boxes[0].data_offset=Some(0);
++   let mut bad=prefix;bad.extend(moof.encode_to_vec().unwrap());bad.extend_from_slice(&plain[len..]);
++   assert_eq!(d.media_complete(&bad),Err(Error::InvalidSample));assert!(matches!(d.media(&bad),Err(Error::InvalidSample)));
++  }
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -585,14 +585,18 @@
+         // Transactional: invalid samples must not mutate sample-entry state.
+         let mut next = self.inner.clone();
+         let samples = next
+-            .handle_media_segment(&envelope)
++            .handle_media_segment(&envelope[moof.1.start..])
+             .map_err(|_| Error::Demux)?;
+         if samples.len() > self.max_samples {
+             return Err(Error::Quota);
+         }
+         let mut output = Vec::with_capacity(samples.len());
+         for s in samples {
+-            let normalized=i64::try_from(s.data_offset).map_err(|_|Error::InvalidSample)?;
++            // The parser envelope starts at moof, but final bounds/copies
++            // always use the caller's original buffer, including its prefix.
++            let normalized=i64::try_from(s.data_offset).map_err(|_|Error::InvalidSample)?
++                .checked_add(i64::try_from(moof.1.start).map_err(|_|Error::InvalidSample)?)
++                .ok_or(Error::InvalidSample)?;
+             let start=usize::try_from(normalized.checked_sub(delta).ok_or(Error::InvalidSample)?)
+                 .map_err(|_|Error::InvalidSample)?;
+             let end = start.checked_add(s.data_size).ok_or(Error::InvalidSample)?;
