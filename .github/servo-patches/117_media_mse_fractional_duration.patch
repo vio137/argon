@@ -1,0 +1,75 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -739,3 +739,15 @@
+   assert!(d.init(&transformed(matrix)).is_err());assert_eq!(d.descriptions(),old);
+  }
+ }
++
++#[test]
++fn aac_fractional_timestamps_form_contiguous_real_sample_coverage() {
++ use servo_media_android_hosttest::mse_demux::{append::AppendStream,session::AppendSession};
++ let bytes=include_bytes!("fixtures/synthetic-aac.mp4");
++ let mut stream=AppendStream::new(1<<20,100);
++ let units=stream.append(bytes).unwrap();assert!(units.len()>3);
++ for pair in units.windows(2) {assert_eq!(pair[0].pts_us+pair[0].duration_us,pair[1].pts_us);}
++ let last=units.last().unwrap();let end=last.pts_us+last.duration_us;
++ let mut session=AppendSession::new(1<<20,100);session.append(bytes).unwrap();
++ assert_eq!(session.buffered(),[0..end]);
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -494,7 +494,7 @@
+                 track_id: s.track.track_id,
+                 dts_us: micros(dts, scale)?,
+                 pts_us: micros(pts, scale)?,
+-                duration_us: micros(i128::from(s.duration), scale)?,
++                duration_us: duration_micros(pts, i128::from(s.duration), scale)?,
+                 keyframe: s.keyframe,
+                 codec_config: s.sample_entry.cloned(),
+                 data: data[start..end].to_vec(),
+@@ -504,7 +504,19 @@
+         Ok(output)
+     }
+ }
++fn duration_micros(start: i128, duration: i128, scale: u32) -> Result<i64, Error> {
++    if duration <= 0 {return Err(Error::Timestamp);}
++    // Convert endpoints with the same quantization. Truncating duration on
++    // its own loses the fractional remainder and creates false microsecond
++    // holes between otherwise contiguous AAC/video samples.
++    let end=start.checked_add(duration).ok_or(Error::Timestamp)?;
++    let duration=micros(end,scale)?.checked_sub(micros(start,scale)?)
++        .ok_or(Error::Timestamp)?;
++    if duration<=0 {return Err(Error::Timestamp);}
++    Ok(duration)
++}
+ fn micros(value: i128, scale: u32) -> Result<i64, Error> {
++    if scale==0 {return Err(Error::Timestamp);}
+     i64::try_from(value.checked_mul(1_000_000).ok_or(Error::Timestamp)? / i128::from(scale))
+         .map_err(|_| Error::Timestamp)
+ }
+@@ -564,3 +576,23 @@
+ pub mod delivery;
+ 
+ pub mod session;
++
++#[cfg(test)]
++mod duration_quantization_tests {
++ use super::*;
++ #[test] fn fractional_sample_endpoints_join_without_artificial_gaps() {
++  for scale in [44100,48000,90000] {
++   for start in [-2048,-1024,0,1024,2048,3072,4096] {
++    let end=micros(start+1024,scale).unwrap();
++    assert_eq!(micros(start,scale).unwrap()+duration_micros(start,1024,scale).unwrap(),end);
++   }
++  }
++ }
++ #[test] fn invalid_scale_tiny_duration_and_overflow_return_errors() {
++  assert_eq!(duration_micros(0,1024,0),Err(Error::Timestamp));
++  assert_eq!(duration_micros(i128::MAX,1,1),Err(Error::Timestamp));
++  assert_eq!(duration_micros(0,0,48000),Err(Error::Timestamp));
++  assert_eq!(duration_micros(0,-1,48000),Err(Error::Timestamp));
++  assert_eq!(duration_micros(0,1,u32::MAX),Err(Error::Timestamp));
++ }
++}
