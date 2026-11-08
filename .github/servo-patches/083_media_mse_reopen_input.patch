@@ -1,0 +1,415 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 554a78706..e141c89fe 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -368,6 +368,7 @@ pub struct PumpStatus {
+ pub struct AppendPlayback {
+     sessions: BTreeMap<u32, AppendSession>,
+     input_ended: bool,
++    declared_duration_us: Option<i64>,
+     decoders: Decoders,
+     renderer: Arc<Mutex<dyn VideoFrameRenderer>>,
+     audio: AudioOutput,
+@@ -397,6 +398,7 @@ impl AppendPlayback {
+         Self {
+             sessions: BTreeMap::new(),
+             input_ended: false,
++            declared_duration_us: None,
+             decoders: Decoders {
+                 track_ids: BTreeMap::new(),
+                 next_track: 1,
+@@ -459,20 +461,16 @@ impl AppendPlayback {
+             && (!has_video || self.rendered_frames > 0)
+             && (!has_audio || self.audio.pending.is_some() || self.clock.audio_frames_written > 0)
+     }
++    fn largest_track_end(&self) -> i64 {
++        self.sessions
++            .values()
++            .flat_map(|s| s.descriptions().iter().flat_map(|t| s.ranges(t.id)))
++            .map(|r| r.end)
++            .max()
++            .unwrap_or(0)
++    }
+     fn duration_us(&self) -> Option<i64> {
+-        if !self.input_ended {
+-            return None;
+-        }
+-        // MSE endOfStream uses the largest track-buffer end, not the
+-        // intersection which can end earlier for a shorter audio/video track.
+-        Some(
+-            self.sessions
+-                .values()
+-                .flat_map(|s| s.descriptions().iter().flat_map(|t| s.ranges(t.id)))
+-                .map(|r| r.end)
+-                .max()
+-                .unwrap_or(0),
+-        )
++        self.declared_duration_us
+     }
+     fn input_exhausted(&self) -> bool {
+         self.input_ended && self.sessions.values().all(AppendSession::input_exhausted)
+@@ -533,6 +531,9 @@ impl AppendPlayback {
+         }
+         let r = session.append(bytes).map_err(|_| ());
+         self.checked(r)?;
++        if let Some(duration) = self.declared_duration_us {
++            self.declared_duration_us = Some(duration.max(self.largest_track_end()));
++        }
+         if let Some(target) = self.removed_target {
+             if self.buffered().iter().any(|r| r.contains(&target)) {
+                 self.reset_seek_epoch(target)?;
+@@ -696,6 +697,52 @@ impl AppendPlayback {
+     pub fn take_seek_ready(&mut self) -> bool {
+         std::mem::take(&mut self.seek_ready)
+     }
++    pub fn reopen_input(&mut self) -> Result<(), ()> {
++        if self.failed
++            || !self.input_ended
++            || !self.sessions.values().all(AppendSession::can_reopen)
++        {
++            return Err(());
++        }
++        let target = self.clock.now_us();
++        let covered = self.buffered().iter().any(|r| r.contains(&target));
++        let plans = self
++            .sessions
++            .iter()
++            .map(|(id, s)| {
++                let plan = if covered {
++                    s.stage_seek(target)
++                } else {
++                    s.empty_delivery_plan()
++                }
++                .map_err(|_| ())?;
++                Ok((*id, plan))
++            })
++            .collect::<Result<Vec<_>, ()>>()?;
++        let floor = if covered {
++            self.sessions
++                .values()
++                .filter_map(|s| s.video_frame_at(target))
++                .max()
++        } else {
++            None
++        };
++        self.reset_output_epoch(target, floor);
++        if !covered {
++            self.seek_target = None;
++            self.seek_started = None;
++            self.removed_target = Some(target);
++        } else {
++            self.removed_target = None;
++        }
++        for (id, plan) in plans {
++            let s = self.sessions.get_mut(&id).ok_or(())?;
++            s.reopen().map_err(|_| ())?;
++            s.commit_seek(plan);
++        }
++        self.input_ended = false;
++        Ok(())
++    }
+     pub fn end_input(&mut self) -> Result<(), ()> {
+         if self.failed {
+             return Err(());
+@@ -709,6 +756,7 @@ impl AppendPlayback {
+             .try_for_each(|s| s.end_of_stream().map_err(|_| ()));
+         self.checked(result)?;
+         self.input_ended = true;
++        self.declared_duration_us = Some(self.largest_track_end());
+         Ok(())
+     }
+     pub fn set_playing(&mut self, playing: bool) -> Result<(), ()> {
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index 4813e6b5e..178c6d041 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -830,3 +830,47 @@ fn invalid_current_removal_cannot_discard_live_output_or_frames() {
+         assert_eq!(p.removed_target, None);
+     }
+ }
++
++#[test]
++fn reopen_resets_eos_output_epoch_and_preserves_retained_data_and_finite_duration() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.end_input().unwrap();
++    p.clock.rebase(250_000);
++    p.rendered_frames = 8;
++    p.video_done = true;
++    p.reopen_input().unwrap();
++    assert!(!p.input_ended);
++    assert_eq!(p.duration_us(), Some(1_000_000));
++    assert_eq!(p.buffered(), [0..1_000_000]);
++    assert_eq!(p.seek_target, Some(250_000));
++    assert_eq!(p.rendered_frames, 0);
++    assert!(!p.video_done);
++    assert!(!p.take_seek_ready());
++    assert!(p.reopen_input().is_err());
++}
++#[test]
++fn reopen_at_exclusive_end_waits_for_new_coverage_without_replaying_old_eos() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.end_input().unwrap();
++    p.clock.rebase(1_000_000);
++    p.reopen_input().unwrap();
++    assert_eq!(p.removed_target, Some(1_000_000));
++    assert_eq!(p.seek_target, None);
++    assert_eq!(p.seek_started, None);
++    assert_eq!(p.clock.now_us(), 1_000_000);
++    assert!(!p.pump().unwrap().finished);
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 2e3ae83c9..46f9d52e6 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -583,6 +583,20 @@ impl Player for AndroidAppendPlayer {
+             Box::new(move |notification| callback(notification.event)),
+         )
+     }
++    fn append_reopen(&self) -> Result<(), PlayerError> {
++        let mut s = self.state.lock().unwrap();
++        if s.stopped
++            || !s.input_ended
++            || s.pending_seek.is_some()
++            || s.buffers.values().any(|b| !b.ready || b.updating)
++        {
++            return Err(error());
++        }
++        self.command(Command::ReopenInput)?;
++        s.input_ended = false;
++        s.output_ended = false;
++        Ok(())
++    }
+     fn append_remove(&self, id: u32, start: f64, end: f64) -> Result<u64, PlayerError> {
+         if !start.is_finite()
+             || start < 0.0
+@@ -1142,15 +1156,49 @@ mod tests {
+     }
+     #[test]
+     fn removal_cannot_be_aborted_and_queue_rejection_does_not_advance_operation() {
+-        let p=seek_test_player();let p=p.lock().unwrap();
++        let p = seek_test_player();
++        let p = p.lock().unwrap();
+         drop(p.worker.lock().unwrap().take());
+-        let (worker,_rx)=Worker::saturated_for_test();*p.worker.lock().unwrap()=Some(worker);
+-        p.state.lock().unwrap().buffers.insert(1,BufferState{ready:true,updating:true,removing:true,operation:19,callback:Arc::new(|_|{})});
++        let (worker, _rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        p.state.lock().unwrap().buffers.insert(
++            1,
++            BufferState {
++                ready: true,
++                updating: true,
++                removing: true,
++                operation: 19,
++                callback: Arc::new(|_| {}),
++            },
++        );
+         assert!(p.append_abort(1).is_err());
+-        {let s=p.state.lock().unwrap();let b=s.buffers.get(&1).unwrap();assert!(b.removing);assert!(b.updating);assert_eq!(b.operation,19);}
+-        {let mut s=p.state.lock().unwrap();let b=s.buffers.get_mut(&1).unwrap();b.updating=false;b.removing=false;}
+-        assert_eq!(p.append_remove(1,0.0,1.0),Err(PlayerError::EnoughData));
+-        let s=p.state.lock().unwrap();let b=s.buffers.get(&1).unwrap();assert_eq!(b.operation,19);assert!(!b.updating);assert!(!b.removing);
++        {
++            let s = p.state.lock().unwrap();
++            let b = s.buffers.get(&1).unwrap();
++            assert!(b.removing);
++            assert!(b.updating);
++            assert_eq!(b.operation, 19);
++        }
++        {
++            let mut s = p.state.lock().unwrap();
++            let b = s.buffers.get_mut(&1).unwrap();
++            b.updating = false;
++            b.removing = false;
++        }
++        assert_eq!(p.append_remove(1, 0.0, 1.0), Err(PlayerError::EnoughData));
++        let s = p.state.lock().unwrap();
++        let b = s.buffers.get(&1).unwrap();
++        assert_eq!(b.operation, 19);
++        assert!(!b.updating);
++        assert!(!b.removing);
++    }
++    #[test]
++    fn rejected_reopen_preserves_ended_flags_and_next_operation_scope() {
++        let p=seek_test_player();let p=p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());let (worker,_rx)=Worker::saturated_for_test();*p.worker.lock().unwrap()=Some(worker);
++        {let mut s=p.state.lock().unwrap();s.input_ended=true;s.output_ended=true;}
++        assert_eq!(p.append_reopen(),Err(PlayerError::EnoughData));
++        let s=p.state.lock().unwrap();assert!(s.input_ended);assert!(s.output_ended);assert!(!s.stopped);
+     }
+ 
+ }
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index 78b7e2772..cd71b7d23 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -39,6 +39,7 @@ pub enum Command {
+         offset_us: i64,
+         window: std::ops::Range<i64>,
+     },
++    ReopenInput,
+     EndInput,
+     Playing(bool),
+     Volume {
+@@ -59,6 +60,7 @@ pub enum Applied {
+     AppendAborted(u32),
+     Appended(u32, u64),
+     Options(u32),
++    InputReopened,
+     InputEnded,
+     Playing,
+     Volume,
+@@ -134,6 +136,7 @@ impl Worker {
+                                         operation,
+                                         ..
+                                     } => Applied::Appended(*buffer_id, *operation),
++                                    Command::ReopenInput => Applied::InputReopened,
+                                     Command::EndInput => Applied::InputEnded,
+                                     Command::Playing(_) => Applied::Playing,
+                                     Command::Volume { .. } => Applied::Volume,
+@@ -187,6 +190,12 @@ impl Worker {
+                                         event(Event::AppendStarted(buffer_id, operation));
+                                         playback.append(buffer_id, &bytes)
+                                     },
++                                    Command::ReopenInput => {
++                                        playback.reopen_input()?;
++                                        output_finished = false;
++                                        pending_seek = None;
++                                        Ok(())
++                                    },
+                                     Command::EndInput => playback.end_input(),
+                                     Command::Playing(playing) => playback.set_playing(playing),
+                                     Command::Volume { volume, muted } => {
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index 9492e9331..b9b248642 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -112,6 +112,7 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::SetStreamFailed)
+     }
+     fn append_add_buffer_operations(&self,_id:u32,_callback:append::AppendOperationCallback)->Result<(),PlayerError> {Err(PlayerError::SetStreamFailed)}
++    fn append_reopen(&self)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_remove(&self,_id:u32,_start:f64,_end:f64)->Result<u64,PlayerError>{Err(PlayerError::BufferPushFailed)}
+     /// Return an operation floor for filtering canceled notifications.
+     fn append_abort(&self,_id:u32)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index c6ebf4786..a26218aed 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -267,3 +267,23 @@ mod pipeline_tests {
+   assert_eq!(buffer.remove(-1.0,0.5),Err(SourceError::Type));assert!(!buffer.updating());source.detach();
+  }
+ }
++
++#[cfg(test)] mod reopen_tests {
++ use crate::{append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ #[test] fn reopened_source_keeps_buffer_identity_and_opens_before_next_update() {
++  let p=AndroidAppendPlayer::new(83,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p).unwrap();
++  assert_eq!(rx.recv().unwrap(),SourceEvent::Open);let b=source.add_buffer("video/mp4").unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  for e in rx.try_iter(){assert_eq!(e,SourceEvent::BufferAdded(b.id()));}
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,1)){break;}}
++  source.end_input().unwrap();assert_eq!(rx.recv().unwrap(),SourceEvent::Ended);
++  source.reopen().unwrap();assert_eq!(source.state(),SourceState::Open);assert_eq!(rx.recv().unwrap(),SourceEvent::Open);
++  assert!(b.same_buffer(&source.buffers()[0]));assert!(source.reopen().is_err());
++  b.append(vec![]).unwrap();
++  for e in [AppendEvent::UpdateStart,AppendEvent::Update,AppendEvent::UpdateEnd]{assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(b.id(),e,2));}
++  source.detach();assert!(source.reopen().is_err());
++ }
++}
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index 6a4916486..312a98479 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -582,3 +582,15 @@ fn committed_retained_target_removal_replaces_queued_packets_and_replays_configu
+     let mut sink=Sink{pts:vec![],configs:0};while s.pump_input(&mut sink).unwrap(){}
+     assert_eq!(sink.pts,[500_000]);assert_eq!(sink.configs,1);assert!(s.input_exhausted());
+ }
++
++#[test]
++fn session_reopen_retains_initialization_and_accepts_more_media_after_clean_eos() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let mut s=AppendSession::new(1<<20,128);assert!(!s.can_reopen());assert!(s.reopen().is_err());
++ s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();s.end_of_stream().unwrap();assert!(s.can_reopen());
++ let old=s.buffered();s.reopen().unwrap();assert!(!s.can_reopen());assert_eq!(s.buffered(),old);
++ let mut f=BoxFramer::new(1<<20);f.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();let mut media=vec![];
++ while let Some(b)=f.pop_box().unwrap(){if &b[4..8]==b"moof"||&b[4..8]==b"mdat"{media.extend(b);}}
++ s.set_append_options(1_000_000,0..i64::MAX).unwrap();s.append(&media).unwrap();
++ assert_eq!(s.buffered(),[0..2_000_000]);s.end_of_stream().unwrap();assert!(s.can_reopen());
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index d5856b3a0..2ab8da069 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -60,6 +60,18 @@ impl AppendSession {
+             limit,
+         }
+     }
++    pub fn can_reopen(&self) -> bool {
++        !self.failed && self.ended
++    }
++    /// EOS completed the parser cleanly. Reopening retains initialization,
++    /// timestamp options, coded frames and dependency history.
++    pub fn reopen(&mut self) -> Result<(), SessionError> {
++        if !self.can_reopen() {
++            return Err(SessionError::Failed);
++        }
++        self.ended = false;
++        Ok(())
++    }
+     pub fn append(&mut self, data: &[u8]) -> Result<(), SessionError> {
+         if self.failed || self.ended {
+             return Err(SessionError::Failed);
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+index 742eba6f5..c316bdaa6 100644
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -198,6 +198,19 @@ impl AppendSource {
+             })
+             .collect()
+     }
++    /// Reopen explicitly before dispatching any new buffer operation. This
++    /// delivers sourceopen before the caller can queue its update lifecycle.
++    pub fn reopen(&self)->Result<(),SourceError> {
++        {
++            let mut s=self.0.state.lock().unwrap();
++            if s.state!=SourceState::Ended || s.buffers.values().any(|b|b.updating||!b.ready){return Err(SourceError::InvalidState);}
++            let p=s.player.clone().ok_or(SourceError::InvalidState)?;
++            p.lock().unwrap().append_reopen().map_err(|e|if e==PlayerError::EnoughData{SourceError::Quota}else{SourceError::Backend})?;
++            s.state=SourceState::Open;
++        }
++        (self.0.callback)(SourceEvent::Open);
++        Ok(())
++    }
+     pub fn end_input(&self) -> Result<(), SourceError> {
+         let player = {
+             let s = self.0.state.lock().unwrap();
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 84aac9f72..350a12026 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -150,6 +150,7 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::SetStreamFailed)
+     }
+     fn append_add_buffer_operations(&self,_id:u32,_callback:append::AppendOperationCallback)->Result<(),PlayerError> {Err(PlayerError::SetStreamFailed)}
++    fn append_reopen(&self)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_remove(&self,_id:u32,_start:f64,_end:f64)->Result<u64,PlayerError>{Err(PlayerError::BufferPushFailed)}
+     /// Return an operation floor for filtering canceled notifications.
+     fn append_abort(&self,_id:u32)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
