@@ -1,0 +1,291 @@
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -67,7 +67,7 @@
+ 
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+ pub enum PlayerEvent {
+-    AppendEpoch {generation:u64,event:Box<PlayerEvent>},
++    AppendEpoch {generation:u64,selection_generation:u64,event:Box<PlayerEvent>},
+     EndOfStream,
+     /// The player has enough data. The client should stop pushing data into.
+     EnoughData,
+@@ -141,6 +141,7 @@
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
+     fn append_event_epoch(&self)->u64{0}
++    fn append_selection_epoch(&self)->u64{0}
+     fn append_remove_buffer(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -30,7 +30,7 @@
+ }
+ #[derive(Clone,Debug)]
+ pub enum PlayerEvent {
+-    AppendEpoch {generation:u64,event:Box<PlayerEvent>},
++    AppendEpoch {generation:u64,selection_generation:u64,event:Box<PlayerEvent>},
+     EndOfStream,
+     /// The player has enough data. The client should stop pushing data into.
+     EnoughData,
+@@ -103,6 +103,7 @@
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
+     fn append_event_epoch(&self)->u64{0}
++    fn append_selection_epoch(&self)->u64{0}
+     fn append_remove_buffer(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -615,7 +615,18 @@
+   let old=loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){e@PlayerEvent::AppendEpoch{generation:0,..}=>break e,PlayerEvent::Error(e)=>panic!("{e}"),_=>()}};
+   loop{if updates.recv_timeout(Duration::from_secs(2)).unwrap()==AppendEvent::UpdateEnd{break;}}
+   player.lock().unwrap().append_remove_buffer(1).unwrap();assert_eq!(player.lock().unwrap().append_event_epoch(),1);
+-  match old{PlayerEvent::AppendEpoch{generation,event}=>{assert_eq!(generation,0);assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}));assert_ne!(generation,player.lock().unwrap().append_event_epoch());},_=>panic!("unversioned status")}
+-  loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){PlayerEvent::AppendEpoch{generation:1,event}=>{assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}));break;},PlayerEvent::Error(e)=>panic!("{e}"),_=>()}}
+- }
+-}
++  match old{PlayerEvent::AppendEpoch{generation,event,..}=>{assert_eq!(generation,0);assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}));assert_ne!(generation,player.lock().unwrap().append_event_epoch());},_=>panic!("unversioned status")}
++  loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){PlayerEvent::AppendEpoch{generation:1,event,..}=>{assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}));break;},PlayerEvent::Error(e)=>panic!("{e}"),_=>()}}
++ }
++}
++
++#[test]
++fn selected_track_changes_tag_queued_status_and_old_envelopes_fail_current_epoch_pair() {
++ use crate::{Player,PlayerEvent,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};use std::{sync::mpsc,time::Duration};
++ let(tx,events)=mpsc::channel();let player=AndroidAppendPlayer::new(103,GenericCallback::new(move|e|{if let Ok(e)=e{let _=tx.send(e);}}).unwrap(),None,Box::new(||{})).unwrap();let(tx,updates)=mpsc::channel();player.lock().unwrap().append_add_buffer(1,Box::new(move|e|{let _=tx.send(e);})).unwrap();assert_eq!(updates.recv_timeout(Duration::from_secs(2)).unwrap(),AppendEvent::Ready);
++ player.lock().unwrap().append_to_buffer(1,include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();while updates.recv_timeout(Duration::from_secs(2)).unwrap()!=AppendEvent::UpdateEnd{}
++ let old=loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){e@PlayerEvent::AppendEpoch{selection_generation:0,..}=>break e,PlayerEvent::Error(e)=>panic!("{e}"),_=>()}};
++ player.lock().unwrap().set_video_track(0,false).unwrap();let current={let p=player.lock().unwrap();(p.append_event_epoch(),p.append_selection_epoch())};assert_eq!(current,(0,1));match old{PlayerEvent::AppendEpoch{generation,selection_generation,..}=>assert_ne!((generation,selection_generation),current),_=>panic!("unversioned")};
++ loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){PlayerEvent::AppendEpoch{generation:0,selection_generation:1,event}=>{assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}|PlayerEvent::EndOfStream));break;},PlayerEvent::Error(e)=>panic!("{e}"),_=>()}}
++ player.lock().unwrap().stop().unwrap();
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -44,6 +44,9 @@
+     highest_pts: Option<i64>,
+     highest_end: i64,
+     removal_generation: u64,
++    selection_generation: u64,
++    audio_selected: bool,
++    video_selected: bool,
+     readiness: Option<servo_media_player::append::AppendReadiness>,
+     pending_seek: Option<u64>,
+     buffers: BTreeMap<u32, BufferState>,
+@@ -172,6 +175,9 @@
+             highest_pts: None,
+             highest_end: 0,
+             removal_generation: 0,
++            selection_generation: 0,
++            audio_selected: true,
++            video_selected: true,
+             readiness: None,
+             pending_seek: None,
+             buffers: BTreeMap::new(),
+@@ -306,13 +312,16 @@
+                         let send = |event| {
+                             send(PlayerEvent::AppendEpoch {
+                                 generation,
++                                selection_generation: status.selection_generation,
+                                 event: Box::new(event),
+                             })
+                         };
+                         let duration_changed = {
+                             let mut s = shared.lock().unwrap();
+                             s.apply_buffer_duration_bounds(&status.buffer_duration_bounds);
+-                            if status.removal_generation < s.removal_generation {
++                            if status.removal_generation < s.removal_generation
++                                || status.selection_generation < s.selection_generation
++                            {
+                                 return;
+                             }
+                             s.timestamp_offsets =
+@@ -409,7 +418,9 @@
+                             );
+                             let changed = {
+                                 let mut s = shared.lock().unwrap();
+-                                if status.removal_generation < s.removal_generation {
++                                if status.removal_generation < s.removal_generation
++                                    || status.selection_generation < s.selection_generation
++                                {
+                                     return;
+                                 }
+                                 let changed = s.readiness != Some(readiness);
+@@ -437,7 +448,9 @@
+                         if status.finished {
+                             {
+                                 let mut s = shared.lock().unwrap();
+-                                if status.removal_generation < s.removal_generation {
++                                if status.removal_generation < s.removal_generation
++                                    || status.selection_generation < s.selection_generation
++                                {
+                                     return;
+                                 }
+                                 s.paused = true;
+@@ -541,6 +554,56 @@
+         self.close();
+     }
+ }
++impl AndroidAppendPlayer {
++    fn set_track_selection(
++        &self,
++        index: i32,
++        enabled: bool,
++        audio: bool,
++    ) -> Result<(), PlayerError> {
++        let mut s = self.state.lock().unwrap();
++        let mime = if audio {
++            "audio/mp4a-latm"
++        } else {
++            "video/avc"
++        };
++        if s.stopped
++            || index != 0
++            || !s
++                .buffer_tracks
++                .values()
++                .flatten()
++                .any(|track| track.mime == mime)
++        {
++            return Err(PlayerError::SetTrackFailed);
++        }
++        let (next_audio, next_video) = if audio {
++            (enabled, s.video_selected)
++        } else {
++            (s.audio_selected, enabled)
++        };
++        if next_audio == s.audio_selected && next_video == s.video_selected {
++            return Ok(());
++        }
++        let generation = s
++            .selection_generation
++            .checked_add(1)
++            .ok_or(PlayerError::SetTrackFailed)?;
++        self.command(Command::TrackSelection {
++            generation,
++            audio: next_audio,
++            video: next_video,
++        })?;
++        s.selection_generation = generation;
++        s.audio_selected = next_audio;
++        s.video_selected = next_video;
++        s.buffered.clear();
++        s.readiness = None;
++        s.output_ended = false;
++        Ok(())
++    }
++}
++
+ impl MediaInstance for AndroidAppendPlayer {
+     fn get_id(&self) -> usize {
+         self.id
+@@ -589,6 +652,9 @@
+     }
+     fn append_event_epoch(&self) -> u64 {
+         self.state.lock().unwrap().removal_generation
++    }
++    fn append_selection_epoch(&self) -> u64 {
++        self.state.lock().unwrap().selection_generation
+     }
+     fn append_remove_buffer(&self, id: u32) -> Result<(), PlayerError> {
+         let mut s = self.state.lock().unwrap();
+@@ -746,11 +812,11 @@
+     fn render_use_gl(&self) -> bool {
+         false
+     }
+-    fn set_audio_track(&self, _: i32, _: bool) -> Result<(), PlayerError> {
+-        Err(PlayerError::SetTrackFailed)
+-    }
+-    fn set_video_track(&self, _: i32, _: bool) -> Result<(), PlayerError> {
+-        Err(PlayerError::SetTrackFailed)
++    fn set_audio_track(&self, index: i32, enabled: bool) -> Result<(), PlayerError> {
++        self.set_track_selection(index, enabled, true)
++    }
++    fn set_video_track(&self, index: i32, enabled: bool) -> Result<(), PlayerError> {
++        self.set_track_selection(index, enabled, false)
+     }
+     fn append_add_buffer(&self, id: u32, callback: AppendCallback) -> Result<(), PlayerError> {
+         self.append_add_buffer_operations(
+@@ -1837,4 +1903,61 @@
+         assert_eq!(p.append_set_duration(1.0), Err(PlayerError::SeekOutOfRange));
+         assert_eq!(p.append_set_duration(2.0), Ok((3.0, 1)));
+     }
++    #[test]
++    fn selection_queue_failure_preserves_generation_and_state_and_validates_track_index() {
++        let p = AndroidAppendPlayer::new(
++            102,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut s = p.state.lock().unwrap();
++            s.buffer_tracks.insert(
++                1,
++                vec![servo_media_player::append::AppendTrack {
++                    id: 1,
++                    mime: "video/avc".to_owned(),
++                }],
++            );
++            s.buffered = vec![0.0..1.0];
++        }
++        assert_eq!(
++            p.set_audio_track(0, false),
++            Err(PlayerError::SetTrackFailed)
++        );
++        assert_eq!(
++            p.set_video_track(-1, false),
++            Err(PlayerError::SetTrackFailed)
++        );
++        assert_eq!(
++            p.set_video_track(1, false),
++            Err(PlayerError::SetTrackFailed)
++        );
++        assert_eq!(p.set_video_track(0, false), Err(PlayerError::EnoughData));
++        assert_eq!(p.append_selection_epoch(), 0);
++        assert!(p.state.lock().unwrap().video_selected);
++        assert_eq!(p.state.lock().unwrap().buffered, [0.0..1.0]);
++        rx.recv().unwrap();
++        p.set_video_track(0, false).unwrap();
++        assert_eq!(p.append_selection_epoch(), 1);
++        assert!(!p.state.lock().unwrap().video_selected);
++        assert!(p.state.lock().unwrap().buffered.is_empty());
++        match rx.recv().unwrap() {
++            Command::TrackSelection {
++                generation: 1,
++                audio: true,
++                video: false,
++            } => (),
++            _ => panic!("wrong selection"),
++        };
++        p.set_video_track(0, false).unwrap();
++        assert_eq!(p.append_selection_epoch(), 1);
++        assert!(rx.try_recv().is_err());
++    }
+ }
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -4535,9 +4535,9 @@
+         }
+ 
+         let event=match event {
+-            PlayerEvent::AppendEpoch{generation,event}=>{
+-                let current=element.player.borrow().as_ref().map(|player|player.lock().unwrap().append_event_epoch());
+-                if element.attached_append_source.get().is_none()||current!=Some(generation){return;}
++            PlayerEvent::AppendEpoch{generation,selection_generation,event}=>{
++                let current=element.player.borrow().as_ref().map(|player|{let player=player.lock().unwrap();(player.append_event_epoch(),player.append_selection_epoch())});
++                if element.attached_append_source.get().is_none()||current!=Some((generation,selection_generation)){return;}
+                 *event
+             },
+             event=>event,
