@@ -1,0 +1,162 @@
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -31,6 +31,12 @@
+     pub fn covers(&self, target: i64) -> bool {
+         self.store.buffered().iter().any(|r| r.contains(&target))
+     }
++    pub fn covers_selected(&self, target: i64, selected: impl Fn(u32) -> bool) -> bool {
++        self.store
++            .buffered_selected(selected)
++            .iter()
++            .any(|range| range.contains(&target))
++    }
+     pub fn video_floor(&self) -> Option<i64> {
+         self.video_floor
+     }
+@@ -247,6 +253,15 @@
+         end: i64,
+         target: Option<i64>,
+     ) -> Result<RemovePlan, SessionError> {
++        self.stage_remove_selected(start, end, target, |_| true)
++    }
++    pub fn stage_remove_selected(
++        &self,
++        start: i64,
++        end: i64,
++        target: Option<i64>,
++        selected: impl Fn(u32) -> bool,
++    ) -> Result<RemovePlan, SessionError> {
+         if self.failed {
+             return Err(SessionError::Failed);
+         }
+@@ -256,7 +271,7 @@
+             .map_err(|_| SessionError::Append)?;
+         let units = match target {
+             Some(target) => store
+-                .replay_from(target)
++                .replay_selected_from(target, &selected)
+                 .map_err(|_| SessionError::Append)?,
+             None => vec![],
+         };
+@@ -271,7 +286,7 @@
+         let video_floor = target.and_then(|target| {
+             self.descriptions()
+                 .iter()
+-                .filter(|t| t.mime == "video/avc")
++                .filter(|t| t.mime == "video/avc" && selected(t.id))
+                 .flat_map(|t| store.frames(t.id))
+                 .filter(|f| f.pts_us <= target && target < f.pts_us.saturating_add(f.duration_us))
+                 .map(|f| f.pts_us)
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -786,7 +786,12 @@
+         if next == self.selection {
+             return Ok(());
+         }
+-        let target = self.clock.now_us();
++        let position = self.clock.now_us();
++        let target = if self.declared_duration_us == Some(position) && position > 0 {
++            position - 1
++        } else {
++            position
++        };
+         let covered = self.buffered_for(next).iter().any(|r| r.contains(&target));
+         let plans = self
+             .sessions
+@@ -935,11 +940,11 @@
+         if self.failed || (self.seek_target.is_some() && !self.reopen_reset) {
+             return Err(());
+         }
+-        let removal = self
+-            .sessions
+-            .get(&buffer)
+-            .ok_or(())?
+-            .stage_remove_retaining_target(start, end, target)
++        let session = self.sessions.get(&buffer).ok_or(())?;
++        let removal = session
++            .stage_remove_selected(start, end, Some(target), |id| {
++                self.selection.selected(session, id)
++            })
+             .map_err(|_| ())?;
+         let other = self
+             .sessions
+@@ -985,7 +990,9 @@
+             .ok_or(())?
+             .stage_remove(start, end, None)
+             .map_err(|_| ())?;
+-        let covered = removal.covers(target)
++        let session = self.sessions.get(&buffer).ok_or(())?;
++        let covered = (!self.selection.active(session) && !session.descriptions().is_empty()
++            || removal.covers_selected(target, |id| self.selection.selected(session, id)))
+             && self
+                 .sessions
+                 .iter()
+@@ -1245,6 +1252,9 @@
+     }
+     fn finish_seek_if_ready(&mut self) -> Result<(), ()> {
+         if self.seek_target.is_some() {
++            if !self.selection.audio && !self.selection.video {
++                return Ok(());
++            }
+             let has_video = self.selection.video
+                 && self
+                     .sessions
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1482,3 +1482,53 @@
+     assert!(!p.take_seek_ready());
+     assert_eq!(p.sessions[&1].ranges(1), [0..1_000_000]);
+ }
++
++#[test]
++fn removal_of_disabled_audio_does_not_stall_selected_video_or_restore_audio_decoder() {
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(Arc::new(Mutex::new(vec![]))))));
++    p.add_buffer(1).unwrap();
++    p.add_buffer(2).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.append(
++        2,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4"),
++    )
++    .unwrap();
++    p.set_track_selection(false, true).unwrap();
++    p.seek_target = None;
++    p.seek_started = None;
++    p.remove_and_stall_if_needed(2, 0, 1_000_000, 0).unwrap();
++    assert!(p.removed_target.is_none());
++    assert!(p.sessions[&2].ranges(1).is_empty());
++    assert_eq!(p.sessions[&1].ranges(1), [0..1_000_000]);
++    assert_eq!(p.buffered(), [0..1_000_000]);
++    assert!(p.decoders.audio.is_none());
++}
++#[test]
++fn explicit_seek_while_every_track_disabled_cannot_complete_and_eos_reenable_replays_last_instant()
++{
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(Arc::new(Mutex::new(vec![]))))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.end_input().unwrap();
++    p.set_track_selection(false, false).unwrap();
++    p.reset_seek_epoch(0).unwrap();
++    p.finish_seek_if_ready().unwrap();
++    assert!(!p.take_seek_ready());
++    assert_eq!(p.seek_target, Some(0));
++    p.clock.rebase(1_000_000);
++    p.clock.pause();
++    p.set_track_selection(false, true).unwrap();
++    assert_eq!(p.seek_target, Some(999_999));
++    assert!(p.removed_target.is_none());
++    assert_eq!(p.video_seek_floor, Some(500_000));
++    assert!(!p.take_seek_ready());
++}
