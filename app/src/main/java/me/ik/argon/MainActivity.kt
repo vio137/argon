@@ -204,7 +204,17 @@ class MainActivity : ComponentActivity(), Servo.Client {
                 val result =
                     runCatching {
                             val html =
-                                contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                                contentResolver.openInputStream(uri)?.use { input ->
+                                    val out = java.io.ByteArrayOutputStream()
+                                    val chunk = ByteArray(8192)
+                                    while (true) {
+                                        val count = input.read(chunk)
+                                        if (count < 0) break
+                                        require(out.size() + count <= BookmarksIO.MAX_IMPORT_BYTES) { "Bookmark file is too large" }
+                                        out.write(chunk, 0, count)
+                                    }
+                                    out.toString(Charsets.UTF_8.name())
+                                }
                                     ?: error("no stream")
                             val parsed = BookmarksIO.import(html)
                             val before = bookmarks.entries.size
@@ -214,7 +224,7 @@ class MainActivity : ComponentActivity(), Servo.Client {
                         .getOrElse { -1 }
                 alertMessage =
                     if (result >= 0) "Imported $result new bookmarks."
-                    else "Bookmark import failed - not a recognized bookmarks file."
+                    else "Bookmark import failed. Use a bookmarks HTML file smaller than 4 MB."
             }
         }
 

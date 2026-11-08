@@ -67,4 +67,15 @@ class BookmarksIOTest {
         val html = "<dt><a href=\"https://x.example/\">\nmultiline title\n</a>"
         assertEquals(listOf(Bookmark(title = "multiline title", url = "https://x.example/")), BookmarksIO.import(html))
     }
+    @Test fun importAllowsWhitespaceAttributeOrderAndSingleQuotes() {
+        val html = "<DT>\n <A ADD_DATE='1' HREF = 'https://example.org/?x=1&amp;y=2'>A &#38; B &#x1F600;</A>"
+        assertEquals(listOf(Bookmark(title = "A & B 😀", url = "https://example.org/?x=1&y=2")), BookmarksIO.import(html))
+    }
+    @Test fun numericEntitiesAreSinglePassAndInvalidCodePointsStayLiteral() {
+        val html = "<DT><A HREF='https://e.example/'>&#38;lt; &#0; &#xD800; &#x110000; &apos;</A>"
+        assertEquals("&lt; &#0; &#xD800; &#x110000; '", BookmarksIO.import(html).single().title)
+    }
+    @Test(expected = IllegalArgumentException::class) fun oversizedImportIsRejected() {
+        BookmarksIO.import("x".repeat(BookmarksIO.MAX_IMPORT_BYTES + 1))
+    }
 }
