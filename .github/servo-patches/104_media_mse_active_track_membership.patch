@@ -1,0 +1,96 @@
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -227,6 +227,9 @@
+         self.updating.set(false);
+         self.removing.set(false);
+     }
++    pub(crate) fn has_selected_tracks(&self)->bool {
++        self.audio_tracks.get().is_some_and(|list|list.enabled_index().is_some()) || self.video_tracks.get().is_some_and(|list|list.selected_index().is_some())
++    }
+     pub(crate) fn buffer_id(&self) -> u32 {
+         self.buffer.id()
+     }
+diff --git a/components/script/dom/mse/sourcebufferlist.rs b/components/script/dom/mse/sourcebufferlist.rs
+--- a/components/script/dom/mse/sourcebufferlist.rs
++++ b/components/script/dom/mse/sourcebufferlist.rs
+@@ -51,6 +51,16 @@
+             self.queue_change(stylo_atoms::Atom::from("removesourcebuffer"));
+         }
+     }
++    /// Reconcile active membership in sourceBuffers order, not click order.
++    /// Reordering surviving entries alone does not fabricate membership events.
++    pub(crate) fn reconcile(&self,desired:&[DomRoot<SourceBuffer>]) {
++        let previous=self.buffers();
++        let removed=previous.iter().any(|old|!desired.iter().any(|new|&**new==&**old));
++        let added=desired.iter().any(|new|!previous.iter().any(|old|&**new==&**old));
++        *self.buffers.borrow_mut()=desired.iter().map(|buffer|Dom::from_ref(&**buffer)).collect();
++        if removed{self.queue_change(Atom::from("removesourcebuffer"));}
++        if added{self.queue_change(Atom::from("addsourcebuffer"));}
++    }
+     pub(crate) fn clear(&self) {
+         if !self.buffers.borrow().is_empty() {
+             self.buffers.borrow_mut().clear();
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -195,13 +195,17 @@
+             self.duration.set(duration);
+         }
+     }
+-    pub(crate) fn sync_tracks(&self, cx: &mut JSContext) {
+-        if let Some(list) = self.source_buffers.get() {
+-            for buffer in list.buffers() {
+-                if buffer.sync_tracks(cx) {
+-                    self.ActiveSourceBuffers(cx).add(&buffer);
+-                }
+-            }
++    pub(crate) fn refresh_active_buffers(&self) {
++        if let (Some(source),Some(active))=(self.source_buffers.get(),self.active_buffers.get()) {
++            let selected:Vec<_>=source.buffers().into_iter().filter(|buffer|buffer.has_selected_tracks()).collect();
++            active.reconcile(&selected);
++        }
++    }
++    pub(crate) fn sync_tracks(&self,cx:&mut JSContext) {
++        if let Some(list)=self.source_buffers.get() {
++            for buffer in list.buffers(){buffer.sync_tracks(cx);}
++            self.ActiveSourceBuffers(cx);
++            self.refresh_active_buffers();
+         }
+     }
+     fn backend_event(&self, cx: &mut JSContext, event: SourceEvent) {
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2469,6 +2469,9 @@
+ 
+     pub(crate) fn existing_audio_tracks(&self) -> Option<DomRoot<AudioTrackList>> { self.audio_tracks_list.get() }
+     pub(crate) fn existing_video_tracks(&self) -> Option<DomRoot<VideoTrackList>> { self.video_tracks_list.get() }
++    pub(crate) fn refresh_append_active_buffers(&self) {
++        if let Some(source)=self.attached_append_source.get(){source.refresh_active_buffers();}
++    }
+     /// Append-backed selection must be accepted by the bounded worker queue
+     /// before the DOM list changes. Preserve existing progressive behavior.
+     pub(crate) fn set_audio_track(&self,idx:usize,enabled:bool)->bool {
+diff --git a/components/script/dom/audio/audiotracklist.rs b/components/script/dom/audio/audiotracklist.rs
+--- a/components/script/dom/audio/audiotracklist.rs
++++ b/components/script/dom/audio/audiotracklist.rs
+@@ -104,6 +104,7 @@
+         }
+         // Queue acceptance precedes DOM mutation and the change event.
+         track.set_enabled(value);
++        if let Some(media)=self.media_element.as_ref(){media.refresh_append_active_buffers();}
+ 
+         // Queue a task to fire an event named change.
+         let global = &self.global();
+diff --git a/components/script/dom/media/videotracklist.rs b/components/script/dom/media/videotracklist.rs
+--- a/components/script/dom/media/videotracklist.rs
++++ b/components/script/dom/media/videotracklist.rs
+@@ -108,6 +108,7 @@
+         }
+ 
+         track.set_selected(value);
++        if let Some(media)=self.media_element.as_ref(){media.refresh_append_active_buffers();}
+ 
+         let this = Trusted::new(self);
+         self.global()
