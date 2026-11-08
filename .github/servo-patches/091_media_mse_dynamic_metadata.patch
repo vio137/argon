@@ -1,0 +1,53 @@
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2632,7 +2632,9 @@
+     ) {
+         // The following steps should be run once on the initial `metadata` signal from the media
+         // engine.
+-        if self.ready_state.get() != ReadyState::HaveNothing {
++        let initialized = self.ready_state.get() != ReadyState::HaveNothing;
++        let append = self.attached_append_source.get().is_some();
++        if initialized && !append {
+             return;
+         }
+ 
+@@ -2640,6 +2642,9 @@
+         // => "If the media resource is found to have an audio track"
+         for (i, _track) in metadata.audio_tracks.iter().enumerate() {
+             let audio_track_list = self.AudioTracks(cx);
++            if append && i < audio_track_list.len() {
++                continue;
++            }
+ 
+             // Step 1. Create an AudioTrack object to represent the audio track.
+             let kind = match i {
+@@ -2707,6 +2712,9 @@
+         // => "If the media resource is found to have a video track"
+         for (i, _track) in metadata.video_tracks.iter().enumerate() {
+             let video_track_list = self.VideoTracks(cx);
++            if append && i < video_track_list.len() {
++                continue;
++            }
+ 
+             // Step 1. Create a VideoTrack object to represent the video track.
+             let kind = match i {
+@@ -2774,6 +2782,18 @@
+ 
+         if let Some(source) = self.attached_append_source.get() {
+             source.sync_tracks(cx);
++        }
++
++        // Append initialization can add the independent audio buffer or replace
++        // video configuration after HAVE_METADATA. Preserve track identity and
++        // playback/seek positions; only the first metadata establishes them.
++        if initialized {
++            if let Some(video) = self.downcast::<HTMLVideoElement>() {
++                if video.set_natural_dimensions(cx.no_gc(), Some(metadata.width), Some(metadata.height)) {
++                    self.queue_media_element_task_to_fire_event(atom!("resize"));
++                }
++            }
++            return;
+         }
+ 
+         // => "Once enough of the media data has been fetched to determine the duration..."
