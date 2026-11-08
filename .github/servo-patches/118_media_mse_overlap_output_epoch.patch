@@ -1,0 +1,212 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -872,7 +872,11 @@
+         if let Some(duration) = self.declared_duration_us {
+             self.declared_duration_us = Some(duration.max(self.largest_track_end()));
+         }
+-        if let Some(target) = self.removed_target {
++        if self.sessions.values().any(AppendSession::output_invalidated) {
++            let target=self.removed_target.or(self.seek_target).unwrap_or_else(||self.position_us());
++            let result=self.seek_or_wait_for_coverage(target);
++            self.checked(result)?;
++        } else if let Some(target) = self.removed_target {
+             if self.buffered().iter().any(|r| r.contains(&target)) {
+                 self.reset_seek_epoch(target)?;
+                 self.removed_target = None;
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1617,3 +1617,51 @@
+  p.reopen_input().unwrap();assert_eq!(p.reported_buffered(),before);
+  assert_eq!(p.buffer_ranges().iter().find(|(id,_)|*id==1).unwrap().1,[0..1_000_000]);
+ }
++
++#[test]
++fn replacement_append_resets_native_epoch_and_clears_stale_pending_output_before_replay() {
++ let frames=Arc::new(Mutex::new(vec![]));
++ let mut p=AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));p.add_buffer(1).unwrap();
++ let fixture=include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4");
++ p.append(1,fixture).unwrap();p.pump().unwrap();
++ assert!(p.decoders.video.is_some());
++ p.video_pending=Some(Instant::now());p.rendered_frames=10;
++ p.clock.rebase(250_000);p.clock.pause();
++ p.append(1,fixture).unwrap();
++ assert!(p.decoders.video.is_none());assert!(p.decoders.surface.is_none());
++ assert!(p.video_pending.is_none());assert_eq!(p.rendered_frames,0);
++ assert_eq!(p.seek_target,Some(250_000));assert!(!p.sessions[&1].output_invalidated());
++ assert_eq!(p.sessions[&1].buffered(),[0..1_000_000]);
++ // Partial/new nonoverlapping input must not reset an otherwise live epoch.
++ p.seek_target=None;p.rendered_frames=7;p.append(1,&[]).unwrap();assert_eq!(p.rendered_frames,7);
++}
++
++#[test]
++fn replacement_replays_other_selected_buffer_and_preserves_uncovered_seek_wait() {
++ let frames=Arc::new(Mutex::new(vec![]));
++ let mut p=AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++ p.add_buffer(1).unwrap();p.add_buffer(2).unwrap();
++ let video=include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4");
++ p.append(1,video).unwrap();
++ p.append(2,include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4")).unwrap();
++ for (id,session) in &mut p.sessions {
++  let mut sink=ScopedDecoder{buffer_id:*id,decoders:&mut p.decoders};
++  while session.pump_input(&mut sink).unwrap(){}
++ }
++ assert!(p.decoders.audio.is_some());assert!(p.decoders.video.is_some());
++ p.clock.rebase(50_000);p.clock.pause();p.append(1,video).unwrap();
++ assert!(p.decoders.audio.is_none());assert!(p.decoders.video.is_none());
++ assert_eq!(p.seek_target,Some(50_000));
++ assert!(p.sessions.values().all(|s|!s.output_invalidated()));
++ for (id,session) in &mut p.sessions {
++  let mut sink=ScopedDecoder{buffer_id:*id,decoders:&mut p.decoders};
++  while session.pump_input(&mut sink).unwrap(){}
++ }
++ assert!(p.decoders.audio.is_some());assert!(p.decoders.video.is_some());
++ p.seek_or_wait_for_coverage(2_000_000).unwrap();
++ assert_eq!(p.removed_target,Some(2_000_000));
++ p.append(1,video).unwrap();
++ assert_eq!(p.removed_target,Some(2_000_000));assert!(p.seek_target.is_none());
++ assert!(!p.pump().unwrap().current_data);
++ assert!(p.sessions.values().all(|s|!s.output_invalidated()));
++}
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -751,3 +751,30 @@
+  let mut session=AppendSession::new(1<<20,100);session.append(bytes).unwrap();
+  assert_eq!(session.buffered(),[0..end]);
+ }
++
++#[test]
++fn overlapping_append_invalidates_old_delivery_until_owner_replays_retained_samples() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoovBox};
++ use servo_media_android_hosttest::mse_demux::{session::AppendSession,delivery::CodecInput,bridge::DecoderConfig};
++ struct Sink{widths:Vec<u16>,pts:Vec<i64>}
++ impl CodecInput for Sink {
++  fn configure(&mut self,c:&DecoderConfig)->Result<(),()>{self.widths.push(c.width);Ok(())}
++  fn submit(&mut self,_:u32,_:&[u8],pts:i64)->Result<bool,()>{self.pts.push(pts);Ok(true)}
++ }
++ let mut replacement=vec![];
++ for b in boxes(){if &b[4..8]==b"moov" {
++  let(mut moov,_)=MoovBox::decode(&b).unwrap();
++  if let shiguredo_mp4::boxes::SampleEntry::Avc1(e)=&mut moov.trak_boxes[0].mdia_box.minf_box.stbl_box.stsd_box.entries[0] {e.visual.width=64;}
++  replacement.extend(moov.encode_to_vec().unwrap());
++ }else{replacement.extend(b);}}
++ for already_pumped in [false,true] {
++  let mut s=AppendSession::new(1<<20,100);s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();
++  let mut old=Sink{widths:vec![],pts:vec![]};
++  if already_pumped {assert!(s.pump_input(&mut old).unwrap());}
++  s.append(&replacement).unwrap();assert!(s.output_invalidated());
++  assert!(s.pump_input(&mut old).is_err(),"stale native output needs coordinated reset");
++  s.prepare_seek(0).unwrap();assert!(!s.output_invalidated());
++  let mut fresh=Sink{widths:vec![],pts:vec![]};while s.pump_input(&mut fresh).unwrap(){}
++  assert_eq!(fresh.widths,[64]);assert_eq!(fresh.pts,[0,500_000]);
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -42,6 +42,7 @@
+     }
+ }
+ pub struct AppendSession {
++    output_invalidated: bool,
+     stream: AppendStream,
+     store: super::timeline::FrameStore,
+     offset_us: i64,
+@@ -55,6 +56,7 @@
+ impl AppendSession {
+     pub fn new(limit: usize, max_samples: usize) -> Self {
+         Self {
++            output_invalidated: false,
+             stream: AppendStream::new(limit, max_samples),
+             store: super::timeline::FrameStore::new(limit),
+             offset_us: 0,
+@@ -145,6 +147,7 @@
+             })?;
+         }
+         let has_frames = !units.is_empty();
++        let generation=self.store.replacement_generation();
+         let units = self
+             .store
+             .append_collect(units, self.offset_us, self.window.clone())
+@@ -157,6 +160,15 @@
+                 self.offset_us = offset;
+             }
+         }
++        if self.store.replacement_generation()!=generation {
++            // Replaced coded frames may already be queued or decoded. Never
++            // keep delivering that stale cursor. The native owner must reset
++            // output and install a retained-frame replay at its media position.
++            self.output_invalidated=true;
++            self.delivery=Delivery::new(self.limit);
++            self.bridge=DecoderBridge::new(self.limit);
++        }
++        if self.output_invalidated {return Ok(());}
+         for unit in units {
+             let packet = match self.bridge.prepare(unit) {
+                 Ok(p) => p,
+@@ -318,7 +330,9 @@
+             delivery: Delivery::new(self.limit),
+         })
+     }
++    pub fn output_invalidated(&self) -> bool { self.output_invalidated }
+     pub fn commit_seek(&mut self, plan: SeekPlan) {
++        self.output_invalidated=false;
+         if plan.rearm_configuration {
+             self.store.rearm_output_configuration();
+         }
+@@ -361,7 +375,7 @@
+         sink: &mut impl CodecInput,
+         selected: impl Fn(u32) -> bool,
+     ) -> Result<bool, SessionError> {
+-        if self.failed {
++        if self.failed || self.output_invalidated {
+             return Err(SessionError::Failed);
+         }
+         self.delivery.pump_selected(sink, selected).map_err(|_| {
+@@ -371,7 +385,7 @@
+     }
+     /// Input is exhausted, not decoder-output or audible/displayed completion.
+     pub fn input_exhausted(&self) -> bool {
+-        !self.failed && self.ended && self.delivery.is_empty()
++        !self.failed && !self.output_invalidated && self.ended && self.delivery.is_empty()
+     }
+ }
+ 
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -51,6 +51,7 @@
+ }
+ #[derive(Clone)]
+ pub struct FrameStore {
++    replacement_generation: u64,
+     sequence: bool,
+     group_start: Option<i64>,
+     group_end: i64,
+@@ -67,6 +68,7 @@
+ impl FrameStore {
+     pub fn new(limit: usize) -> Self {
+         Self {
++            replacement_generation: 0,
+             sequence: false,
+             group_start: None,
+             group_end: 0,
+@@ -110,6 +112,7 @@
+         self.output_configured.clear();
+         self.output_configs.clear();
+     }
++    pub fn replacement_generation(&self) -> u64 { self.replacement_generation }
+     pub fn bytes(&self) -> usize {
+         self.bytes
+     }
+@@ -262,6 +265,8 @@
+                 .iter()
+                 .position(|f| f.pts_us < end && f.pts_us + f.duration_us > frame.pts_us);
+             if let Some(first) = first {
++                self.replacement_generation=self.replacement_generation.checked_add(1)
++                    .ok_or(StoreError::Quota)?;
+                 let last_overlap = frames
+                     .iter()
+                     .rposition(|f| f.pts_us < end && f.pts_us + f.duration_us > frame.pts_us)
