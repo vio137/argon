@@ -1,0 +1,61 @@
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -497,11 +497,15 @@
+                                 .collect::<Vec<_>>()
+                         };
+                         for (cb, updating, operation) in callbacks {
+-                            cb(AppendNotification {
+-                                operation,
+-                                event: AppendEvent::Error,
+-                            });
++                            // A player-wide decoder failure must not invent an
++                            // append failure on an idle SourceBuffer. Complete
++                            // only accepted in-flight operations; the element
++                            // still receives the terminal Player error below.
+                             if updating {
++                                cb(AppendNotification {
++                                    operation,
++                                    event: AppendEvent::Error,
++                                });
+                                 cb(AppendNotification {
+                                     operation,
+                                     event: AppendEvent::UpdateEnd,
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -767,3 +767,34 @@
+     assert!(matches!(source.add_buffer("video/mp4"),Err(SourceError::Quota)));
+     source.detach();
+ }
++
++#[test]
++fn malformed_append_error_does_not_fabricate_idle_buffer_failure() {
++    use crate::{Player,PlayerEvent,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};
++    use std::{sync::mpsc,time::{Duration,Instant}};
++    let (tx,events)=mpsc::channel();
++    let p=AndroidAppendPlayer::new(115,GenericCallback::new(move|e| {if let Ok(e)=e {let _=tx.send(e);}}).unwrap(),None,Box::new(||{})).unwrap();
++    let (tx,updates)=mpsc::channel();
++    for id in [1,2] {
++        let tx=tx.clone();
++        p.lock().unwrap().append_add_buffer(id,Box::new(move|e|{let _=tx.send((id,e));})).unwrap();
++    }
++    for _ in 0..2 {assert_eq!(updates.recv_timeout(Duration::from_secs(2)).unwrap().1,AppendEvent::Ready);}
++    // A declared box shorter than its own header fails in the actual parser.
++    p.lock().unwrap().append_to_buffer(1,vec![0,0,0,4,b'm',b'o',b'o',b'f']).unwrap();
++    for expected in [AppendEvent::UpdateStart,AppendEvent::Error,AppendEvent::UpdateEnd] {
++        assert_eq!(updates.recv_timeout(Duration::from_secs(2)).unwrap(),(1,expected));
++    }
++    let deadline=Instant::now()+Duration::from_secs(2);
++    loop {
++        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
++            PlayerEvent::Error(_)=>break,
++            PlayerEvent::AppendEpoch{event,..} if matches!(*event,PlayerEvent::Error(_))=>break,
++            _=>()
++        }
++    }
++    assert!(updates.try_recv().is_err(),"idle buffer must not receive error/updateend");
++    assert!(!p.lock().unwrap().can_resume());
++    assert!(p.lock().unwrap().append_to_buffer(2,vec![]).is_err());
++    p.lock().unwrap().stop().unwrap();
++}
