@@ -1244,10 +1244,10 @@ index 2fd4c04e2..fcf03833f 100644
      fn append_set_timestamp_offset(&self,_id:u32,_offset:f64)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
      fn append_timestamp_offset(&self,_id:u32)->Option<f64>{None}
 diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
-index 94336be1b..db6831e25 100644
+index 94336be1b..fd3fe3c33 100644
 --- a/components/script/dom/mse/sourcebuffer.rs
 +++ b/components/script/dom/mse/sourcebuffer.rs
-@@ -342,10 +342,18 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+@@ -342,10 +342,19 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
          }
          Ok(())
      }
@@ -1262,6 +1262,7 @@ index 94336be1b..db6831e25 100644
 +        if self.updating.get() {
 +            return Err(Error::InvalidState(None));
 +        }
++        let mime = mime.to_string();
 +        self.buffer
 +            .validate_change_type(&mime)
 +            .map_err(source_error)?;
