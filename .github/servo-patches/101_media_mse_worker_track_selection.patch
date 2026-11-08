@@ -1,0 +1,197 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -435,6 +435,9 @@
+     pub highest_pts: Option<i64>,
+     pub highest_end: i64,
+     pub removal_generation: u64,
++    pub selection_generation: u64,
++    pub audio_selected: bool,
++    pub video_selected: bool,
+     pub rendered_frames: u64,
+     pub video_size: Option<(u16, u16)>,
+     pub has_audio: bool,
+@@ -487,6 +490,7 @@
+ pub struct AppendPlayback {
+     sessions: BTreeMap<u32, AppendSession>,
+     selection: TrackSelection,
++    selection_generation: u64,
+     removal_generation: u64,
+     input_ended: bool,
+     declared_duration_us: Option<i64>,
+@@ -522,6 +526,7 @@
+     pub fn new(renderer: Arc<Mutex<dyn VideoFrameRenderer>>) -> Self {
+         Self {
+             sessions: BTreeMap::new(),
++            selection_generation: 0,
+             selection: TrackSelection {
+                 audio: true,
+                 video: true,
+@@ -779,11 +784,24 @@
+     /// Private owner operation only. Stage every delivery plan before touching
+     /// native output or selection. DOM/worker control connection is separate.
+     pub fn set_track_selection(&mut self, audio: bool, video: bool) -> Result<(), ()> {
++        let generation = self.selection_generation.checked_add(1).ok_or(())?;
++        self.set_track_selection_generation(generation, audio, video)
++    }
++    pub fn set_track_selection_generation(
++        &mut self,
++        generation: u64,
++        audio: bool,
++        video: bool,
++    ) -> Result<(), ()> {
++        if generation <= self.selection_generation {
++            return Err(());
++        }
+         if self.failed {
+             return Err(());
+         }
+         let next = TrackSelection { audio, video };
+         if next == self.selection {
++            self.selection_generation = generation;
+             return Ok(());
+         }
+         let position = self.clock.now_us();
+@@ -819,6 +837,7 @@
+             .flatten();
+         self.reset_output_epoch(target, floor);
+         self.selection = next;
++        self.selection_generation = generation;
+         self.removed_target = (!covered && (audio || video)).then_some(target);
+         if !covered {
+             self.seek_target = None;
+@@ -1215,6 +1234,9 @@
+                 .max(),
+             highest_end: self.largest_track_end(),
+             removal_generation: self.removal_generation,
++            selection_generation: self.selection_generation,
++            audio_selected: self.selection.audio,
++            video_selected: self.selection.video,
+             rendered_frames: self.rendered_frames,
+             video_size: self.decoders.video_size.or_else(|| {
+                 self.sessions
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1532,3 +1532,24 @@
+     assert_eq!(p.video_seek_floor, Some(500_000));
+     assert!(!p.take_seek_ready());
+ }
++
++#[test]
++fn selection_generation_is_monotonic_and_noop_ack_does_not_reset_output_epoch() {
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(Arc::new(Mutex::new(vec![]))))));
++    p.clock.rebase(42);
++    p.clock.pause();
++    p.rendered_frames = 9;
++    p.set_track_selection_generation(7, true, true).unwrap();
++    assert_eq!(p.selection_generation, 7);
++    assert_eq!(p.rendered_frames, 9);
++    assert_eq!(p.position_us(), 42);
++    assert!(p.set_track_selection_generation(7, false, false).is_err());
++    assert_eq!(
++        p.selection,
++        TrackSelection {
++            audio: true,
++            video: true
++        }
++    );
++    assert_eq!(p.rendered_frames, 9);
++}
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -55,6 +55,11 @@
+     },
+     ReopenInput,
+     EndInput,
++    TrackSelection {
++        generation: u64,
++        audio: bool,
++        video: bool,
++    },
+     Playing(bool),
+     Volume {
+         volume: f32,
+@@ -81,6 +86,7 @@
+     Duration,
+     InputReopened,
+     InputEnded,
++    TrackSelection(u64),
+     Playing,
+     Volume,
+ }
+@@ -168,6 +174,9 @@
+                                     },
+                                     Command::ChangeType(id) => Applied::TypeChanged(*id),
+                                     Command::Duration { .. } => Applied::Duration,
++                                    Command::TrackSelection { generation, .. } => {
++                                        Applied::TrackSelection(*generation)
++                                    },
+                                     Command::ReopenInput => Applied::InputReopened,
+                                     Command::EndInput => Applied::InputEnded,
+                                     Command::Playing(_) => Applied::Playing,
+@@ -253,6 +262,17 @@
+                                         Ok(())
+                                     },
+                                     Command::EndInput => playback.end_input(),
++                                    Command::TrackSelection {
++                                        generation,
++                                        audio,
++                                        video,
++                                    } => {
++                                        playback.set_track_selection_generation(
++                                            generation, audio, video,
++                                        )?;
++                                        output_finished = false;
++                                        Ok(())
++                                    },
+                                     Command::Playing(playing) => playback.set_playing(playing),
+                                     Command::Volume { volume, muted } => {
+                                         playback.set_volume(volume, muted)
+@@ -733,4 +753,45 @@
+             }
+         }
+     }
++    #[test]
++    fn track_selection_status_generation_precedes_ack_and_disabling_cannot_finish_pending_seek() {
++        let (tx, rx) = mpsc::channel();
++        let worker = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |e| {
++                let _ = tx.send(e);
++            }),
++        )
++        .unwrap();
++        let send = |c| assert!(worker.try_command(c).is_ok());
++        send(Command::AddBuffer(1));
++        send(Command::Seek {
++            operation: 201,
++            target_us: 500_000,
++        });
++        send(Command::TrackSelection {
++            generation: 3,
++            audio: false,
++            video: false,
++        });
++        let mut seen = false;
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::Status(s) if s.selection_generation == 3 => {
++                    assert!(!s.audio_selected && !s.video_selected);
++                    assert!(!s.finished);
++                    assert!(!s.playing);
++                    seen = true;
++                },
++                Event::CommandApplied(Applied::TrackSelection(3)) => {
++                    assert!(seen);
++                    break;
++                },
++                Event::Error | Event::SeekReady { .. } | Event::SeekRejected(_) => {
++                    panic!("selection manufactured seek completion/error")
++                },
++                _ => (),
++            }
++        }
++    }
+ }
