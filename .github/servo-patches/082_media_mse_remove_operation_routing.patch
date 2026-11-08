@@ -1,0 +1,401 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 3fb5a16ff..554a78706 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -690,6 +690,9 @@ impl AppendPlayback {
+         self.seek_started = Some(Instant::now());
+         focus::set_counted(&mut self.focus_counted, false);
+     }
++    pub fn position_us(&self) -> i64 {
++        self.clock.now_us()
++    }
+     pub fn take_seek_ready(&mut self) -> bool {
+         std::mem::take(&mut self.seek_ready)
+     }
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 1fabc8f17..2e3ae83c9 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -21,6 +21,7 @@ use std::{
+ struct BufferState {
+     ready: bool,
+     updating: bool,
++    removing: bool,
+     operation: u64,
+     callback: Arc<dyn Fn(AppendNotification) + Send + Sync>,
+ }
+@@ -105,6 +106,24 @@ impl AndroidAppendPlayer {
+                     }
+                 };
+                 match event {
++                    Event::RemoveRejected(id, operation) => {
++                        let cb = {
++                            let mut s = shared.lock().unwrap();
++                            s.buffers
++                                .get_mut(&id)
++                                .filter(|b| b.accepts(operation))
++                                .map(|b| {
++                                    b.updating = false;
++                                    b.removing = false;
++                                    b.callback.clone()
++                                })
++                        };
++                        if let Some(cb) = cb {
++                            for event in [AppendEvent::Error, AppendEvent::UpdateEnd] {
++                                cb(AppendNotification { operation, event });
++                            }
++                        }
++                    },
+                     Event::SeekReady {
+                         operation,
+                         target_us,
+@@ -154,7 +173,9 @@ impl AndroidAppendPlayer {
+                             });
+                         }
+                     },
+-                    Event::CommandApplied(Applied::Appended(id, operation)) => {
++                    Event::CommandApplied(
++                        Applied::Appended(id, operation) | Applied::Removed(id, operation),
++                    ) => {
+                         let cb = {
+                             let mut s = shared.lock().unwrap();
+                             s.buffers
+@@ -163,6 +184,7 @@ impl AndroidAppendPlayer {
+                                 .map(|b| {
+                                     let updating = b.updating;
+                                     b.updating = false;
++                                    b.removing = false;
+                                     (b.callback.clone(), updating)
+                                 })
+                         };
+@@ -561,12 +583,50 @@ impl Player for AndroidAppendPlayer {
+             Box::new(move |notification| callback(notification.event)),
+         )
+     }
++    fn append_remove(&self, id: u32, start: f64, end: f64) -> Result<u64, PlayerError> {
++        if !start.is_finite()
++            || start < 0.0
++            || end.is_nan()
++            || end <= start
++            || start * 1e6 >= i64::MAX as f64
++            || (end.is_finite() && end * 1e6 >= i64::MAX as f64)
++        {
++            return Err(PlayerError::SeekOutOfRange);
++        }
++        let mut s = self.state.lock().unwrap();
++        if s.stopped
++            || s.input_ended
++            || s.pending_seek.is_some()
++            || s.buffers.values().any(|b| !b.ready || b.updating)
++        {
++            return Err(error());
++        }
++        let b = s.buffers.get_mut(&id).ok_or_else(error)?;
++        let operation = b.operation.checked_add(1).ok_or_else(error)?;
++        self.command(Command::Remove {
++            buffer_id: id,
++            operation,
++            start: (start * 1e6) as i64,
++            end: if end == f64::INFINITY {
++                i64::MAX
++            } else {
++                (end * 1e6) as i64
++            },
++        })?;
++        b.operation = operation;
++        b.updating = true;
++        b.removing = true;
++        Ok(operation)
++    }
+     fn append_abort(&self, id: u32) -> Result<u64, PlayerError> {
+         let mut s = self.state.lock().unwrap();
+         if s.stopped || s.input_ended {
+             return Err(error());
+         }
+         let buffer = s.buffers.get_mut(&id).ok_or_else(error)?;
++        if buffer.removing {
++            return Err(error());
++        }
+         let operation = buffer.operation.checked_add(1).ok_or_else(error)?;
+         // No callbacks are emitted for this command before or after acceptance.
+         // The caller owns abort/updateend event delivery and its task floor.
+@@ -589,6 +649,7 @@ impl Player for AndroidAppendPlayer {
+             BufferState {
+                 ready: false,
+                 updating: false,
++                removing: false,
+                 operation: 0,
+                 callback: Arc::from(callback),
+             },
+@@ -798,6 +859,7 @@ mod tests {
+         let mut buffer = BufferState {
+             ready: true,
+             updating: true,
++            removing: false,
+             operation: 2,
+             callback: Arc::new(|_| {}),
+         };
+@@ -893,6 +955,7 @@ mod tests {
+                 BufferState {
+                     ready: false,
+                     updating: false,
++                    removing: false,
+                     operation: 0,
+                     callback: Arc::new(|_| {}),
+                 },
+@@ -933,6 +996,7 @@ mod tests {
+                 BufferState {
+                     ready: true,
+                     updating: false,
++                    removing: false,
+                     operation: 0,
+                     callback: Arc::new(|_| {}),
+                 },
+@@ -977,6 +1041,7 @@ mod tests {
+                 BufferState {
+                     ready: true,
+                     updating: false,
++                    removing: false,
+                     operation: 0,
+                     callback: Arc::new(|_| {}),
+                 },
+@@ -1075,4 +1140,17 @@ mod tests {
+             Some(0)
+         );
+     }
++    #[test]
++    fn removal_cannot_be_aborted_and_queue_rejection_does_not_advance_operation() {
++        let p=seek_test_player();let p=p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker,_rx)=Worker::saturated_for_test();*p.worker.lock().unwrap()=Some(worker);
++        p.state.lock().unwrap().buffers.insert(1,BufferState{ready:true,updating:true,removing:true,operation:19,callback:Arc::new(|_|{})});
++        assert!(p.append_abort(1).is_err());
++        {let s=p.state.lock().unwrap();let b=s.buffers.get(&1).unwrap();assert!(b.removing);assert!(b.updating);assert_eq!(b.operation,19);}
++        {let mut s=p.state.lock().unwrap();let b=s.buffers.get_mut(&1).unwrap();b.updating=false;b.removing=false;}
++        assert_eq!(p.append_remove(1,0.0,1.0),Err(PlayerError::EnoughData));
++        let s=p.state.lock().unwrap();let b=s.buffers.get(&1).unwrap();assert_eq!(b.operation,19);assert!(!b.updating);assert!(!b.removing);
++    }
++
+ }
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index 13f9c7c60..78b7e2772 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -18,6 +18,12 @@ use std::{
+ 
+ pub enum Command {
+     AddBuffer(u32),
++    Remove {
++        buffer_id: u32,
++        operation: u64,
++        start: i64,
++        end: i64,
++    },
+     Seek {
+         operation: u64,
+         target_us: i64,
+@@ -48,6 +54,7 @@ pub enum SendError {
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Applied {
+     BufferAdded(u32),
++    Removed(u32, u64),
+     SeekStarted(u64),
+     AppendAborted(u32),
+     Appended(u32, u64),
+@@ -58,6 +65,7 @@ pub enum Applied {
+ }
+ pub enum Event {
+     AppendStarted(u32, u64),
++    RemoveRejected(u32, u64),
+     SeekReady {
+         operation: u64,
+         target_us: i64,
+@@ -108,6 +116,11 @@ impl Worker {
+                         match rx.recv_timeout(Duration::from_millis(5)) {
+                             Ok(command) => {
+                                 let ack = match &command {
++                                    Command::Remove {
++                                        buffer_id,
++                                        operation,
++                                        ..
++                                    } => Applied::Removed(*buffer_id, *operation),
+                                     Command::Seek { operation, .. } => {
+                                         Applied::SeekStarted(*operation)
+                                     },
+@@ -126,6 +139,27 @@ impl Worker {
+                                     Command::Volume { .. } => Applied::Volume,
+                                 };
+                                 let applied = match command {
++                                    Command::Remove {
++                                        buffer_id,
++                                        operation,
++                                        start,
++                                        end,
++                                    } => {
++                                        let target = playback.position_us();
++                                        if playback
++                                            .remove_and_stall_if_needed(
++                                                buffer_id, start, end, target,
++                                            )
++                                            .is_err()
++                                        {
++                                            event(Event::RemoveRejected(buffer_id, operation));
++                                            continue;
++                                        }
++                                        pending_seek = None;
++                                        output_finished = false;
++                                        event(Event::AppendStarted(buffer_id, operation));
++                                        Ok(())
++                                    },
+                                     Command::Seek {
+                                         operation,
+                                         target_us,
+@@ -509,4 +543,39 @@ mod tests {
+             }
+         }
+     }
++    #[test]
++    fn invalid_removal_is_tagged_rejection_not_fatal_worker_error() {
++        let (tx, rx) = mpsc::channel();
++        let w = Worker::spawn(
++            Arc::new(Mutex::new(Renderer)),
++            Box::new(move |e| {
++                let _ = tx.send(e);
++            }),
++        )
++        .unwrap();
++        assert!(
++            w.try_command(Command::Remove {
++                buffer_id: 7,
++                operation: 82,
++                start: 0,
++                end: 100
++            })
++            .is_ok()
++        );
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::RemoveRejected(7, 82) => break,
++                Event::Error => panic!("invalid removal fatal"),
++                _ => (),
++            }
++        }
++        assert!(w.try_command(Command::Playing(false)).is_ok());
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                Event::CommandApplied(Applied::Playing) => break,
++                Event::Error => panic!("worker poisoned"),
++                _ => (),
++            }
++        }
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index cd02f3ea8..9492e9331 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -112,6 +112,7 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::SetStreamFailed)
+     }
+     fn append_add_buffer_operations(&self,_id:u32,_callback:append::AppendOperationCallback)->Result<(),PlayerError> {Err(PlayerError::SetStreamFailed)}
++    fn append_remove(&self,_id:u32,_start:f64,_end:f64)->Result<u64,PlayerError>{Err(PlayerError::BufferPushFailed)}
+     /// Return an operation floor for filtering canceled notifications.
+     fn append_abort(&self,_id:u32)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
+     fn append_to_buffer_operation(&self,_id:u32,_bytes:Vec<u8>)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index 7f4ddbb56..c6ebf4786 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -247,3 +247,23 @@ mod pipeline_tests {
+         }
+     }
+ }
++
++#[cfg(test)] mod remove_pipeline_tests {
++ use crate::{append_source::*,append::AppendEvent,Player,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ #[test] fn removal_lifecycle_updates_retained_ranges_and_allows_later_append() {
++  let p=AndroidAppendPlayer::new(82,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p.clone()).unwrap();
++  let buffer=source.add_buffer("video/mp4").unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  buffer.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,1)){break;}}
++  buffer.remove(0.0,0.25).unwrap();assert!(buffer.updating());
++  for expected in [AppendEvent::UpdateStart,AppendEvent::Update,AppendEvent::UpdateEnd]{assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(buffer.id(),expected,2));}
++  assert!(!buffer.updating());assert_eq!(buffer.buffered(),[0.5..1.0]);
++  assert!(p.lock().unwrap().can_resume());
++  buffer.append(vec![]).unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,3)){break;}}
++  assert_eq!(buffer.remove(-1.0,0.5),Err(SourceError::Type));assert!(!buffer.updating());source.detach();
++ }
++}
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+index e2af697a5..742eba6f5 100644
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -36,6 +36,7 @@ struct Buffer {
+     offset: f64,
+     window: std::ops::Range<f64>,
+     updating: bool,
++    removing: bool,
+     ready: bool,
+     floor: u64,
+     operation: u64,
+@@ -123,6 +124,7 @@ impl AppendSource {
+                     offset: 0.0,
+                     window: 0.0..f64::INFINITY,
+                     updating: false,
++                    removing: false,
+                     ready: false,
+                     floor: 0,
+                     operation: 0,
+@@ -155,7 +157,8 @@ impl AppendSource {
+                         AppendEvent::UpdateEnd | AppendEvent::Closed
+                             if operation == b.operation =>
+                         {
+-                            b.updating = false
++                            b.updating = false;
++                            b.removing = false;
+                         },
+                         _ => (),
+                     }
+@@ -325,7 +328,7 @@ impl AppendBuffer {
+         let mut s = inner.state.lock().unwrap();
+         if s.epoch != self.epoch
+             || s.state != SourceState::Open
+-            || !s.buffers.contains_key(&self.id)
++            || s.buffers.get(&self.id).is_none_or(|b|b.removing)
+         {
+             return Err(SourceError::InvalidState);
+         }
+@@ -347,6 +350,17 @@ impl AppendBuffer {
+         buffer.window = 0.0..f64::INFINITY;
+         Ok(())
+     }
++    pub fn remove(&self,start:f64,end:f64)->Result<(),SourceError>{
++        let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;
++        let mut s=inner.state.lock().unwrap();
++        if s.epoch!=self.epoch || s.state!=SourceState::Open || s.buffers.get(&self.id).is_none_or(|b|b.updating){return Err(SourceError::InvalidState);}
++        if !start.is_finite() || start<0.0 || end.is_nan() || end<=start {return Err(SourceError::Type);}
++        let player=s.player.clone().ok_or(SourceError::InvalidState)?;
++        let operation=player.lock().unwrap().append_remove(self.id,start,end).map_err(|e|if e==PlayerError::EnoughData{SourceError::Quota}else{SourceError::Backend})?;
++        let b=s.buffers.get_mut(&self.id).ok_or(SourceError::InvalidState)?;
++        b.operation=operation;b.updating=true;b.removing=true;
++        Ok(())
++    }
+     pub fn append(&self, bytes: Vec<u8>) -> Result<(), SourceError> {
+         let inner = self.owner.upgrade().ok_or(SourceError::InvalidState)?;
+         let mut s = inner.state.lock().unwrap();
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 39185623d..84aac9f72 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -150,6 +150,7 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::SetStreamFailed)
+     }
+     fn append_add_buffer_operations(&self,_id:u32,_callback:append::AppendOperationCallback)->Result<(),PlayerError> {Err(PlayerError::SetStreamFailed)}
++    fn append_remove(&self,_id:u32,_start:f64,_end:f64)->Result<u64,PlayerError>{Err(PlayerError::BufferPushFailed)}
+     /// Return an operation floor for filtering canceled notifications.
+     fn append_abort(&self,_id:u32)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
+     fn append_to_buffer_operation(&self,_id:u32,_bytes:Vec<u8>)->Result<u64,PlayerError> {Err(PlayerError::BufferPushFailed)}
