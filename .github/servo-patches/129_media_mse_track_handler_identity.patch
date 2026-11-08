@@ -1,0 +1,80 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1073,3 +1073,32 @@
+   }
+  }
+ }
++
++#[test]
++fn handler_and_codec_identity_must_agree_before_replacing_init() {
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoovBox,HdlrBox,SampleEntry}};
++ use servo_media_android_hosttest::mse_demux::Error;
++ for fixture in [include_bytes!("fixtures/synthetic-fmp4.mp4").as_slice(),include_bytes!("fixtures/synthetic-aac.mp4").as_slice()] {
++  let mut framer=BoxFramer::new(1<<20);framer.append(fixture).unwrap();let mut bs=vec![];
++  while let Some(b)=framer.pop_box().unwrap(){bs.push(b);}
++  let ftyp=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap();let bytes=bs.iter().find(|b|&b[4..8]==b"moov").unwrap();
++  let(moov,_)=MoovBox::decode(bytes).unwrap();let mut original=ftyp.clone();original.extend_from_slice(bytes);
++  for mode in 0..3 {
++   let mut bad=moov.clone();let track=&mut bad.trak_boxes[0];
++   match mode {
++    0=>{track.mdia_box.hdlr_box.handler_type=if matches!(track.mdia_box.minf_box.stbl_box.stsd_box.entries[0],SampleEntry::Avc1(_)){HdlrBox::HANDLER_TYPE_SOUN}else{HdlrBox::HANDLER_TYPE_VIDE};},
++    1=>{track.mdia_box.hdlr_box.handler_type=*b"meta";},
++    _=>{track.tkhd_box.track_id=0;bad.mvex_box.as_mut().unwrap().trex_boxes[0].track_id=0;},
++   }
++   let mut init=ftyp.clone();init.extend(bad.encode_to_vec().unwrap());
++   let mut d=Demux::new(1<<20,64);d.init(&original).unwrap();let previous=d.descriptions().to_vec();
++   assert_eq!(d.init(&init),Err(Error::UnsupportedLayout),"mode={mode}");assert_eq!(d.descriptions(),previous);
++   let mut baseline=Demux::new(1<<20,64);baseline.init(&original).unwrap();
++   for pair in bs.windows(2) {if &pair[0][4..8]==b"moof"&&&pair[1][4..8]==b"mdat" {
++    let mut segment=pair[0].clone();segment.extend_from_slice(&pair[1]);
++    let got=d.media(&segment).unwrap();let expected=baseline.media(&segment).unwrap();
++    assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.track_id,a.pts_us,a.duration_us),(b.track_id,b.pts_us,b.duration_us));}
++   }}
++  }
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -1,7 +1,7 @@
+ //! Private, unintegrated fMP4 adapter prototype. Not advertised as MSE support.
+ use shiguredo_mp4::{
+     Decode, Encode,
+-    boxes::{MoofBox, MoovBox, SampleEntry},
++    boxes::{HdlrBox, MoofBox, MoovBox, SampleEntry},
+     demux::Fmp4SegmentDemuxer,
+ };
+ use std::ops::Range;
+@@ -365,7 +365,7 @@
+                 return Err(Error::UnsupportedLayout);
+             }
+             let entries = &minf.stbl_box.stsd_box.entries;
+-            if entries.len() != 1
++            if track.tkhd_box.track_id==0 || entries.len() != 1
+                 || descriptions.len() >= 2
+                 || descriptions
+                     .iter()
+@@ -377,6 +377,12 @@
+                 .ok_or(Error::UnsupportedLayout)?;
+             let description = match &entries[0] {
+                 SampleEntry::Avc1(entry) => {
++                    // The dependency chooses tracks by handler, while this
++                    // adapter chooses decoders by sample entry. They must
++                    // agree before accepting replacement configuration.
++                    if track.mdia_box.hdlr_box.handler_type!=HdlrBox::HANDLER_TYPE_VIDE {
++                        return Err(Error::UnsupportedLayout);
++                    }
+                     if entry.visual.data_reference_index.get()!=1 {return Err(Error::UnsupportedLayout);}
+                     let config = avc::AvcConfig::from_entry(&entries[0], self.max_bytes)
+                         .map_err(|_| Error::InvalidSample)?;
+@@ -391,6 +397,9 @@
+                     }
+                 },
+                 SampleEntry::Mp4a(entry) => {
++                    if track.mdia_box.hdlr_box.handler_type!=HdlrBox::HANDLER_TYPE_SOUN {
++                        return Err(Error::UnsupportedLayout);
++                    }
+                     if entry.audio.data_reference_index.get()!=1 {return Err(Error::UnsupportedLayout);}
+                     let desc = &entry.esds_box.es.dec_config_descr;
+                     let asc = &desc
