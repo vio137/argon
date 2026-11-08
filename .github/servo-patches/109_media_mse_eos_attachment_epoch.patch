@@ -1,0 +1,74 @@
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -51,6 +51,17 @@
+     buffers: BTreeMap<u32, Buffer>,
+     next_id: u32,
+     epoch: u64,
++}
++impl State {
++    // Backend acceptance is outside this mutex. Detach/reattach may have
++    // replaced the source while it was pending; never resurrect that source.
++    fn commit_end_input(&mut self, epoch: u64) -> Result<(), SourceError> {
++        if self.epoch != epoch || self.state != SourceState::Open {
++            return Err(SourceError::InvalidState);
++        }
++        self.state = SourceState::Ended;
++        Ok(())
++    }
+ }
+ struct Inner {
+     state: Mutex<State>,
+@@ -302,19 +313,19 @@
+         Ok(())
+     }
+     pub fn end_input(&self) -> Result<(), SourceError> {
+-        let player = {
++        let (player, epoch) = {
+             let s = self.0.state.lock().unwrap();
+             if s.state != SourceState::Open || s.buffers.values().any(|b| b.updating || !b.ready) {
+                 return Err(SourceError::InvalidState);
+             }
+-            s.player.clone().ok_or(SourceError::InvalidState)?
++            (s.player.clone().ok_or(SourceError::InvalidState)?, s.epoch)
+         };
+         player
+             .lock()
+             .unwrap()
+             .end_of_stream()
+             .map_err(|_| SourceError::Backend)?;
+-        self.0.state.lock().unwrap().state = SourceState::Ended;
++        self.0.state.lock().unwrap().commit_end_input(epoch)?;
+         (self.0.callback)(SourceEvent::Ended);
+         Ok(())
+     }
+@@ -591,3 +602,29 @@
+     }
+     count > 0 && count <= 2
+ }
++
++#[cfg(test)]
++mod end_input_epoch_tests {
++    use super::*;
++    #[test]
++    fn accepted_eos_cannot_resurrect_detached_source() {
++        let source = AppendSource::new(Arc::new(|_| {}));
++        let mut state = source.0.state.lock().unwrap();
++        state.epoch = 3;
++        state.state = SourceState::Closed;
++        assert_eq!(state.commit_end_input(3), Err(SourceError::InvalidState));
++        assert_eq!(state.state, SourceState::Closed);
++    }
++    #[test]
++    fn accepted_eos_from_old_attachment_cannot_end_replacement() {
++        let source = AppendSource::new(Arc::new(|_| {}));
++        let mut state = source.0.state.lock().unwrap();
++        state.epoch = 4;
++        state.state = SourceState::Open;
++        assert_eq!(state.commit_end_input(3), Err(SourceError::InvalidState));
++        assert_eq!(state.state, SourceState::Open);
++        assert_eq!(state.commit_end_input(4), Ok(()));
++        assert_eq!(state.state, SourceState::Ended);
++        assert_eq!(state.commit_end_input(4), Err(SourceError::InvalidState));
++    }
++}
