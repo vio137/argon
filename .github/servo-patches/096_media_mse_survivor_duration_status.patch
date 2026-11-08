@@ -1,0 +1,130 @@
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -55,6 +55,31 @@
+     buffer_tracks: BTreeMap<u32, Vec<servo_media_player::append::AppendTrack>>,
+ }
+ impl State {
++    /// A pre-removal status still describes the surviving buffers accurately.
++    /// Worker statuses precede operation acknowledgements, so retain these
++    /// bounds before allowing updateend to unblock synchronous duration checks.
++    /// Buffer identities are monotonic and removed IDs must never reappear.
++    fn apply_buffer_duration_bounds(&mut self, bounds: &[(u32, Option<i64>, i64)]) {
++        self.buffer_duration_bounds = bounds
++            .iter()
++            .filter(|(id, _, _)| self.buffers.contains_key(id))
++            .map(|(id, pts, end)| (*id, (*pts, *end)))
++            .collect();
++        self.recalculate_duration_bounds();
++    }
++    fn recalculate_duration_bounds(&mut self) {
++        self.highest_pts = self
++            .buffer_duration_bounds
++            .values()
++            .filter_map(|(pts, _)| *pts)
++            .max();
++        self.highest_end = self
++            .buffer_duration_bounds
++            .values()
++            .map(|(_, end)| *end)
++            .max()
++            .unwrap_or(0);
++    }
+     fn apply_duration_status(
+         &mut self,
+         generation: u64,
+@@ -286,16 +311,10 @@
+                         };
+                         let duration_changed = {
+                             let mut s = shared.lock().unwrap();
++                            s.apply_buffer_duration_bounds(&status.buffer_duration_bounds);
+                             if status.removal_generation < s.removal_generation {
+                                 return;
+                             }
+-                            s.buffer_duration_bounds = status
+-                                .buffer_duration_bounds
+-                                .iter()
+-                                .map(|(id, pts, end)| (*id, (*pts, *end)))
+-                                .collect();
+-                            s.highest_pts = status.highest_pts;
+-                            s.highest_end = status.highest_end;
+                             s.timestamp_offsets =
+                                 status.timestamp_offsets.iter().copied().collect();
+                             s.parsing_media_segments =
+@@ -581,17 +600,7 @@
+         s.removal_generation = generation;
+         s.buffers.remove(&id);
+         s.buffer_duration_bounds.remove(&id);
+-        s.highest_pts = s
+-            .buffer_duration_bounds
+-            .values()
+-            .filter_map(|(pts, _)| *pts)
+-            .max();
+-        s.highest_end = s
+-            .buffer_duration_bounds
+-            .values()
+-            .map(|(_, end)| *end)
+-            .max()
+-            .unwrap_or(0);
++        s.recalculate_duration_bounds();
+         s.buffer_ranges.remove(&id);
+         s.buffer_tracks.remove(&id);
+         s.timestamp_offsets.remove(&id);
+@@ -1775,4 +1784,57 @@
+         rx.recv().unwrap();
+         assert_eq!(p.append_set_duration(0.5), Ok((1.0, 1)));
+     }
++    #[test]
++    fn surviving_append_bounds_arriving_after_removal_are_retained_before_updateend() {
++        let p = AndroidAppendPlayer::new(
++            100,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = p.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        rx.recv().unwrap();
++        {
++            let mut s = p.state.lock().unwrap();
++            for id in [1, 2] {
++                s.buffers.insert(
++                    id,
++                    BufferState {
++                        ready: true,
++                        updating: id == 2,
++                        removing: false,
++                        operation: 1,
++                        callback: Arc::new(|_| {}),
++                    },
++                );
++            }
++            s.duration_seconds = 10.0;
++            s.apply_buffer_duration_bounds(&[
++                (1, Some(9_000_000), 10_000_000),
++                (2, Some(500_000), 1_000_000),
++            ]);
++        }
++        p.append_remove_buffer(1).unwrap();
++        rx.recv().unwrap();
++        {
++            let mut s = p.state.lock().unwrap();
++            assert_eq!(s.removal_generation, 1);
++            // The survivor append finished in generation0, but removeSourceBuffer
++            // accepted generation1 before its Status callback acquired State.
++            s.apply_buffer_duration_bounds(&[
++                (1, Some(9_000_000), 10_000_000),
++                (2, Some(2_000_000), 3_000_000),
++            ]);
++            assert!(!s.buffer_duration_bounds.contains_key(&1));
++            assert_eq!(s.highest_pts, Some(2_000_000));
++            assert_eq!(s.highest_end, 3_000_000);
++            s.buffers.get_mut(&2).unwrap().updating = false;
++        }
++        assert_eq!(p.append_set_duration(1.0), Err(PlayerError::SeekOutOfRange));
++        assert_eq!(p.append_set_duration(2.0), Ok((3.0, 1)));
++    }
+ }
