@@ -1,0 +1,119 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -748,8 +748,13 @@
+     fn buffer_ranges(&self) -> Vec<(u32, Vec<std::ops::Range<i64>>)> {
+         self.sessions
+             .iter()
+-            .map(|(id, s)| (*id, s.buffered()))
++            .map(|(id, s)| (*id, s.reported_buffered(self.input_ended)))
+             .collect()
++    }
++    fn reported_buffered(&self) -> Vec<std::ops::Range<i64>> {
++        crate::mse_demux::timeline::reported_intersection(
++            self.sessions.values().filter(|s|self.selection.active(s))
++                .map(|s|s.reported_buffered(self.input_ended)).collect(),self.input_ended)
+     }
+     fn buffered_for(&self, selection: TrackSelection) -> Vec<std::ops::Range<i64>> {
+         let mut buffers = self
+@@ -1251,7 +1256,7 @@
+             all_buffers_ready: !self.sessions.is_empty()
+                 && self.sessions.values().all(|s| !s.descriptions().is_empty()),
+             current_data: self.has_current_data(),
+-            buffered: self.buffered(),
++            buffered: self.reported_buffered(),
+             buffer_ranges: self.buffer_ranges(),
+             timestamp_offsets: self
+                 .sessions
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1600,3 +1600,20 @@
+     assert_eq!(p.decoders.video_size,Some((4,8)));
+     assert_eq!(p.decoders.configs[&1].rotation_degrees,90);
+ }
++
++#[test]
++fn ended_reported_ranges_extend_shorter_tail_but_decoder_coverage_and_reopen_stay_real() {
++ let frames=Arc::new(Mutex::new(vec![]));
++ let mut p=AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++ p.add_buffer(1).unwrap();p.add_buffer(2).unwrap();
++ p.append(1,include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4")).unwrap();
++ p.append(2,include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4")).unwrap();
++ let before=p.reported_buffered();assert_eq!(before,p.buffered());
++ let highest=p.largest_track_end();assert!(before.last().unwrap().end<highest);
++ p.end_input().unwrap();
++ let mut expected=before.clone();expected.last_mut().unwrap().end=highest;
++ assert_eq!(p.reported_buffered(),expected);
++ assert_eq!(p.buffered(),before,"reporting must not fabricate decoder coverage");
++ p.reopen_input().unwrap();assert_eq!(p.reported_buffered(),before);
++ assert_eq!(p.buffer_ranges().iter().find(|(id,_)|*id==1).unwrap().1,[0..1_000_000]);
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -339,6 +339,9 @@
+     pub fn descriptions(&self) -> &[super::TrackDescription] {
+         self.stream.descriptions()
+     }
++    pub fn reported_buffered(&self, ended: bool) -> Vec<std::ops::Range<i64>> {
++        self.store.reported_buffered(ended)
++    }
+     pub fn buffered(&self) -> Vec<std::ops::Range<i64>> {
+         self.store.buffered()
+     }
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -6,6 +6,25 @@
+     ops::Deref,
+     sync::Arc,
+ };
++/// Observable MSE ranges, separate from actual decoder coverage. At ended,
++/// only the final range is extended. Interior gaps and empty tracks remain.
++pub fn reported_intersection(mut tracks: Vec<Vec<std::ops::Range<i64>>>, ended: bool)
++    -> Vec<std::ops::Range<i64>> {
++    let highest=tracks.iter().flat_map(|r|r.iter().map(|r|r.end)).max().unwrap_or(0);
++    if tracks.is_empty() || highest<=0 {return vec![];}
++    let mut result=vec![0..highest];
++    for ranges in &mut tracks {
++        if ended {if let Some(last)=ranges.last_mut() {last.end=highest;}}
++        let mut next=vec![];
++        for a in &result {for b in ranges.iter() {
++            let start=a.start.max(b.start);let end=a.end.min(b.end);
++            if start<end {next.push(start..end);}
++        }}
++        result=next;
++    }
++    result
++}
++
+ #[derive(Clone)]
+ struct ConfigEpoch {
+     rotation_degrees: i32,
+@@ -386,6 +405,9 @@
+     }
+     /// Buffered is the intersection across multiplexed tracks, never their
+     /// union. A range without audio is not sufficient audio/video coverage.
++    pub fn reported_buffered(&self, ended: bool) -> Vec<std::ops::Range<i64>> {
++        reported_intersection(self.tracks.keys().map(|id|self.ranges(*id)).collect(),ended)
++    }
+     pub fn buffered(&self) -> Vec<std::ops::Range<i64>> {
+         self.buffered_selected(|_| true)
+     }
+@@ -978,3 +1000,15 @@
+         assert_eq!(s.ranges(1), [0..10]);
+     }
+ }
++
++#[cfg(test)]
++mod reported_range_tests {
++ use super::*;
++ #[test] fn ended_extends_only_final_ranges_without_creating_samples_or_filling_gaps() {
++  let ranges=vec![vec![0..5,10..15],vec![0..4,10..12]];
++  assert_eq!(reported_intersection(ranges.clone(),false),[0..4,10..12]);
++  assert_eq!(reported_intersection(ranges,true),[0..4,10..15]);
++  assert!(reported_intersection(vec![vec![0..10],vec![]],true).is_empty());
++  assert!(reported_intersection(vec![],true).is_empty());
++ }
++}
