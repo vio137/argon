@@ -1,0 +1,63 @@
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -197,7 +197,7 @@
+         }
+         let (id, epoch, player) = {
+             let mut s = self.0.state.lock().unwrap();
+-            if s.state != SourceState::Open || s.buffers.values().any(|b| b.updating) {
++            if s.state != SourceState::Open {
+                 return Err(SourceError::InvalidState);
+             }
+             if s.buffers.len() >= 2 {
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -723,3 +723,47 @@
+     }
+     p.lock().unwrap().stop().unwrap();
+ }
++
++#[test]
++fn adding_second_buffer_is_not_blocked_by_first_buffers_accepted_update() {
++    use crate::{append_source::*, append::AppendEvent, generic_channel::GenericCallback,
++        mse_player::AndroidAppendPlayer};
++    use std::{sync::{Arc,Mutex,mpsc}, time::Duration};
++    let player=AndroidAppendPlayer::new(113,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++    let (tx,events)=mpsc::channel();
++    let (release,gate)=mpsc::channel();
++    let gate=Mutex::new(gate);
++    let source=AppendSource::new(Arc::new(move |event| {
++        let _=tx.send(event);
++        if matches!(event,SourceEvent::BufferEvent(_,AppendEvent::UpdateStart,_)) {
++            // Freeze the real worker outside both controller and Player locks.
++            // Timeout also lets a failed assertion unwind without hanging Drop.
++            let _=gate.lock().unwrap().recv_timeout(Duration::from_secs(2));
++        }
++    }));
++    source.attach(player).unwrap();
++    let video=source.add_buffer("video/mp4").unwrap();
++    loop {if events.recv_timeout(Duration::from_secs(2)).unwrap()==SourceEvent::BufferEvent(video.id(),AppendEvent::Ready,0) {break;}}
++    video.append(vec![]).unwrap();
++    loop {if events.recv_timeout(Duration::from_secs(2)).unwrap()==SourceEvent::BufferEvent(video.id(),AppendEvent::UpdateStart,1) {break;}}
++    assert!(video.updating());
++    let audio=source.add_buffer("audio/mp4");
++    let still_updating=video.updating();
++    release.send(()).unwrap();
++    let audio=audio.expect("addSourceBuffer must not reject because another buffer is updating");
++    assert!(still_updating);
++    let mut completed=false;
++    let mut ready=false;
++    while !completed||!ready {
++        match events.recv_timeout(Duration::from_secs(2)).unwrap() {
++            SourceEvent::BufferEvent(id,AppendEvent::UpdateEnd,1) if id==video.id()=>completed=true,
++            SourceEvent::BufferEvent(id,AppendEvent::Ready,0) if id==audio.id()=>ready=true,
++            SourceEvent::BufferEvent(_,AppendEvent::Error,_)=>panic!("unexpected append failure"),
++            _=>()
++        }
++    }
++    assert!(!video.updating());
++    assert_eq!(source.buffers().len(),2);
++    assert!(matches!(source.add_buffer("video/mp4"),Err(SourceError::Quota)));
++    source.detach();
++}
