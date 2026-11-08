@@ -1,0 +1,916 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 9161c625e..f030ced6d 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -362,6 +362,7 @@ pub struct PumpStatus {
+     pub all_buffers_ready: bool,
+     pub buffered: Vec<std::ops::Range<i64>>,
+     pub buffer_ranges: Vec<(u32, Vec<std::ops::Range<i64>>)>,
++    pub timestamp_offsets: Vec<(u32, i64)>,
+     pub parsing_media_segments: Vec<(u32, bool)>,
+     pub buffer_tracks: Vec<(u32, Vec<crate::mse_demux::TrackDescription>)>,
+ }
+@@ -478,6 +479,26 @@ impl AppendPlayback {
+     fn input_exhausted(&self) -> bool {
+         self.input_ended && self.sessions.values().all(AppendSession::input_exhausted)
+     }
++    pub fn set_sequence_mode(&mut self, id: u32, sequence: bool) -> Result<(), ()> {
++        if self.failed || self.input_ended {
++            return Err(());
++        }
++        self.sessions
++            .get_mut(&id)
++            .ok_or(())?
++            .set_sequence_mode(sequence)
++            .map_err(|_| ())
++    }
++    pub fn set_timestamp_offset(&mut self, id: u32, offset: i64) -> Result<(), ()> {
++        if self.failed || self.input_ended {
++            return Err(());
++        }
++        self.sessions
++            .get_mut(&id)
++            .ok_or(())?
++            .set_timestamp_offset(offset)
++            .map_err(|_| ())
++    }
+     pub fn set_options(
+         &mut self,
+         id: u32,
+@@ -853,6 +874,11 @@ impl AppendPlayback {
+             current_data: self.has_current_data(),
+             buffered: self.buffered(),
+             buffer_ranges: self.buffer_ranges(),
++            timestamp_offsets: self
++                .sessions
++                .iter()
++                .map(|(id, s)| (*id, s.timestamp_offset()))
++                .collect(),
+             parsing_media_segments: self
+                 .sessions
+                 .iter()
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index 107fe01ed..fcb3578b8 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -918,3 +918,36 @@ fn quantized_equal_removal_uses_the_native_epoch_path_with_a_real_buffer() {
+     assert_eq!(p.seek_target, Some(0));
+     assert_eq!(p.buffered(), [0..1_000_000]);
+ }
++
++#[test]
++fn sequence_session_mapping_reaches_native_delivery_without_replacing_retained_frames() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.sessions
++        .get_mut(&1)
++        .unwrap()
++        .set_sequence_mode(true)
++        .unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    let mut f = crate::mse_demux::BoxFramer::new(1 << 20);
++    f.append(include_bytes!(
++        "../hosttest/tests/fixtures/synthetic-fmp4.mp4"
++    ))
++    .unwrap();
++    let mut media = vec![];
++    while let Some(b) = f.pop_box().unwrap() {
++        if &b[4..8] == b"moof" || &b[4..8] == b"mdat" {
++            media.extend(b);
++        }
++    }
++    p.append(1, &media).unwrap();
++    assert_eq!(p.buffered(), [0..2_000_000]);
++    assert_eq!(p.sessions.get(&1).unwrap().timestamp_offset(), 1_000_000);
++    p.pump().unwrap();
++    assert!(p.decoders.video.is_some());
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 5005d195f..d88c1a9a7 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -44,6 +44,7 @@ struct State {
+     buffered: Vec<Range<f64>>,
+     buffer_ranges: BTreeMap<u32, Vec<Range<f64>>>,
+     pending_parser_resets: BTreeMap<u32, usize>,
++    timestamp_offsets: BTreeMap<u32, i64>,
+     parsing_media_segments: BTreeMap<u32, bool>,
+     buffer_tracks: BTreeMap<u32, Vec<servo_media_player::append::AppendTrack>>,
+ }
+@@ -122,6 +123,7 @@ impl AndroidAppendPlayer {
+             buffered: vec![],
+             buffer_ranges: BTreeMap::new(),
+             pending_parser_resets: BTreeMap::new(),
++            timestamp_offsets: BTreeMap::new(),
+             parsing_media_segments: BTreeMap::new(),
+             buffer_tracks: BTreeMap::new(),
+         }));
+@@ -255,6 +257,8 @@ impl AndroidAppendPlayer {
+                             );
+                             old
+                         };
++                        shared.lock().unwrap().timestamp_offsets =
++                            status.timestamp_offsets.iter().copied().collect();
+                         shared.lock().unwrap().parsing_media_segments =
+                             status.parsing_media_segments.iter().copied().collect();
+                         shared.lock().unwrap().buffered = status
+@@ -707,6 +711,46 @@ impl Player for AndroidAppendPlayer {
+         }
+         Ok(())
+     }
++    fn append_set_sequence(&self, id: u32, sequence: bool) -> Result<(), PlayerError> {
++        let s = self.state.lock().unwrap();
++        if s.stopped
++            || s.input_ended
++            || s.buffers.get(&id).is_none_or(|b| !b.ready || b.updating)
++            || s.parsing_media_segment(id)
++        {
++            return Err(error());
++        }
++        self.command(Command::Sequence {
++            buffer_id: id,
++            sequence,
++        })
++    }
++    fn append_set_timestamp_offset(&self, id: u32, offset: f64) -> Result<(), PlayerError> {
++        let us = offset * 1e6;
++        if !us.is_finite() || us < i64::MIN as f64 || us >= i64::MAX as f64 {
++            return Err(error());
++        }
++        let s = self.state.lock().unwrap();
++        if s.stopped
++            || s.input_ended
++            || s.buffers.get(&id).is_none_or(|b| !b.ready || b.updating)
++            || s.parsing_media_segment(id)
++        {
++            return Err(error());
++        }
++        self.command(Command::TimestampOffset {
++            buffer_id: id,
++            offset_us: us.round() as i64,
++        })
++    }
++    fn append_timestamp_offset(&self, id: u32) -> Option<f64> {
++        self.state
++            .lock()
++            .unwrap()
++            .timestamp_offsets
++            .get(&id)
++            .map(|us| *us as f64 / 1e6)
++    }
+     fn append_set_options(
+         &self,
+         id: u32,
+@@ -1246,6 +1290,38 @@ mod tests {
+         assert!(s.output_ended);
+         assert!(!s.stopped);
+     }
++    #[test]
++    fn sequence_control_queue_rejection_does_not_change_buffer_operation_or_offset() {
++        let player = seek_test_player();
++        let p = player.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, _rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut s = p.state.lock().unwrap();
++            s.buffers.insert(
++                1,
++                BufferState {
++                    ready: true,
++                    updating: false,
++                    removing: false,
++                    operation: 7,
++                    callback: Arc::new(|_| {}),
++                },
++            );
++            s.timestamp_offsets.insert(1, 123);
++        }
++        assert_eq!(p.append_set_sequence(1, true), Err(PlayerError::EnoughData));
++        assert_eq!(
++            p.append_set_timestamp_offset(1, 5.0),
++            Err(PlayerError::EnoughData)
++        );
++        let s = p.state.lock().unwrap();
++        assert_eq!(s.timestamp_offsets.get(&1), Some(&123));
++        let b = s.buffers.get(&1).unwrap();
++        assert_eq!(b.operation, 7);
++        assert!(!b.updating);
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index b8b69c68f..e2fa9ecfb 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -39,6 +39,14 @@ pub enum Command {
+         offset_us: i64,
+         window: std::ops::Range<i64>,
+     },
++    Sequence {
++        buffer_id: u32,
++        sequence: bool,
++    },
++    TimestampOffset {
++        buffer_id: u32,
++        offset_us: i64,
++    },
+     ReopenInput,
+     EndInput,
+     Playing(bool),
+@@ -60,6 +68,8 @@ pub enum Applied {
+     AppendAborted(u32),
+     Appended(u32, u64),
+     Options(u32),
++    Sequence(u32),
++    TimestampOffset(u32),
+     InputReopened,
+     InputEnded,
+     Playing,
+@@ -101,6 +111,7 @@ impl Worker {
+                     let mut playback = AppendPlayback::new(renderer);
+                     let mut previous_current_data = false;
+                     let mut previous_all_ready = false;
++                    let mut previous_offsets = vec![];
+                     let mut previous_parsing = vec![];
+                     let mut previous_ranges = vec![];
+                     let mut previous_frames = 0;
+@@ -137,6 +148,12 @@ impl Worker {
+                                         operation,
+                                         ..
+                                     } => Applied::Appended(*buffer_id, *operation),
++                                    Command::Sequence { buffer_id, .. } => {
++                                        Applied::Sequence(*buffer_id)
++                                    },
++                                    Command::TimestampOffset { buffer_id, .. } => {
++                                        Applied::TimestampOffset(*buffer_id)
++                                    },
+                                     Command::ReopenInput => Applied::InputReopened,
+                                     Command::EndInput => Applied::InputEnded,
+                                     Command::Playing(_) => Applied::Playing,
+@@ -191,6 +208,14 @@ impl Worker {
+                                         event(Event::AppendStarted(buffer_id, operation));
+                                         playback.append(buffer_id, &bytes)
+                                     },
++                                    Command::Sequence {
++                                        buffer_id,
++                                        sequence,
++                                    } => playback.set_sequence_mode(buffer_id, sequence),
++                                    Command::TimestampOffset {
++                                        buffer_id,
++                                        offset_us,
++                                    } => playback.set_timestamp_offset(buffer_id, offset_us),
+                                     Command::ReopenInput => {
+                                         playback.reopen_input()?;
+                                         output_finished = false;
+@@ -234,6 +259,7 @@ impl Worker {
+                         if status.duration_us != previous_duration
+                             || status.all_buffers_ready != previous_all_ready
+                             || status.current_data != previous_current_data
++                            || status.timestamp_offsets != previous_offsets
+                             || status.parsing_media_segments != previous_parsing
+                             || status.buffer_ranges != previous_ranges
+                             || status.rendered_frames != previous_frames
+@@ -248,6 +274,7 @@ impl Worker {
+                             previous_duration = status.duration_us;
+                             previous_ranges = status.buffer_ranges.clone();
+                             previous_parsing = status.parsing_media_segments.clone();
++                            previous_offsets = status.timestamp_offsets.clone();
+                             previous_current_data = status.current_data;
+                             previous_all_ready = status.all_buffers_ready;
+                             previous_frames = status.rendered_frames;
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index 99838d1e9..cdfdc9df3 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -121,6 +121,9 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::BufferPushFailed)
+     }
+ 
++    fn append_set_sequence(&self, _id:u32, _sequence:bool)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
++    fn append_set_timestamp_offset(&self,_id:u32,_offset:f64)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
++    fn append_timestamp_offset(&self,_id:u32)->Option<f64>{None}
+     fn append_set_options(
+         &self,
+         _id: u32,
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index 8a965bcf9..eaf5dcf42 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -354,3 +354,44 @@ mod pipeline_tests {
+   assert!(!b.parsing_media_segment().unwrap());source.detach();assert_eq!(b.parsing_media_segment(),Err(SourceError::InvalidState));
+  }
+ }
++
++#[cfg(test)] mod sequence_control_tests {
++ use crate::{append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer,mse_demux::BoxFramer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ fn await_end(rx:&mpsc::Receiver<SourceEvent>,op:u64){loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,n) if n==op){break;}}}
++ #[test] fn real_controller_sequence_mode_rebases_repeated_fragments_and_exposes_updated_offset() {
++  let p=AndroidAppendPlayer::new(86,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p).unwrap();let b=source.add_buffer("video/mp4").unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  assert!(!b.sequence_mode().unwrap());b.set_sequence_mode(true).unwrap();assert!(b.sequence_mode().unwrap());
++  let mut f=BoxFramer::new(1<<20);f.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4")).unwrap();let mut media=vec![];while let Some(b)=f.pop_box().unwrap(){if &b[4..8]==b"moof"||&b[4..8]==b"mdat"{media.extend(b);}}
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();await_end(&rx,1);assert_eq!(b.options().unwrap().0,0.0);
++  b.append(media.clone()).unwrap();await_end(&rx,2);assert_eq!(b.buffered(),[0.0..2.0]);assert_eq!(b.options().unwrap().0,1.0);
++  // A window update must not restart a sequence group or reset its offset.
++  b.set_options(b.options().unwrap().0,0.0..10.0).unwrap();b.append(media.clone()).unwrap();await_end(&rx,3);
++  assert_eq!(b.buffered(),[0.0..3.0]);assert_eq!(b.options().unwrap().0,2.0);
++  b.set_timestamp_offset(5.0).unwrap();assert_eq!(b.options().unwrap().0,5.0);
++  b.append(vec![]).unwrap();await_end(&rx,4);assert_eq!(b.options().unwrap().0,5.0);
++  b.append(media.clone()).unwrap();await_end(&rx,5);assert_eq!(b.buffered(),[0.0..3.0,5.0..6.0]);
++  b.set_sequence_mode(false).unwrap();assert!(!b.sequence_mode().unwrap());assert_eq!(b.options().unwrap().0,5.0);
++  b.set_timestamp_offset(7.0).unwrap();b.append(media).unwrap();await_end(&rx,6);assert_eq!(b.buffered(),[0.0..3.0,5.0..6.0,7.0..8.0]);
++  source.end_input().unwrap();
++  assert_eq!(b.set_sequence_mode(true),Err(SourceError::InvalidState));
++  source.reopen().unwrap();b.set_sequence_mode(true).unwrap();
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();await_end(&rx,7);
++  assert_eq!(b.buffered(),[0.0..3.0,5.0..6.0,7.0..9.0]);assert_eq!(b.options().unwrap().0,8.0);
++  b.abort().unwrap();assert_eq!(b.options().unwrap().0,8.0);
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();await_end(&rx,9);
++  assert_eq!(b.buffered(),[0.0..3.0,5.0..6.0,7.0..10.0]);assert_eq!(b.options().unwrap().0,9.0);
++  source.detach();assert_eq!(b.set_sequence_mode(true),Err(SourceError::InvalidState));assert_eq!(b.set_timestamp_offset(0.0),Err(SourceError::InvalidState));
++ }
++ #[test] fn parser_guard_rejects_control_commands_and_abort_allows_immediate_setters() {
++  let p=AndroidAppendPlayer::new(86,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p).unwrap();let b=source.add_buffer("video/mp4").unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  let mut f=BoxFramer::new(1<<20);f.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4")).unwrap();let mut init=vec![];let mut media=vec![];while let Some(b)=f.pop_box().unwrap(){match &b[4..8]{b"ftyp"|b"moov"=>init.extend(b),b"moof"|b"mdat"=>media.extend(b),_=>()}}
++  init.extend_from_slice(&media[..8]);b.append(init).unwrap();await_end(&rx,1);assert!(b.parsing_media_segment().unwrap());
++  assert!(b.set_sequence_mode(true).is_err());assert!(b.set_timestamp_offset(5.0).is_err());assert!(!b.sequence_mode().unwrap());assert_eq!(b.options().unwrap().0,0.0);
++  b.abort().unwrap();b.set_sequence_mode(true).unwrap();b.set_timestamp_offset(5.0).unwrap();b.append(media).unwrap();await_end(&rx,3);assert_eq!(b.buffered(),[5.0..6.0]);source.detach();
++ }
++}
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index 7e8124df9..8025c0e9a 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -620,3 +620,48 @@ fn parsing_media_state_tracks_partial_moof_until_complete_mdat_and_clears_on_abo
+  s.append(&mdat[mdat.len()-1..]).unwrap();assert!(!s.parsing_media_segment());
+  s.append(&moof[..8]).unwrap();assert!(s.parsing_media_segment());s.abort();assert!(!s.parsing_media_segment());
+ }
++
++#[test]
++fn sequence_session_rebases_repeated_fragments_and_keeps_mapping_across_chunked_appends() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let mut f=BoxFramer::new(1<<20);f.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();let mut init=vec![];let mut media=vec![];
++ while let Some(b)=f.pop_box().unwrap(){match &b[4..8]{b"ftyp"|b"moov"=>init.extend(b),b"moof"|b"mdat"=>media.extend(b),_=>()}}
++ let mut s=AppendSession::new(1<<20,128);s.set_sequence_mode(true).unwrap();s.append(&init).unwrap();
++ for _ in 0..2 {for chunk in media.chunks(7) {s.append(chunk).unwrap();}}
++ assert_eq!(s.buffered(),[0..2_000_000]);assert_eq!(s.timestamp_offset(),1_000_000);
++ s.abort_append().unwrap();s.set_timestamp_offset(3_000_000).unwrap();
++ s.append(&media).unwrap();assert_eq!(s.buffered(),[0..2_000_000,3_000_000..4_000_000]);
++ assert_eq!(s.timestamp_offset(),3_000_000);
++ s.end_of_stream().unwrap();assert!(s.set_sequence_mode(false).is_err());s.reopen().unwrap();
++ s.set_sequence_mode(false).unwrap();s.set_timestamp_offset(5_000_000).unwrap();s.append(&media).unwrap();
++ assert_eq!(s.buffered(),[0..2_000_000,3_000_000..4_000_000,5_000_000..6_000_000]);
++}
++#[test]
++fn sequence_setters_reject_partial_media_before_mutating_offset_or_mode() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let bs=boxes();let init=bs.iter().filter(|b| &b[4..8]==b"ftyp" || &b[4..8]==b"moov").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let moof=bs.iter().find(|b| &b[4..8]==b"moof").unwrap();
++ let mut s=AppendSession::new(1<<20,100);s.append(&init).unwrap();s.append(&moof[..8]).unwrap();
++ assert!(s.set_sequence_mode(true).is_err());assert!(s.set_timestamp_offset(1_000_000).is_err());assert_eq!(s.timestamp_offset(),0);
++ s.abort_append().unwrap();s.set_sequence_mode(true).unwrap();s.set_timestamp_offset(1_000_000).unwrap();
++ s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();assert_eq!(s.buffered(),[1_000_000..2_000_000]);
++}
++
++#[test]
++fn switching_from_sequence_to_segments_keeps_the_effective_calculated_offset() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let mut s=AppendSession::new(1<<20,128);s.set_sequence_mode(true).unwrap();s.set_timestamp_offset(2_000_000).unwrap();
++ s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();assert_eq!(s.timestamp_offset(),2_000_000);
++ s.set_sequence_mode(false).unwrap();assert_eq!(s.timestamp_offset(),2_000_000);
++}
++
++#[test]
++fn sequence_explicit_offset_remains_visible_before_frames_and_through_empty_appends() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let mut s=AppendSession::new(1<<20,128);s.set_timestamp_offset(5_000_000).unwrap();s.set_sequence_mode(true).unwrap();
++ assert_eq!(s.timestamp_offset(),5_000_000);s.append(&[]).unwrap();assert_eq!(s.timestamp_offset(),5_000_000);
++ s.set_timestamp_offset(7_000_000).unwrap();assert_eq!(s.timestamp_offset(),7_000_000);
++ s.append(&[]).unwrap();assert_eq!(s.timestamp_offset(),7_000_000);
++ s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();assert_eq!(s.buffered(),[7_000_000..8_000_000]);
++ s.set_sequence_mode(false).unwrap();assert_eq!(s.timestamp_offset(),7_000_000);
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index d5e7aa268..e720355d2 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -60,6 +60,24 @@ impl AppendSession {
+             limit,
+         }
+     }
++    pub fn set_sequence_mode(&mut self, sequence: bool) -> Result<(), SessionError> {
++        if self.failed || self.ended || self.parsing_media_segment() {
++            return Err(SessionError::Failed);
++        }
++        self.store.set_sequence_mode(sequence);
++        Ok(())
++    }
++    pub fn set_timestamp_offset(&mut self, offset_us: i64) -> Result<(), SessionError> {
++        if self.failed || self.ended || self.parsing_media_segment() {
++            return Err(SessionError::Failed);
++        }
++        self.offset_us = offset_us;
++        self.store.set_sequence_start(offset_us);
++        Ok(())
++    }
++    pub fn timestamp_offset(&self) -> i64 {
++        self.offset_us
++    }
+     pub fn parsing_media_segment(&self) -> bool {
+         self.stream.parsing_media_segment()
+     }
+@@ -110,6 +128,7 @@ impl AppendSession {
+                 SessionError::Append
+             })?;
+         }
++        let has_frames = !units.is_empty();
+         let units = self
+             .store
+             .append_collect(units, self.offset_us, self.window.clone())
+@@ -117,6 +136,11 @@ impl AppendSession {
+                 self.failed = true;
+                 SessionError::Append
+             })?;
++        if has_frames {
++            if let Some(offset) = self.store.effective_sequence_offset() {
++                self.offset_us = offset;
++            }
++        }
+         for unit in units {
+             let packet = match self.bridge.prepare(unit) {
+                 Ok(p) => p,
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+index 25d5b1367..c48ea2266 100644
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -9,6 +9,10 @@ pub enum StoreError {
+ }
+ #[derive(Clone)]
+ pub struct FrameStore {
++    sequence: bool,
++    group_start: Option<i64>,
++    group_end: i64,
++    sequence_offset: i64,
+     tracks: BTreeMap<u32, Vec<AccessUnit>>,
+     configs: BTreeMap<u32, shiguredo_mp4::boxes::SampleEntry>,
+     output_configured: BTreeSet<u32>,
+@@ -20,6 +24,10 @@ pub struct FrameStore {
+ impl FrameStore {
+     pub fn new(limit: usize) -> Self {
+         Self {
++            sequence: false,
++            group_start: None,
++            group_end: 0,
++            sequence_offset: 0,
+             tracks: BTreeMap::new(),
+             configs: BTreeMap::new(),
+             output_configured: BTreeSet::new(),
+@@ -29,6 +37,20 @@ impl FrameStore {
+             limit,
+         }
+     }
++    pub fn set_sequence_mode(&mut self, sequence: bool) {
++        if sequence {
++            self.group_start = Some(self.group_end);
++        }
++        self.sequence = sequence;
++    }
++    pub fn set_sequence_start(&mut self, timestamp: i64) {
++        if self.sequence {
++            self.group_start = Some(timestamp);
++        }
++    }
++    pub fn effective_sequence_offset(&self) -> Option<i64> {
++        self.sequence.then_some(self.sequence_offset)
++    }
+     pub fn register_track(&mut self, id: u32) -> Result<(), StoreError> {
+         if !self.tracks.contains_key(&id) && self.tracks.len() >= 2 {
+             return Err(StoreError::Quota);
+@@ -50,6 +72,9 @@ impl FrameStore {
+         self.tracks.get(&track).map(Vec::as_slice).unwrap_or(&[])
+     }
+     pub fn discontinuity(&mut self) {
++        if self.sequence {
++            self.group_start = Some(self.group_end);
++        }
+         self.last_decode.clear();
+         self.need_random_access.extend(self.tracks.keys().copied());
+     }
+@@ -66,7 +91,24 @@ impl FrameStore {
+     /// outside the append window. Storage owns a clone for ranges and replay.
+     pub fn append_collect(
+         &mut self,
+-        mut input: Vec<AccessUnit>,
++        input: Vec<AccessUnit>,
++        offset_us: i64,
++        window: std::ops::Range<i64>,
++    ) -> Result<Vec<AccessUnit>, StoreError> {
++        if window.start < 0 || window.end <= window.start {
++            return Err(StoreError::Window);
++        }
++        if input.is_empty() {
++            return Ok(vec![]);
++        }
++        let mut staged = self.clone();
++        let accepted = staged.append_collect_staged(input, offset_us, window)?;
++        *self = staged;
++        Ok(accepted)
++    }
++    fn append_collect_staged(
++        &mut self,
++        input: Vec<AccessUnit>,
+         offset_us: i64,
+         window: std::ops::Range<i64>,
+     ) -> Result<Vec<AccessUnit>, StoreError> {
+@@ -90,21 +132,10 @@ impl FrameStore {
+         }
+         let mut bytes = 0usize;
+         // Validate transaction before changing existing buffered frames.
+-        for f in &mut input {
++        for f in &input {
+             if f.duration_us <= 0 {
+                 return Err(StoreError::Timestamp);
+             }
+-            f.pts_us = f
+-                .pts_us
+-                .checked_add(offset_us)
+-                .ok_or(StoreError::Timestamp)?;
+-            f.dts_us = f
+-                .dts_us
+-                .checked_add(offset_us)
+-                .ok_or(StoreError::Timestamp)?;
+-            f.pts_us
+-                .checked_add(f.duration_us)
+-                .ok_or(StoreError::Timestamp)?;
+             bytes = bytes.checked_add(f.data.len()).ok_or(StoreError::Quota)?;
+         }
+         if self.bytes.checked_add(bytes).ok_or(StoreError::Quota)? > self.limit {
+@@ -114,24 +145,49 @@ impl FrameStore {
+         let mut accepted = vec![];
+         for mut frame in input {
+             let track = frame.track_id;
+-            let end = frame.pts_us + frame.duration_us;
+             if !self.tracks.contains_key(&track) {
+                 self.need_random_access.insert(track);
+                 self.tracks.insert(track, vec![]);
+             }
+-            // MSE coded-frame processing restarts all track dependency chains
+-            // on decode-time regression or a gap over twice the last duration.
+-            // Compare in i128 so valid i64 timestamps cannot overflow here.
+-            if self
+-                .last_decode
+-                .get(&track)
+-                .is_some_and(|&(last, duration)| {
+-                    frame.dts_us < last
+-                        || i128::from(frame.dts_us) - i128::from(last) > 2 * i128::from(duration)
+-                })
+-            {
+-                self.discontinuity();
++            let raw_pts = frame.pts_us;
++            let raw_dts = frame.dts_us;
++            loop {
++                if self.sequence {
++                    if let Some(start) = self.group_start.take() {
++                        self.sequence_offset =
++                            start.checked_sub(raw_pts).ok_or(StoreError::Timestamp)?;
++                        self.group_end = start;
++                        self.need_random_access.extend(self.tracks.keys().copied());
++                    }
++                }
++                let offset = if self.sequence {
++                    self.sequence_offset
++                } else {
++                    offset_us
++                };
++                frame.pts_us = raw_pts.checked_add(offset).ok_or(StoreError::Timestamp)?;
++                frame.dts_us = raw_dts.checked_add(offset).ok_or(StoreError::Timestamp)?;
++                if self
++                    .last_decode
++                    .get(&track)
++                    .is_some_and(|&(last, duration)| {
++                        frame.dts_us < last
++                            || i128::from(frame.dts_us) - i128::from(last)
++                                > 2 * i128::from(duration)
++                    })
++                {
++                    if !self.sequence {
++                        self.group_end = frame.pts_us;
++                    }
++                    self.discontinuity();
++                    continue;
++                }
++                break;
+             }
++            let end = frame
++                .pts_us
++                .checked_add(frame.duration_us)
++                .ok_or(StoreError::Timestamp)?;
+             if frame.pts_us < window.start || end > window.end {
+                 self.need_random_access.insert(track);
+                 continue;
+@@ -142,6 +198,7 @@ impl FrameStore {
+             self.need_random_access.remove(&track);
+             self.last_decode
+                 .insert(track, (frame.dts_us, frame.duration_us));
++            self.group_end = self.group_end.max(end);
+             let frames = self.tracks.entry(track).or_default();
+             // Overlapping coded frames and dependent successors up to the next
+             // random-access frame are removed together; never keep a decoder
+@@ -239,6 +296,9 @@ impl FrameStore {
+                         .get(&id)
+                         .is_some_and(|&(dts, _)| dts == old.dts_us)
+                     {
++                        if !self.sequence {
++                            self.group_end = old.pts_us;
++                        }
+                         reset_dependencies = true;
+                     }
+                     self.bytes -= old.data.len();
+@@ -342,6 +402,92 @@ mod tests {
+         }
+     }
+     #[test]
++    fn sequence_mode_rebases_timestamp_regressions_and_honors_explicit_group_start() {
++        let mut s = FrameStore::new(128);
++        s.set_sequence_mode(true);
++        s.append(vec![f(100, true), f(110, false)], 0, 0..1000)
++            .unwrap();
++        assert_eq!(s.ranges(1), [0..20]);
++        assert_eq!(s.effective_sequence_offset(), Some(-100));
++        s.append(vec![f(0, true), f(10, false)], 0, 0..1000)
++            .unwrap();
++        assert_eq!(s.ranges(1), [0..40]);
++        assert_eq!(s.effective_sequence_offset(), Some(20));
++        s.set_sequence_start(100);
++        s.append(vec![f(0, true)], 0, 0..1000).unwrap();
++        assert_eq!(s.ranges(1), [0..40, 100..110]);
++    }
++    #[test]
++    fn sequence_discontinuity_waits_for_rap_without_advancing_group_end_for_dropped_frames() {
++        let mut s = FrameStore::new(128);
++        s.set_sequence_mode(true);
++        s.append(vec![f(0, true), f(10, false)], 0, 0..1000)
++            .unwrap();
++        s.discontinuity();
++        s.append(vec![f(100, false), f(110, true)], 0, 0..1000)
++            .unwrap();
++        assert_eq!(s.ranges(1), [0..20, 30..40]);
++        s.discontinuity();
++        s.append(vec![f(0, true)], 0, 0..1000).unwrap();
++        assert_eq!(s.ranges(1), [0..20, 30..50]);
++    }
++    #[test]
++    fn sequence_mapping_preserves_relative_timestamps_across_multiplexed_tracks() {
++        let mut s = FrameStore::new(128);
++        s.register_track(1).unwrap();
++        s.register_track(2).unwrap();
++        s.set_sequence_mode(true);
++        let mut audio = f(105, true);
++        audio.track_id = 2;
++        s.append(vec![f(100, true), audio.clone(), f(110, false)], 0, 0..1000)
++            .unwrap();
++        assert_eq!(s.ranges(1), [0..20]);
++        assert_eq!(s.ranges(2), [5..15]);
++        s.discontinuity();
++        s.append(vec![f(100, true), audio], 0, 0..1000).unwrap();
++        assert_eq!(s.ranges(1), [0..30]);
++        assert_eq!(s.ranges(2), [5..15, 25..35]);
++        assert_eq!(s.buffered(), [5..15, 25..30]);
++    }
++    #[test]
++    fn sequence_window_drop_does_not_move_group_end_or_cache_a_bad_decode_chain() {
++        let mut s = FrameStore::new(128);
++        s.set_sequence_mode(true);
++        s.append(vec![f(0, true), f(10, false), f(20, true)], 0, 0..15)
++            .unwrap();
++        assert_eq!(s.ranges(1), [0..10]);
++        assert_eq!(s.group_end, 10);
++        s.discontinuity();
++        s.append(vec![f(100, true)], 0, 0..1000).unwrap();
++        assert_eq!(s.ranges(1), [0..20]);
++    }
++    #[test]
++    fn sequence_mapping_failure_is_atomic_including_offset_and_dependency_state() {
++        let mut s = FrameStore::new(128);
++        s.set_sequence_mode(true);
++        s.set_sequence_start(i64::MAX);
++        assert_eq!(
++            s.append(vec![f(-1, true)], 0, 0..i64::MAX),
++            Err(StoreError::Timestamp)
++        );
++        assert_eq!(s.bytes(), 0);
++        assert_eq!(s.group_start, Some(i64::MAX));
++        assert_eq!(s.group_end, 0);
++        s.set_sequence_start(0);
++        s.append(vec![f(0, true)], 0, 0..100).unwrap();
++        assert_eq!(s.ranges(1), [0..10]);
++    }
++    #[test]
++    fn returning_to_segments_preserves_raw_timestamps_plus_requested_offset() {
++        let mut s = FrameStore::new(128);
++        s.set_sequence_mode(true);
++        s.append(vec![f(100, true)], 0, 0..1000).unwrap();
++        s.set_sequence_mode(false);
++        s.append(vec![f(100, true)], 100, 0..1000).unwrap();
++        assert_eq!(s.ranges(1), [0..10, 200..210]);
++        assert_eq!(s.effective_sequence_offset(), None);
++    }
++    #[test]
+     fn append_window_and_random_access_filtering() {
+         let mut s = FrameStore::new(128);
+         s.append(
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+index 7f657027a..477e1739e 100644
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -33,6 +33,8 @@ pub enum SourceError {
+ }
+ type Callback = Arc<dyn Fn(SourceEvent) + Send + Sync>;
+ struct Buffer {
++    sequence: bool,
++    offset_from_append: bool,
+     offset: f64,
+     window: std::ops::Range<f64>,
+     updating: bool,
+@@ -121,7 +123,9 @@ impl AppendSource {
+             s.buffers.insert(
+                 id,
+                 Buffer {
+-                    offset: 0.0,
++                    sequence: false,
++                offset_from_append: false,
++                offset: 0.0,
+                     window: 0.0..f64::INFINITY,
+                     updating: false,
+                     removing: false,
+@@ -251,6 +255,25 @@ impl AppendBuffer {
+             s.epoch == self.epoch && s.buffers.get(&self.id).is_some_and(|b| b.updating)
+         })
+     }
++    pub fn sequence_mode(&self)->Result<bool,SourceError> {
++        let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;let s=inner.state.lock().unwrap();
++        if s.epoch!=self.epoch{return Err(SourceError::InvalidState);}
++        Ok(s.buffers.get(&self.id).ok_or(SourceError::InvalidState)?.sequence)
++    }
++    pub fn set_sequence_mode(&self,sequence:bool)->Result<(),SourceError>{
++        let offset=self.options()?.0;
++        let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;let mut s=inner.state.lock().unwrap();
++        if s.epoch!=self.epoch || s.state!=SourceState::Open || s.buffers.get(&self.id).is_none_or(|b|b.updating){return Err(SourceError::InvalidState);}
++        s.player.as_ref().ok_or(SourceError::InvalidState)?.lock().unwrap().append_set_sequence(self.id,sequence).map_err(|_|SourceError::Backend)?;
++        let b=s.buffers.get_mut(&self.id).unwrap();b.sequence=sequence;b.offset=offset;b.offset_from_append=false;Ok(())
++    }
++    pub fn set_timestamp_offset(&self,offset:f64)->Result<(),SourceError>{
++        if !offset.is_finite(){return Err(SourceError::Type);}
++        let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;let mut s=inner.state.lock().unwrap();
++        if s.epoch!=self.epoch || s.state!=SourceState::Open || s.buffers.get(&self.id).is_none_or(|b|b.updating){return Err(SourceError::InvalidState);}
++        s.player.as_ref().ok_or(SourceError::InvalidState)?.lock().unwrap().append_set_timestamp_offset(self.id,offset).map_err(|_|SourceError::Backend)?;
++        let b=s.buffers.get_mut(&self.id).unwrap();b.offset=offset;b.offset_from_append=false;Ok(())
++    }
+     pub fn options(&self) -> Result<(f64, std::ops::Range<f64>), SourceError> {
+         let inner = self.owner.upgrade().ok_or(SourceError::InvalidState)?;
+         let s = inner.state.lock().unwrap();
+@@ -258,7 +281,10 @@ impl AppendBuffer {
+             return Err(SourceError::InvalidState);
+         }
+         let b = s.buffers.get(&self.id).ok_or(SourceError::InvalidState)?;
+-        Ok((b.offset, b.window.clone()))
++        let offset=if b.offset_from_append && !b.updating {
++            s.player.as_ref().and_then(|p|p.lock().unwrap().append_timestamp_offset(self.id)).unwrap_or(b.offset)
++        } else {b.offset};
++        Ok((offset, b.window.clone()))
+     }
+     pub fn set_options(
+         &self,
+@@ -295,6 +321,7 @@ impl AppendBuffer {
+             .get_mut(&self.id)
+             .ok_or(SourceError::InvalidState)?;
+         b.offset = offset;
++        b.offset_from_append = false;
+         b.window = window;
+         Ok(())
+     }
+@@ -414,6 +441,7 @@ impl AppendBuffer {
+             .get_mut(&self.id)
+             .ok_or(SourceError::InvalidState)?;
+         buffer.updating = true;
++        buffer.offset_from_append = true;
+         buffer.operation = operation;
+         Ok(())
+     }
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 845d9607e..2fd4c04e2 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -159,6 +159,9 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::BufferPushFailed)
+     }
+ 
++    fn append_set_sequence(&self, _id:u32, _sequence:bool)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
++    fn append_set_timestamp_offset(&self,_id:u32,_offset:f64)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
++    fn append_timestamp_offset(&self,_id:u32)->Option<f64>{None}
+     fn append_set_options(
+         &self,
+         _id: u32,
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+index 375749662..94336be1b 100644
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -45,6 +45,7 @@ pub(crate) struct SourceBuffer {
+     media: Dom<HTMLMediaElement>,
+     source: Dom<MediaSource>,
+     removing: Cell<bool>,
++    last_sequence: Cell<bool>,
+     last_offset: Cell<f64>,
+     last_start: Cell<f64>,
+     last_end: Cell<f64>,
+@@ -81,6 +82,7 @@ impl SourceBuffer {
+                 media: Dom::from_ref(media),
+                 source: Dom::from_ref(source),
+                 removing: Cell::new(false),
++                last_sequence: Cell::new(false),
+                 last_offset: Cell::new(0.0),
+                 last_start: Cell::new(0.0),
+                 last_end: Cell::new(f64::INFINITY),
+@@ -174,6 +176,11 @@ impl SourceBuffer {
+             return;
+         }
+         use servo_media::player::append::AppendEvent;
++        if event == AppendEvent::Update {
++            if let Ok((offset, _)) = self.buffer.options() {
++                self.last_offset.set(offset);
++            }
++        }
+         // DOM observable state changes on the media task, not on the native
+         // worker before its completion event has been delivered to script.
+         match event {
+@@ -196,21 +203,24 @@ impl SourceBuffer {
+ }
+ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+     fn Mode(&self) -> AppendMode {
+-        AppendMode::Segments
++        if self.last_sequence.get() {
++            AppendMode::Sequence
++        } else {
++            AppendMode::Segments
++        }
+     }
+     fn SetMode(&self, value: AppendMode) -> Fallible<()> {
+         if self.buffer.options().is_err() || self.updating.get() {
+             return Err(Error::InvalidState(None));
+         }
+-        if value == AppendMode::Sequence {
+-            return Err(Error::NotSupported(Some(
+-                "Sequence append mode is not implemented".to_owned(),
+-            )));
+-        }
+         self.source.reopen_if_ended()?;
+         if self.buffer.parsing_media_segment().map_err(source_error)? {
+             return Err(Error::InvalidState(None));
+         }
++        self.buffer
++            .set_sequence_mode(value == AppendMode::Sequence)
++            .map_err(source_error)?;
++        self.last_sequence.set(value == AppendMode::Sequence);
+         Ok(())
+     }
+     fn Updating(&self) -> bool {
+@@ -225,19 +235,25 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+         Ok(TimeRanges::new(cx, self.global().as_window(), ranges))
+     }
+     fn TimestampOffset(&self) -> Finite<f64> {
+-        Finite::new(self.last_offset.get()).expect("validated finite offset")
++        Finite::new(
++            self.buffer
++                .options()
++                .map(|o| o.0)
++                .unwrap_or(self.last_offset.get()),
++        )
++        .expect("validated finite offset")
+     }
+     fn SetTimestampOffset(&self, value: Finite<f64>) -> Fallible<()> {
+         if self.updating.get() {
+             return Err(Error::InvalidState(None));
+         }
+-        let (_, window) = self.buffer.options().map_err(source_error)?;
++        self.buffer.options().map_err(source_error)?;
+         self.source.reopen_if_ended()?;
+         if self.buffer.parsing_media_segment().map_err(source_error)? {
+             return Err(Error::InvalidState(None));
+         }
+         self.buffer
+-            .set_options(*value, window)
++            .set_timestamp_offset(*value)
+             .map_err(source_error)?;
+         self.last_offset.set(*value);
+         Ok(())
