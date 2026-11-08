@@ -1,0 +1,67 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -898,3 +898,25 @@
+  let mut bad=moof.encode_to_vec().unwrap();bad.extend_from_slice(&mdat);
+  assert_eq!(d.media_complete(&bad),Err(Error::UnsupportedLayout));
+ }
++
++#[test]
++fn initialization_rejects_external_and_unresolved_data_references_atomically() {
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoovBox,SampleEntry}};
++ use servo_media_android_hosttest::mse_demux::Error;
++ let bs=boxes();let ftyp=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap();
++ let bytes=bs.iter().find(|b|&b[4..8]==b"moov").unwrap();
++ for mode in 0..3 {
++  let(mut moov,_)=MoovBox::decode(bytes).unwrap();
++  let minf=&mut moov.trak_boxes[0].mdia_box.minf_box;
++  if mode==0 {minf.dinf_box.dref_box.url_box.as_mut().unwrap().location=Some(shiguredo_mp4::Utf8String::new("https://example.invalid/media").unwrap());}
++  if mode==1 {minf.dinf_box.dref_box.url_box=None;}
++  if mode==2 {if let SampleEntry::Avc1(e)=&mut minf.stbl_box.stsd_box.entries[0] {e.visual.data_reference_index=std::num::NonZeroU16::new(2).unwrap();}}
++  let mut input=ftyp.clone();input.extend(moov.encode_to_vec().unwrap());
++  let mut clear=ftyp.clone();clear.extend_from_slice(bytes);
++  let mut d=Demux::new(1<<20,64);d.init(&clear).unwrap();let previous=d.descriptions().to_vec();
++  assert_eq!(d.init(&input),Err(Error::UnsupportedLayout));
++  assert_eq!(d.descriptions(),previous);
++  let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();
++  let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);assert_eq!(d.media(&media).unwrap().len(),1);
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -315,7 +315,15 @@
+         }
+         let mut descriptions = vec![];
+         for track in &moov.trak_boxes {
+-            let entries = &track.mdia_box.minf_box.stbl_box.stsd_box.entries;
++            let minf=&track.mdia_box.minf_box;
++            // All samples must refer to the single self-contained data source.
++            // The adapter neither resolves nor fetches external references.
++            let dref=&minf.dinf_box.dref_box;
++            if !dref.unknown_boxes.is_empty()
++                || dref.url_box.as_ref().is_none_or(|url|url.location.is_some()) {
++                return Err(Error::UnsupportedLayout);
++            }
++            let entries = &minf.stbl_box.stsd_box.entries;
+             if entries.len() != 1
+                 || descriptions.len() >= 2
+                 || descriptions
+@@ -327,7 +335,8 @@
+             let rotation = crate::rotate::mp4_rotation(track.tkhd_box.matrix)
+                 .ok_or(Error::UnsupportedLayout)?;
+             let description = match &entries[0] {
+-                SampleEntry::Avc1(_) => {
++                SampleEntry::Avc1(entry) => {
++                    if entry.visual.data_reference_index.get()!=1 {return Err(Error::UnsupportedLayout);}
+                     let config = avc::AvcConfig::from_entry(&entries[0], self.max_bytes)
+                         .map_err(|_| Error::InvalidSample)?;
+                     TrackDescription {
+@@ -341,6 +350,7 @@
+                     }
+                 },
+                 SampleEntry::Mp4a(entry) => {
++                    if entry.audio.data_reference_index.get()!=1 {return Err(Error::UnsupportedLayout);}
+                     let desc = &entry.esds_box.es.dec_config_descr;
+                     let asc = &desc
+                         .dec_specific_info
