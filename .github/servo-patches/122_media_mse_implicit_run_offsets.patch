@@ -1,0 +1,183 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -847,3 +847,54 @@
+   assert_eq!(d.media(&clear).unwrap().len(),1);
+  }
+ }
++
++#[test]
++fn later_implicit_trun_offsets_follow_prior_run_end_without_copying_box_headers() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoofBox};
++ use servo_media_android_hosttest::mse_demux::{Error,append::AppendStream};
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();
++ let(mut moof,_)=MoofBox::decode(&pair[0]).unwrap();
++ let first=moof.traf_boxes[0].trun_boxes[0].clone();
++ let mut second=first.clone();second.data_offset=None;
++ moof.traf_boxes[0].trun_boxes.push(second);
++ let len=moof.encode_to_vec().unwrap().len();
++ moof.traf_boxes[0].trun_boxes[0].data_offset=Some(len as i32+8);
++ let mut encoded=moof.encode_to_vec().unwrap();
++ let payload=&pair[1][8..];
++ let mdat=[((8+payload.len()*2)as u32).to_be_bytes().to_vec(),b"mdat".to_vec(),payload.to_vec(),payload.to_vec()].concat();
++ encoded.extend_from_slice(&mdat);
++ let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();
++ assert_eq!(d.media_complete(&encoded),Ok(true));
++ let units=d.media(&encoded).unwrap();assert_eq!(units.len(),2);
++ let mut prefixed=vec![0,0,0,32,b's',b'i',b'd',b'x'];prefixed.extend_from_slice(&[0;24]);
++ prefixed[19]=1;prefixed.extend_from_slice(&encoded);
++ assert_eq!(d.media(&prefixed).unwrap().iter().map(|u|u.data.clone()).collect::<Vec<_>>(),units.iter().map(|u|u.data.clone()).collect::<Vec<_>>());
++ let mut wide=moof.clone();
++ wide.traf_boxes[0].trun_boxes[0].data_offset=Some(len as i32+16);
++ let mut wide=wide.encode_to_vec().unwrap();let wide_len=wide.len()+8;
++ wide.splice(8..8,(wide_len as u64).to_be_bytes());wide[..4].copy_from_slice(&1u32.to_be_bytes());
++ wide.extend_from_slice(&mdat);
++ assert_eq!(d.media(&wide).unwrap()[1].data,payload,"extended headers can shrink while implicit offsets grow");
++ let mut capped=Demux::new(encoded.len(),64);capped.init(&init).unwrap();
++ assert!(matches!(capped.media(&encoded),Err(Error::Quota)),"normalized metadata must still fit the bound");
++ // Implicit continuation into a second mdat's header is invalid. Metadata
++ // normalization cannot turn header bytes into compressed sample bytes.
++ let mut split=moof.encode_to_vec().unwrap();split.extend_from_slice(&pair[1]);split.extend_from_slice(&pair[1]);
++ assert_eq!(d.media_complete(&split),Err(Error::InvalidSample));
++ assert!(matches!(d.media(&split),Err(Error::InvalidSample)));
++ assert_eq!(units[0].data,payload);assert_eq!(units[1].data,payload);
++ assert_eq!(units.iter().map(|u|u.dts_us).collect::<Vec<_>>(),[0,500_000]);
++ let mut stream=AppendStream::new(1<<20,64);stream.append(&init).unwrap();
++ assert!(stream.append(&encoded[..encoded.len()-1]).unwrap().is_empty());
++ assert_eq!(stream.append(&encoded[encoded.len()-1..]).unwrap().len(),2);
++ // Multiple explicit runs must remain byte-identical through the old path.
++ moof.traf_boxes[0].trun_boxes[1].data_offset=Some(len as i32+4+8+payload.len()as i32);
++ moof.traf_boxes[0].trun_boxes[0].data_offset=Some(len as i32+4+8);
++ let mut explicit=moof.encode_to_vec().unwrap();explicit.extend_from_slice(&mdat);
++ let got=d.media(&explicit).unwrap();assert_eq!(got[1].data,units[1].data);
++ // Missing first offset is still unsupported, even with an implicit follower.
++ moof.traf_boxes[0].trun_boxes[0].data_offset=None;
++ let mut bad=moof.encode_to_vec().unwrap();bad.extend_from_slice(&mdat);
++ assert_eq!(d.media_complete(&bad),Err(Error::UnsupportedLayout));
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -1,6 +1,6 @@
+ //! Private, unintegrated fMP4 adapter prototype. Not advertised as MSE support.
+ use shiguredo_mp4::{
+-    Decode,
++    Decode, Encode,
+     boxes::{MoofBox, MoovBox, SampleEntry},
+     demux::Fmp4SegmentDemuxer,
+ };
+@@ -398,6 +398,27 @@
+     pub fn descriptions(&self) -> &[TrackDescription] {
+         &self.descriptions
+     }
++    /// Normalize only parser metadata, never the compressed payload. Later
++    /// runs inherit the preceding run's end, not the traf base. Preflight
++    /// still requires an explicit first-run offset and moof-relative bases.
++    fn resolve_run_offsets(&self, moof: &mut MoofBox) -> Result<(), Error> {
++        for traf in &mut moof.traf_boxes {
++            let default=*self.default_sizes.get(&traf.tfhd_box.track_id).ok_or(Error::InvalidSample)?;
++            let mut previous=None;
++            for run in &mut traf.trun_boxes {
++                let offset=run.data_offset.map(i64::from).or(previous).ok_or(Error::UnsupportedLayout)?;
++                run.data_offset=Some(i32::try_from(offset).map_err(|_|Error::InvalidSample)?);
++                let mut end=offset;
++                for sample in &run.samples {
++                    let size=sample.size.or(traf.tfhd_box.default_sample_size).unwrap_or(default);
++                    if size==0 {return Err(Error::InvalidSample);}
++                    end=end.checked_add(i64::from(size)).ok_or(Error::Quota)?;
++                }
++                previous=Some(end);
++            }
++        }
++        Ok(())
++    }
+     /// Probe complete sample coverage without mutating demux runtime state.
+     /// A complete mdat box alone is not sufficient if trun references a later
+     /// mdat. Conversely, append-call end is never a segment boundary.
+@@ -411,7 +432,8 @@
+             .iter()
+             .find(|b| b.0 == *b"moof")
+             .ok_or(Error::InvalidBox)?;
+-        let (moof, _) = MoofBox::decode(&data[header.1.clone()]).map_err(|_| Error::Demux)?;
++        let (mut moof, _) = MoofBox::decode(&data[header.1.clone()]).map_err(|_| Error::Demux)?;
++        self.resolve_run_offsets(&mut moof)?;
+         let mut complete = true;
+         for traf in moof.traf_boxes {
+             let default_size = *self
+@@ -420,8 +442,6 @@
+                 .ok_or(Error::InvalidSample)?;
+             // preflight rejects explicit bases and implicit multi-traf bases.
+             for trun in traf.trun_boxes {
+-                // The pinned library treats omitted later-run offsets as base,
+-                // not previous-run end. Reject until that layout is supported.
+                 let offset = trun.data_offset.ok_or(Error::UnsupportedLayout)?;
+                 let mut start = header
+                     .1
+@@ -471,23 +491,39 @@
+         if mdats.iter().any(|x| x.1.start < moof.1.end) {
+             return Err(Error::InvalidBox);
+         }
+-        // Dependency2026.5.0 expects one mdat directly after moof. Create a
+-        // byte-position-preserving parser envelope over the original tail.
+-        // Every real mdat payload remains at EXACTLY its original offset.
+-        // Validate each returned sample against ORIGINAL payload ranges below,
+-        // never the widened envelope that includes headers and ignored boxes.
+-        let envelope_start = moof.1.end;
+-        let envelope_len = data
+-            .len()
+-            .checked_sub(envelope_start)
++        // The dependency requires explicit later-run offsets and one mdat
++        // directly after moof. Re-encode only when offsets need normalization;
++        // account for header growth, then translate returned offsets back to
++        // ORIGINAL mdat payloads before copying any compressed sample bytes.
++        let (mut parsed,_) = MoofBox::decode(&data[moof.1.clone()]).map_err(|_|Error::Demux)?;
++        let implicit=parsed.traf_boxes.iter().any(|t|t.trun_boxes.iter().any(|r|r.data_offset.is_none()));
++        let mut delta=0i64;
++        let mut envelope=if implicit {
++            self.resolve_run_offsets(&mut parsed)?;
++            let encoded=parsed.encode_to_vec().map_err(|_|Error::Demux)?;
++            delta=i64::try_from(encoded.len()).map_err(|_|Error::Quota)?
++                -i64::try_from(moof.1.len()).map_err(|_|Error::Quota)?;
++            let total=data.len().checked_add_signed(isize::try_from(delta).map_err(|_|Error::Quota)?)
++                .ok_or(Error::Quota)?;
++            if total>self.max_bytes {return Err(Error::Quota);}
++            for traf in &mut parsed.traf_boxes {for run in &mut traf.trun_boxes {
++                let offset=i64::from(run.data_offset.ok_or(Error::InvalidSample)?)
++                    .checked_add(delta).ok_or(Error::Quota)?;
++                run.data_offset=Some(i32::try_from(offset).map_err(|_|Error::InvalidSample)?);
++            }}
++            let mut normalized=Vec::with_capacity(total);
++            normalized.extend_from_slice(&data[..moof.1.start]);
++            normalized.extend(parsed.encode_to_vec().map_err(|_|Error::Demux)?);
++            normalized.extend_from_slice(&data[moof.1.end..]);
++            if normalized.len()!=total {return Err(Error::InvalidBox);}
++            normalized
++        } else {data.to_vec()};
++        let envelope_start=moof.1.end.checked_add_signed(isize::try_from(delta).map_err(|_|Error::Quota)?)
+             .ok_or(Error::InvalidBox)?;
+-        if envelope_len < 8 || envelope_len > u32::MAX as usize {
+-            return Err(Error::UnsupportedLayout);
+-        }
+-        let mut envelope = data.to_vec();
+-        envelope[envelope_start..envelope_start + 4]
+-            .copy_from_slice(&(envelope_len as u32).to_be_bytes());
+-        envelope[envelope_start + 4..envelope_start + 8].copy_from_slice(b"mdat");
++        let envelope_len=envelope.len().checked_sub(envelope_start).ok_or(Error::InvalidBox)?;
++        if envelope_len<8 || envelope_len>u32::MAX as usize {return Err(Error::UnsupportedLayout);}
++        envelope[envelope_start..envelope_start+4].copy_from_slice(&(envelope_len as u32).to_be_bytes());
++        envelope[envelope_start+4..envelope_start+8].copy_from_slice(b"mdat");
+         // Transactional: invalid samples must not mutate sample-entry state.
+         let mut next = self.inner.clone();
+         let samples = next
+@@ -498,7 +534,9 @@
+         }
+         let mut output = Vec::with_capacity(samples.len());
+         for s in samples {
+-            let start = usize::try_from(s.data_offset).map_err(|_| Error::InvalidSample)?;
++            let normalized=i64::try_from(s.data_offset).map_err(|_|Error::InvalidSample)?;
++            let start=usize::try_from(normalized.checked_sub(delta).ok_or(Error::InvalidSample)?)
++                .map_err(|_|Error::InvalidSample)?;
+             let end = start.checked_add(s.data_size).ok_or(Error::InvalidSample)?;
+             // Library's upper-bound check alone is insufficient: never copy box
+             // headers/metadata or data from outside mdat as compressed samples.
