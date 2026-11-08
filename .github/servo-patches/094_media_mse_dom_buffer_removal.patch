@@ -1,0 +1,52 @@
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -159,6 +159,12 @@
+             list.clear();
+         }
+     }
++    pub(crate) fn remove_controller_buffer(
++        &self,
++        buffer: &servo_media::player::append_source::AppendBuffer,
++    ) -> Result<(), SourceError> {
++        self.controller.remove_buffer(buffer)
++    }
+     pub(crate) fn seekable_ranges(&self) -> Vec<std::ops::Range<f64>> {
+         self.controller.seekable_ranges(self.duration.get())
+     }
+@@ -286,10 +292,18 @@
+         // not simply from addSourceBuffer. No fabricated active list here.
+         Ok(buffer)
+     }
+-    fn RemoveSourceBuffer(&self, _: &SourceBuffer) -> Fallible<()> {
+-        Err(Error::NotSupported(Some(
+-            "Live decoder removal synchronization is not implemented".to_owned(),
+-        )))
++    fn RemoveSourceBuffer(&self, buffer: &SourceBuffer) -> Fallible<()> {
++        let list = self.source_buffers.get().ok_or(Error::NotFound(None))?;
++        if !list.buffers().iter().any(|entry| &**entry == buffer) {
++            return Err(Error::NotFound(None));
++        }
++        buffer.remove_from_backend().map_err(source_error)?;
++        buffer.removed();
++        if let Some(active) = self.active_buffers.get() {
++            active.remove(buffer);
++        }
++        list.remove(buffer);
++        Ok(())
+     }
+     fn EndOfStream(&self, error: Option<EndOfStreamError>) -> Fallible<()> {
+         if self
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -163,6 +163,9 @@
+     }
+     /// Called only after the backend has accepted removal of this buffer.
+     /// Queued append notifications are separately rejected by controller identity.
++    pub(crate) fn remove_from_backend(&self) -> Result<(), SourceError> {
++        self.source.remove_controller_buffer(&self.buffer)
++    }
+     pub(crate) fn removed(&self) {
+         if self.updating.replace(false) {
+             let this = Trusted::new(self);
