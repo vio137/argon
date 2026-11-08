@@ -1,0 +1,411 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -447,8 +447,46 @@
+     pub buffer_tracks: Vec<(u32, Vec<crate::mse_demux::TrackDescription>)>,
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct TrackSelection {
++    audio: bool,
++    video: bool,
++}
++impl TrackSelection {
++    fn selected(self, session: &AppendSession, id: u32) -> bool {
++        session
++            .descriptions()
++            .iter()
++            .any(|t| t.id == id && self.mime(t.mime))
++    }
++    fn mime(self, mime: &str) -> bool {
++        match mime {
++            "audio/mp4a-latm" => self.audio,
++            "video/avc" => self.video,
++            _ => false,
++        }
++    }
++    fn active(self, session: &AppendSession) -> bool {
++        session.descriptions().iter().any(|t| self.mime(t.mime))
++    }
++    fn ranges(self, session: &AppendSession) -> Vec<std::ops::Range<i64>> {
++        session.buffered_selected(|id| self.selected(session, id))
++    }
++    fn plan(
++        self,
++        session: &AppendSession,
++        target: i64,
++    ) -> Result<crate::mse_demux::session::SeekPlan, crate::mse_demux::session::SessionError> {
++        if !self.active(session) && !session.descriptions().is_empty() {
++            session.empty_delivery_plan()
++        } else {
++            session.stage_seek_selected(target, |id| self.selected(session, id))
++        }
++    }
++}
+ pub struct AppendPlayback {
+     sessions: BTreeMap<u32, AppendSession>,
++    selection: TrackSelection,
+     removal_generation: u64,
+     input_ended: bool,
+     declared_duration_us: Option<i64>,
+@@ -484,6 +522,10 @@
+     pub fn new(renderer: Arc<Mutex<dyn VideoFrameRenderer>>) -> Self {
+         Self {
+             sessions: BTreeMap::new(),
++            selection: TrackSelection {
++                audio: true,
++                video: true,
++            },
+             removal_generation: 0,
+             input_ended: false,
+             declared_duration_us: None,
+@@ -550,10 +592,12 @@
+             .iter()
+             .filter(|(key, _)| **key != id)
+             .all(|(_, session)| {
+-                session
+-                    .buffered()
+-                    .iter()
+-                    .any(|range| range.contains(&target))
++                !self.selection.active(session) && !session.descriptions().is_empty()
++                    || self
++                        .selection
++                        .ranges(session)
++                        .iter()
++                        .any(|range| range.contains(&target))
+             })
+             && self.sessions.len() > 1;
+         let plans = self
+@@ -562,7 +606,7 @@
+             .filter(|(key, _)| **key != id)
+             .map(|(key, session)| {
+                 let plan = if covered {
+-                    session.stage_seek(target)
++                    self.selection.plan(session, target)
+                 } else {
+                     session.empty_delivery_plan()
+                 }
+@@ -610,8 +654,8 @@
+     }
+     fn has_current_data(&self) -> bool {
+         let tracks = self.sessions.values().flat_map(|s| s.descriptions());
+-        let has_video = tracks.clone().any(|t| t.mime == "video/avc");
+-        let has_audio = tracks.clone().any(|t| t.mime == "audio/mp4a-latm");
++        let has_video = self.selection.video && tracks.clone().any(|t| t.mime == "video/avc");
++        let has_audio = self.selection.audio && tracks.clone().any(|t| t.mime == "audio/mp4a-latm");
+         (has_video || has_audio)
+             && (!has_video || self.rendered_frames > 0)
+             && (!has_audio || self.audio.pending.is_some() || self.clock.audio_frames_written > 0)
+@@ -704,14 +748,17 @@
+             .map(|(id, s)| (*id, s.buffered()))
+             .collect()
+     }
+-    fn buffered(&self) -> Vec<std::ops::Range<i64>> {
+-        let mut buffers = self.sessions.values();
++    fn buffered_for(&self, selection: TrackSelection) -> Vec<std::ops::Range<i64>> {
++        let mut buffers = self
++            .sessions
++            .values()
++            .filter(|session| selection.active(session) || session.descriptions().is_empty());
+         let Some(first) = buffers.next() else {
+             return vec![];
+         };
+-        let mut ranges = first.buffered();
++        let mut ranges = selection.ranges(first);
+         for buffer in buffers {
+-            let next = buffer.buffered();
++            let next = selection.ranges(buffer);
+             let mut intersection = vec![];
+             for left in &ranges {
+                 for right in &next {
+@@ -725,6 +772,57 @@
+             ranges = intersection;
+         }
+         ranges
++    }
++    fn buffered(&self) -> Vec<std::ops::Range<i64>> {
++        self.buffered_for(self.selection)
++    }
++    /// Private owner operation only. Stage every delivery plan before touching
++    /// native output or selection. DOM/worker control connection is separate.
++    pub fn set_track_selection(&mut self, audio: bool, video: bool) -> Result<(), ()> {
++        if self.failed {
++            return Err(());
++        }
++        let next = TrackSelection { audio, video };
++        if next == self.selection {
++            return Ok(());
++        }
++        let target = self.clock.now_us();
++        let covered = self.buffered_for(next).iter().any(|r| r.contains(&target));
++        let plans = self
++            .sessions
++            .iter()
++            .map(|(id, session)| {
++                Ok((
++                    *id,
++                    if covered {
++                        next.plan(session, target)
++                    } else {
++                        session.empty_delivery_plan()
++                    }
++                    .map_err(|_| ())?,
++                ))
++            })
++            .collect::<Result<Vec<_>, ()>>()?;
++        let floor = next
++            .video
++            .then(|| {
++                self.sessions
++                    .values()
++                    .filter_map(|session| session.video_frame_at(target))
++                    .max()
++            })
++            .flatten();
++        self.reset_output_epoch(target, floor);
++        self.selection = next;
++        self.removed_target = (!covered && (audio || video)).then_some(target);
++        if !covered {
++            self.seek_target = None;
++            self.seek_started = None;
++        }
++        for (id, plan) in plans {
++            self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
++        }
++        Ok(())
+     }
+     pub fn append(&mut self, id: u32, bytes: &[u8]) -> Result<(), ()> {
+         if self.failed {
+@@ -810,7 +908,7 @@
+         let plans = self
+             .sessions
+             .iter()
+-            .map(|(id, s)| Ok((*id, s.stage_seek(target_us).map_err(|_| ())?)))
++            .map(|(id, s)| Ok((*id, self.selection.plan(s, target_us).map_err(|_| ())?)))
+             .collect::<Result<Vec<_>, ()>>()?;
+         let video_floor = self
+             .sessions
+@@ -847,7 +945,7 @@
+             .sessions
+             .iter()
+             .filter(|(id, _)| **id != buffer)
+-            .map(|(id, s)| Ok((*id, s.stage_seek(target).map_err(|_| ())?)))
++            .map(|(id, s)| Ok((*id, self.selection.plan(s, target).map_err(|_| ())?)))
+             .collect::<Result<Vec<_>, ()>>()?;
+         let floor = self
+             .sessions
+@@ -892,7 +990,10 @@
+                 .sessions
+                 .iter()
+                 .filter(|(id, _)| **id != buffer)
+-                .all(|(_, s)| s.buffered().iter().any(|r| r.contains(&target)));
++                .all(|(_, s)| {
++                    !self.selection.active(s) && !s.descriptions().is_empty()
++                        || self.selection.ranges(s).iter().any(|r| r.contains(&target))
++                });
+         if covered {
+             return self.remove_retaining_target(buffer, start, end, target);
+         }
+@@ -959,7 +1060,7 @@
+             .iter()
+             .map(|(id, s)| {
+                 let plan = if covered {
+-                    s.stage_seek(target)
++                    self.selection.plan(s, target)
+                 } else {
+                     s.empty_delivery_plan()
+                 }
+@@ -1028,7 +1129,7 @@
+         self.checked(result)
+     }
+     fn focus_tick(&mut self) -> Result<(), ()> {
+-        let has_audio = self.decoders.audio.is_some();
++        let has_audio = self.selection.audio && self.decoders.audio.is_some();
+         let silent = self.muted || self.volume == 0.0;
+         let effective = if has_audio && !silent {
+             focus::focus()
+@@ -1047,7 +1148,8 @@
+             .buffered()
+             .iter()
+             .any(|r| r.start <= position && position < r.end);
+-        let playing = self.page_playing
++        let playing = (self.selection.audio || self.selection.video)
++            && self.page_playing
+             && self.focus.hold == Hold::None
+             && buffered
+             && self.seek_target.is_none()
+@@ -1143,14 +1245,16 @@
+     }
+     fn finish_seek_if_ready(&mut self) -> Result<(), ()> {
+         if self.seek_target.is_some() {
+-            let has_video = self
+-                .sessions
+-                .values()
+-                .any(|s| s.descriptions().iter().any(|t| t.mime == "video/avc"));
+-            let has_audio = self
+-                .sessions
+-                .values()
+-                .any(|s| s.descriptions().iter().any(|t| t.mime == "audio/mp4a-latm"));
++            let has_video = self.selection.video
++                && self
++                    .sessions
++                    .values()
++                    .any(|s| s.descriptions().iter().any(|t| t.mime == "video/avc"));
++            let has_audio = self.selection.audio
++                && self
++                    .sessions
++                    .values()
++                    .any(|s| s.descriptions().iter().any(|t| t.mime == "audio/mp4a-latm"));
+             if (has_video
+                 && self.video_done
+                 && self.rendered_frames == 0
+@@ -1225,7 +1329,7 @@
+         }
+     }
+     fn pump_inner(&mut self) -> Result<bool, ()> {
+-        if self.removed_target.is_some() {
++        if self.removed_target.is_some() || (!self.selection.audio && !self.selection.video) {
+             return Ok(false);
+         }
+         self.refresh_format_drains();
+@@ -1234,11 +1338,19 @@
+         for _ in 0..4 {
+             let mut progress = false;
+             for (id, session) in &mut self.sessions {
++                let selected: std::collections::BTreeSet<_> = session
++                    .descriptions()
++                    .iter()
++                    .filter(|track| self.selection.mime(track.mime))
++                    .map(|track| track.id)
++                    .collect();
+                 let mut sink = ScopedDecoder {
+                     buffer_id: *id,
+                     decoders: &mut self.decoders,
+                 };
+-                progress |= session.pump_input(&mut sink).map_err(|_| ())?;
++                progress |= session
++                    .pump_input_selected(&mut sink, |id| selected.contains(&id))
++                    .map_err(|_| ())?;
+             }
+             if !progress {
+                 break;
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1369,3 +1369,116 @@
+     .unwrap();
+     assert_eq!(p.buffered(), [0..1_000_000]);
+ }
++
++#[test]
++fn private_track_selection_resets_audio_clock_and_focus_without_deleting_coded_frames() {
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(Arc::new(Mutex::new(vec![]))))));
++    p.add_buffer(1).unwrap();
++    p.add_buffer(2).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.append(
++        2,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4"),
++    )
++    .unwrap();
++    p.audio.configure(48000, 2, false, &mut p.clock).unwrap();
++    assert!(!p.audio.stream.is_null());
++    assert!(p.clock.has_audio);
++    focus::set_counted(&mut p.focus_counted, true);
++    let video = p.sessions[&1].ranges(1);
++    let audio = p.sessions[&2].ranges(1);
++    p.set_track_selection(false, true).unwrap();
++    assert!(p.audio.stream.is_null());
++    assert!(!p.clock.has_audio);
++    assert!(!p.focus_counted);
++    assert!(p.decoders.audio.is_none());
++    assert_eq!(p.sessions[&1].ranges(1), video);
++    assert_eq!(p.sessions[&2].ranges(1), audio);
++    for _ in 0..10 {
++        let selection = p.selection;
++        let mut progress = false;
++        for (id, session) in &mut p.sessions {
++            let selected: BTreeSet<_> = session
++                .descriptions()
++                .iter()
++                .filter(|t| selection.mime(t.mime))
++                .map(|t| t.id)
++                .collect();
++            progress |= session
++                .pump_input_selected(
++                    &mut ScopedDecoder {
++                        buffer_id: *id,
++                        decoders: &mut p.decoders,
++                    },
++                    |id| selected.contains(&id),
++                )
++                .unwrap();
++        }
++        if !progress {
++            break;
++        }
++    }
++    assert!(p.decoders.video.is_some());
++    assert!(p.decoders.audio.is_none());
++    assert!(p.decoders.configs.values().all(|c| c.mime == "video/avc"));
++    p.set_track_selection(true, false).unwrap();
++    assert!(p.decoders.video.is_none());
++    assert!(p.video_pending.is_none());
++    assert_eq!(p.sessions[&1].ranges(1), video);
++    assert_eq!(p.sessions[&2].ranges(1), audio);
++    for _ in 0..10 {
++        let selection = p.selection;
++        let mut progress = false;
++        for (id, session) in &mut p.sessions {
++            let selected: BTreeSet<_> = session
++                .descriptions()
++                .iter()
++                .filter(|t| selection.mime(t.mime))
++                .map(|t| t.id)
++                .collect();
++            progress |= session
++                .pump_input_selected(
++                    &mut ScopedDecoder {
++                        buffer_id: *id,
++                        decoders: &mut p.decoders,
++                    },
++                    |id| selected.contains(&id),
++                )
++                .unwrap();
++        }
++        if !progress {
++            break;
++        }
++    }
++    assert!(p.decoders.audio.is_some());
++    assert!(p.decoders.video.is_none());
++}
++#[test]
++fn both_disabled_tracks_do_not_finish_or_signal_seek_readiness_and_can_be_reenabled() {
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(Arc::new(Mutex::new(vec![]))))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.end_input().unwrap();
++    p.set_track_selection(false, false).unwrap();
++    p.set_playing(true).unwrap();
++    let status = p.pump().unwrap();
++    assert!(!status.finished);
++    assert!(!status.playing);
++    assert!(!status.current_data);
++    assert!(status.buffered.is_empty());
++    assert!(!p.take_seek_ready());
++    assert!(p.seek_target.is_none());
++    p.set_track_selection(false, true).unwrap();
++    assert_eq!(p.buffered(), [0..1_000_000]);
++    assert!(p.seek_target.is_some());
++    assert!(!p.take_seek_ready());
++    assert_eq!(p.sessions[&1].ranges(1), [0..1_000_000]);
++}
