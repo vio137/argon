@@ -1,0 +1,582 @@
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -3077,6 +3077,12 @@
+ 
+     fn seekable(&self) -> TimeRangesContainer {
+         let mut seekable = TimeRangesContainer::default();
++        if let Some(source) = self.attached_append_source.get() {
++            for range in source.seekable_ranges() {
++                let _ = seekable.add(range.start, range.end);
++            }
++            return seekable;
++        }
+         if let Some(ref player) = *self.player.borrow() {
+             let ranges = player.lock().unwrap().seekable();
+             for range in ranges {
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -156,6 +156,9 @@
+             list.clear();
+         }
+     }
++    pub(crate) fn seekable_ranges(&self) -> Vec<std::ops::Range<f64>> {
++        self.controller.seekable_ranges(self.duration.get())
++    }
+     pub(crate) fn backend_duration(&self) -> f64 {
+         self.duration.get()
+     }
+@@ -283,11 +286,15 @@
+         }
+         self.controller.end_input().map_err(source_error)
+     }
+-    fn SetLiveSeekableRange(&self, _: Finite<f64>, _: Finite<f64>) -> Fallible<()> {
+-        Err(Error::NotSupported(None))
++    fn SetLiveSeekableRange(&self, start: Finite<f64>, end: Finite<f64>) -> Fallible<()> {
++        self.controller
++            .set_live_seekable_range(*start, *end)
++            .map_err(source_error)
+     }
+     fn ClearLiveSeekableRange(&self) -> Fallible<()> {
+-        Err(Error::NotSupported(None))
++        self.controller
++            .clear_live_seekable_range()
++            .map_err(source_error)
+     }
+     // Capability stays false until actual decoder/platform/DOM support is ready.
+     fn IsTypeSupported(_: &Window, _: DOMString) -> bool {
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -45,6 +45,7 @@
+     operation: u64,
+ }
+ struct State {
++    live_range: Option<std::ops::Range<f64>>,
+     state: SourceState,
+     player: Option<Arc<Mutex<dyn Player>>>,
+     buffers: BTreeMap<u32, Buffer>,
+@@ -67,6 +68,7 @@
+     pub fn new(callback: Callback) -> Self {
+         Self(Arc::new(Inner {
+             state: Mutex::new(State {
++                live_range: None,
+                 state: SourceState::Closed,
+                 player: None,
+                 buffers: BTreeMap::new(),
+@@ -76,6 +78,54 @@
+             callback,
+         }))
+     }
++    pub fn set_live_seekable_range(&self, start: f64, end: f64) -> Result<(), SourceError> {
++        let mut s = self.0.state.lock().unwrap();
++        if s.state != SourceState::Open {
++            return Err(SourceError::InvalidState);
++        }
++        if !start.is_finite() || !end.is_finite() || start < 0.0 || start > end {
++            return Err(SourceError::Type);
++        }
++        s.live_range = Some(start..end);
++        Ok(())
++    }
++    pub fn clear_live_seekable_range(&self) -> Result<(), SourceError> {
++        let mut s = self.0.state.lock().unwrap();
++        if s.state != SourceState::Open {
++            return Err(SourceError::InvalidState);
++        }
++        s.live_range = None;
++        Ok(())
++    }
++    pub fn seekable_ranges(&self, duration: f64) -> Vec<std::ops::Range<f64>> {
++        let (slive, player) = {
++            let s = self.0.state.lock().unwrap();
++            if s.state == SourceState::Closed {
++                return vec![];
++            }
++            (s.live_range.clone(), s.player.clone())
++        };
++        if duration.is_nan() || duration < 0.0 {
++            return vec![];
++        }
++        if duration.is_finite() {
++            return vec![0.0..duration];
++        }
++        let buffered = player
++            .map(|p| p.lock().unwrap().buffered())
++            .unwrap_or_default();
++        if let Some(live) = slive {
++            let start = buffered.iter().fold(live.start, |v, r| v.min(r.start));
++            let end = buffered.iter().fold(live.end, |v, r| v.max(r.end));
++            return vec![start..end];
++        }
++        buffered
++            .iter()
++            .map(|r| r.end)
++            .reduce(f64::max)
++            .map(|end| vec![0.0..end])
++            .unwrap_or_default()
++    }
+     pub fn state(&self) -> SourceState {
+         self.0.state.lock().unwrap().state
+     }
+@@ -98,6 +148,7 @@
+                 return;
+             }
+             s.state = SourceState::Closed;
++            s.live_range=None;
+             s.epoch = s.epoch.saturating_add(1);
+             s.buffers.clear();
+             s.player.take()
+diff --git a/components/media/backends/android/android_impl/mse_codec.rs b/components/media/backends/android/android_impl/mse_codec.rs
+--- a/components/media/backends/android/android_impl/mse_codec.rs
++++ b/components/media/backends/android/android_impl/mse_codec.rs
+@@ -417,3 +417,8 @@
+ pub(crate) fn mock_reset_output() {
+     tests::mock_reset_output();
+ }
++
++#[cfg(all(test, not(target_os = "android")))]
++pub(crate) fn mock_video_output(pts: i64) {
++    tests::mock_video_output(pts);
++}
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -1112,3 +1112,174 @@
+     p.check_format_drain_progress().unwrap();
+     assert!(p.format_drain_wait.is_none());
+ }
++
++#[test]
++fn unbuffered_seek_stalls_without_false_completion_then_replays_when_new_append_covers_it() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.seek_or_wait_for_coverage(2_500_000).unwrap();
++    assert_eq!(p.removed_target, Some(2_500_000));
++    assert_eq!(p.seek_started, None);
++    assert!(!p.take_seek_ready());
++    assert!(!p.pump().unwrap().finished);
++    p.set_options(1, 2_000_000, 0..i64::MAX).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    assert_eq!(p.removed_target, None);
++    assert_eq!(p.seek_target, Some(2_500_000));
++    assert_eq!(p.video_seek_floor, Some(2_500_000));
++    assert!(!p.take_seek_ready());
++    assert_eq!(p.buffered(), [0..1_000_000, 2_000_000..3_000_000]);
++}
++#[test]
++fn a_later_seek_replaces_an_unbuffered_wait_and_finite_eos_endpoint_uses_last_retained_microsecond()
++{
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.seek_or_wait_for_coverage(2_000_000).unwrap();
++    p.seek_or_wait_for_coverage(750_000).unwrap();
++    assert_eq!(p.removed_target, None);
++    assert_eq!(p.seek_target, Some(750_000));
++    p.end_input().unwrap();
++    p.seek_or_wait_for_coverage(1_000_000).unwrap();
++    assert_eq!(p.seek_target, Some(999_999));
++    assert_eq!(p.removed_target, None);
++}
++
++#[test]
++fn eos_reopen_preserves_unbuffered_seek_target_and_later_append_restores_preroll() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.set_options(1, 2_000_000, 0..i64::MAX).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.end_input().unwrap();
++    assert!(p.seek_or_wait_for_coverage(3_000_001).is_err());
++    p.seek_or_wait_for_coverage(500_000).unwrap();
++    assert_eq!(p.removed_target, Some(500_000));
++    p.reopen_input().unwrap();
++    assert_eq!(p.removed_target, Some(500_000));
++    assert!(!p.take_seek_ready());
++    assert!(p.seek_started.is_none());
++    p.set_options(1, 0, 0..i64::MAX).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    assert_eq!(p.removed_target, None);
++    assert_eq!(p.seek_target, Some(500_000));
++    p.rendered_frames = 1;
++    p.finish_seek_if_ready().unwrap();
++    assert!(p.take_seek_ready());
++    assert!(!p.take_seek_ready());
++}
++
++#[test]
++fn worker_retains_latest_seek_token_across_eos_reopen_and_completes_only_after_mock_output() {
++    use super::super::mse_worker::{Applied, Command, Event, Worker};
++    use std::sync::mpsc;
++    let (tx, rx) = mpsc::channel();
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let worker = Worker::spawn(
++        Arc::new(Mutex::new(Capture(frames.clone()))),
++        Box::new(move |event| {
++            // Thread-local NDK mocks, not an Android decode. Only the second append
++            // authorizes a synthetic acquired image to finish the latest seek.
++            if matches!(event, Event::CommandApplied(Applied::Appended(1, 2))) {
++                super::super::mse_codec::mock_video_output(500_000);
++                READY.with(|r| r.set(true));
++            }
++            let _ = tx.send(event);
++        }),
++    )
++    .unwrap();
++    let send = |c| assert!(worker.try_command(c).is_ok());
++    let ack = |expected| loop {
++        match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++            Event::CommandApplied(a) if a == expected => break,
++            Event::SeekReady { .. } => panic!("seek completed without coverage and mock image"),
++            Event::SeekRejected(_) | Event::Error => panic!("worker rejected or failed"),
++            _ => (),
++        }
++    };
++    send(Command::AddBuffer(1));
++    ack(Applied::BufferAdded(1));
++    send(Command::Options {
++        buffer_id: 1,
++        offset_us: 2_000_000,
++        window: 0..i64::MAX,
++    });
++    ack(Applied::Options(1));
++    send(Command::Append {
++        buffer_id: 1,
++        operation: 1,
++        bytes: include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4").to_vec(),
++    });
++    ack(Applied::Appended(1, 1));
++    send(Command::EndInput);
++    ack(Applied::InputEnded);
++    for (operation, target_us) in [(91, 250_000), (92, 500_000)] {
++        send(Command::Seek {
++            operation,
++            target_us,
++        });
++        ack(Applied::SeekStarted(operation));
++    }
++    send(Command::ReopenInput);
++    ack(Applied::InputReopened);
++    send(Command::Options {
++        buffer_id: 1,
++        offset_us: 0,
++        window: 0..i64::MAX,
++    });
++    ack(Applied::Options(1));
++    send(Command::Append {
++        buffer_id: 1,
++        operation: 2,
++        bytes: include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4").to_vec(),
++    });
++    ack(Applied::Appended(1, 2));
++    loop {
++        match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++            Event::SeekReady {
++                operation,
++                target_us,
++            } => {
++                assert_eq!((operation, target_us), (92, 500_000));
++                break;
++            },
++            Event::SeekRejected(_) | Event::Error => panic!("covered seek failed"),
++            _ => (),
++        }
++    }
++    assert!(!frames.lock().unwrap().is_empty());
++    send(Command::Playing(false));
++    loop {
++        match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++            Event::CommandApplied(Applied::Playing) => break,
++            Event::SeekReady { .. } => panic!("duplicate completion"),
++            Event::Error => panic!("worker failed"),
++            _ => (),
++        }
++    }
++}
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -667,9 +667,42 @@
+             .abort_append()
+             .map_err(|_| ())
+     }
+-    /// Native seek reset primitive. All sessions are staged first so an
+-    /// unbuffered target cannot disturb the current decoder/output epoch.
+-    /// Player/DOM completion and preroll presentation are not wired here yet.
++    /// Seek into retained data or pause with empty delivery queues until an
++    /// append covers the target. A coverage wait cannot report seek readiness
++    /// or start the decoder/preroll timeout.
++    pub fn seek_or_wait_for_coverage(&mut self, target: i64) -> Result<(), ()> {
++        if self.failed
++            || target < 0
++            || self.sessions.is_empty()
++            || self
++                .declared_duration_us
++                .is_some_and(|duration| target > duration)
++        {
++            return Err(());
++        }
++        let target = if self.declared_duration_us == Some(target) && target > 0 {
++            target - 1
++        } else {
++            target
++        };
++        if self.buffered().iter().any(|r| r.contains(&target)) {
++            return self.reset_seek_epoch(target);
++        }
++        let plans = self
++            .sessions
++            .iter()
++            .map(|(id, s)| Ok((*id, s.empty_delivery_plan().map_err(|_| ())?)))
++            .collect::<Result<Vec<_>, ()>>()?;
++        self.reset_output_epoch(target, None);
++        self.seek_target = None;
++        self.seek_started = None;
++        self.seek_ready = false;
++        self.removed_target = Some(target);
++        for (id, plan) in plans {
++            self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
++        }
++        Ok(())
++    }
+     pub fn reset_seek_epoch(&mut self, target_us: i64) -> Result<(), ()> {
+         if self.failed || self.sessions.is_empty() {
+             return Err(());
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -188,7 +188,7 @@
+                                         operation,
+                                         target_us,
+                                     } => {
+-                                        if playback.reset_seek_epoch(target_us).is_err() {
++                                        if playback.seek_or_wait_for_coverage(target_us).is_err() {
+                                             event(Event::SeekRejected(operation));
+                                             continue;
+                                         }
+@@ -223,7 +223,8 @@
+                                     Command::ReopenInput => {
+                                         playback.reopen_input()?;
+                                         output_finished = false;
+-                                        pending_seek = None;
++                                        // A seek waiting for coverage remains pending while
++                                        // EOS is reopened so future appends can satisfy it.
+                                         Ok(())
+                                     },
+                                     Command::EndInput => playback.end_input(),
+diff --git a/components/media/backends/android/android_impl/mse_codec_tests.rs b/components/media/backends/android/android_impl/mse_codec_tests.rs
+--- a/components/media/backends/android/android_impl/mse_codec_tests.rs
++++ b/components/media/backends/android/android_impl/mse_codec_tests.rs
+@@ -207,3 +207,13 @@
+ pub(super) fn mock_reset_output() {
+     MOCK.with(|m| *m.borrow_mut() = Mock::default());
+ }
++
++pub(super) fn mock_video_output(pts: i64) {
++    MOCK.with(|m| {
++        *m.borrow_mut() = Mock {
++            size: 4,
++            pts,
++            ..Mock::default()
++        };
++    });
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -519,7 +519,9 @@
+         if s.stopped || s.buffers.is_empty() || s.buffers.values().any(|b| !b.ready || b.updating) {
+             return Err(error());
+         }
+-        if !s.buffered.iter().any(|r| r.contains(&time)) {
++        if s.duration_us
++            .is_some_and(|duration| time * 1e6 > duration as f64)
++        {
+             return Err(PlayerError::SeekOutOfRange);
+         }
+         let previous = s.pending_seek.replace(operation);
+@@ -635,11 +637,7 @@
+     }
+     fn append_reopen(&self) -> Result<(), PlayerError> {
+         let mut s = self.state.lock().unwrap();
+-        if s.stopped
+-            || !s.input_ended
+-            || s.pending_seek.is_some()
+-            || s.buffers.values().any(|b| !b.ready || b.updating)
+-        {
++        if s.stopped || !s.input_ended || s.buffers.values().any(|b| !b.ready || b.updating) {
+             return Err(error());
+         }
+         self.command(Command::ReopenInput)?;
+@@ -1081,8 +1079,11 @@
+             .get_mut(&1)
+             .unwrap()
+             .updating = false;
++        {
++            p.state.lock().unwrap().duration_us = Some(1_000_000);
++        }
+         assert_eq!(p.append_seek(1, 2.0), Err(PlayerError::SeekOutOfRange));
+-        assert_eq!(p.append_seek(1, 0.5), Err(PlayerError::SeekOutOfRange));
++        assert_eq!(p.append_seek(1, -0.5), Err(PlayerError::SeekOutOfRange));
+         assert_eq!(p.state.lock().unwrap().pending_seek, None);
+     }
+     #[test]
+@@ -1430,4 +1431,38 @@
+         s.parsing_media_segments.insert(1, true);
+         assert!(s.parsing_media_segment(1));
+     }
++    #[test]
++    fn reopening_ended_input_does_not_discard_pending_seek_and_queue_failure_preserves_it() {
++        let player = AndroidAppendPlayer::new(
++            89,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        let p = player.lock().unwrap();
++        let old = p.worker.lock().unwrap().take();
++        drop(old);
++        let (worker, rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut s = p.state.lock().unwrap();
++            s.input_ended = true;
++            s.output_ended = true;
++            s.pending_seek = Some(88);
++        }
++        assert_eq!(p.append_reopen(), Err(PlayerError::EnoughData));
++        {
++            let s = p.state.lock().unwrap();
++            assert!(s.input_ended);
++            assert!(s.output_ended);
++            assert_eq!(s.pending_seek, Some(88));
++        }
++        rx.recv().unwrap();
++        assert_eq!(p.append_reopen(), Ok(()));
++        let s = p.state.lock().unwrap();
++        assert!(!s.input_ended);
++        assert!(!s.output_ended);
++        assert_eq!(s.pending_seek, Some(88));
++    }
+ }
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -415,3 +415,91 @@
+   b.change_type("video/mp4").unwrap();b.set_timestamp_offset(2.0).unwrap();b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();await_end(&rx,4);assert_eq!(b.buffered(),[0.0..3.0]);source.detach();assert_eq!(b.change_type("video/mp4"),Err(SourceError::InvalidState));
+  }
+ }
++
++#[cfg(test)]
++mod live_range_tests {
++    use super::*;
++    use crate::{
++        append::AppendEvent, append_source::*, generic_channel::GenericCallback,
++        mse_player::AndroidAppendPlayer,
++    };
++    use std::{
++        sync::{Arc, mpsc},
++        time::Duration,
++    };
++    #[test]
++    fn live_seekable_range_normalizes_duration_buffered_union_and_clears_on_detach() {
++        let (tx, rx) = mpsc::channel();
++        let source = AppendSource::new(Arc::new(move |e| {
++            let _ = tx.send(e);
++        }));
++        assert_eq!(
++            source.set_live_seekable_range(-1.0, 2.0),
++            Err(SourceError::InvalidState)
++        );
++        assert!(source.seekable_ranges(10.0).is_empty());
++        let p = AndroidAppendPlayer::new(
++            88,
++            GenericCallback::new(|_| {}).unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        source.attach(p).unwrap();
++        assert!(source.seekable_ranges(f64::NAN).is_empty());
++        assert!(source.seekable_ranges(f64::INFINITY).is_empty());
++        assert_eq!(source.seekable_ranges(10.0), [0.0..10.0]);
++        source.set_live_seekable_range(5.0, 9.0).unwrap();
++        assert_eq!(source.seekable_ranges(f64::INFINITY), [5.0..9.0]);
++        assert_eq!(source.seekable_ranges(10.0), [0.0..10.0]);
++        for (start, end) in [
++            (-1.0, 2.0),
++            (3.0, 2.0),
++            (f64::NAN, 3.0),
++            (0.0, f64::INFINITY),
++        ] {
++            assert_eq!(
++                source.set_live_seekable_range(start, end),
++                Err(SourceError::Type)
++            );
++        }
++        assert_eq!(source.seekable_ranges(f64::INFINITY), [5.0..9.0]);
++        let b = source.add_buffer("video/mp4").unwrap();
++        loop {
++            if matches!(
++                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
++                SourceEvent::BufferEvent(_, AppendEvent::Ready, _)
++            ) {
++                break;
++            }
++        }
++        b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec())
++            .unwrap();
++        loop {
++            if matches!(
++                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
++                SourceEvent::BufferEvent(_, AppendEvent::UpdateEnd, 1)
++            ) {
++                break;
++            }
++        }
++        assert_eq!(source.seekable_ranges(f64::INFINITY), [0.0..9.0]);
++        source.clear_live_seekable_range().unwrap();
++        assert_eq!(source.seekable_ranges(f64::INFINITY), [0.0..1.0]);
++        source.set_live_seekable_range(2.0, 2.0).unwrap();
++        assert_eq!(source.seekable_ranges(f64::INFINITY), [0.0..2.0]);
++        source.end_input().unwrap();
++        assert_eq!(
++            source.clear_live_seekable_range(),
++            Err(SourceError::InvalidState)
++        );
++        source.reopen().unwrap();
++        assert_eq!(source.seekable_ranges(f64::INFINITY), [0.0..2.0]);
++        source.detach();
++        assert!(source.seekable_ranges(f64::INFINITY).is_empty());
++        assert_eq!(
++            source.clear_live_seekable_range(),
++            Err(SourceError::InvalidState)
++        );
++    }
++}
