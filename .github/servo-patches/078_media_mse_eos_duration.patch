@@ -1,0 +1,263 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index 6d25cff31..e8ef27e07 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -354,6 +354,7 @@ pub struct PumpStatus {
+     pub finished: bool,
+     pub playing: bool,
+     pub position_us: i64,
++    pub duration_us: Option<i64>,
+     pub rendered_frames: u64,
+     pub video_size: Option<(u16, u16)>,
+     pub has_audio: bool,
+@@ -448,6 +449,21 @@ impl AppendPlayback {
+             .insert(id, AppendSession::new(16 * 1024 * 1024, 8192));
+         Ok(())
+     }
++    fn duration_us(&self) -> Option<i64> {
++        if !self.input_ended {
++            return None;
++        }
++        // MSE endOfStream uses the largest track-buffer end, not the
++        // intersection which can end earlier for a shorter audio/video track.
++        Some(
++            self.sessions
++                .values()
++                .flat_map(|s| s.descriptions().iter().flat_map(|t| s.ranges(t.id)))
++                .map(|r| r.end)
++                .max()
++                .unwrap_or(0),
++        )
++    }
+     fn input_exhausted(&self) -> bool {
+         self.input_ended && self.sessions.values().all(AppendSession::input_exhausted)
+     }
+@@ -648,6 +664,7 @@ impl AppendPlayback {
+             finished,
+             playing: self.playing,
+             position_us: self.clock.now_us(),
++            duration_us: self.duration_us(),
+             rendered_frames: self.rendered_frames,
+             video_size: self.decoders.video_size.or_else(|| {
+                 self.sessions
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index 4a156ede3..a7feee90d 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -597,3 +597,41 @@ fn seek_missing_output_never_becomes_ready_or_waits_without_a_bound() {
+     assert!(p.finish_seek_if_ready().is_err());
+     assert!(!p.take_seek_ready());
+ }
++
++#[test]
++fn eos_duration_is_largest_track_end_not_playable_intersection() {
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(Arc::new(Mutex::new(vec![]))))));
++    p.add_buffer(1).unwrap();
++    p.add_buffer(2).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.append(
++        2,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4"),
++    )
++    .unwrap();
++    assert_eq!(p.duration_us(), None);
++    let intersection_end = p.buffered().last().unwrap().end;
++    let largest = p
++        .sessions
++        .values()
++        .flat_map(|s| s.descriptions().iter().flat_map(|t| s.ranges(t.id)))
++        .map(|r| r.end)
++        .max()
++        .unwrap();
++    assert!(largest > intersection_end);
++    p.end_input().unwrap();
++    assert_eq!(p.duration_us(), Some(largest));
++    p.reset_seek_epoch(50_000).unwrap();
++    assert_eq!(p.duration_us(), Some(largest));
++}
++#[test]
++fn empty_eos_has_zero_duration_instead_of_infinite() {
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(Arc::new(Mutex::new(vec![]))))));
++    assert_eq!(p.duration_us(), None);
++    p.end_input().unwrap();
++    assert_eq!(p.duration_us(), Some(0));
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index cf9a8c9c3..939147fa9 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -36,6 +36,7 @@ struct State {
+     stopped: bool,
+     input_ended: bool,
+     output_ended: bool,
++    duration_us: Option<i64>,
+     pending_seek: Option<u64>,
+     buffers: BTreeMap<u32, BufferState>,
+     buffered: Vec<Range<f64>>,
+@@ -75,6 +76,7 @@ impl AndroidAppendPlayer {
+             stopped: false,
+             input_ended: false,
+             output_ended: false,
++            duration_us: None,
+             pending_seek: None,
+             buffers: BTreeMap::new(),
+             buffered: vec![],
+@@ -228,7 +230,9 @@ impl AndroidAppendPlayer {
+                         {
+                             let (width, height) = status.video_size.unwrap_or((0, 0));
+                             send(PlayerEvent::MetadataUpdated(Metadata {
+-                                duration: None,
++                                duration: status
++                                    .duration_us
++                                    .map(|us| std::time::Duration::from_micros(us.max(0) as u64)),
+                                 width: u32::from(width),
+                                 height: u32::from(height),
+                                 format: "video/mp4".to_owned(),
+@@ -243,16 +247,29 @@ impl AndroidAppendPlayer {
+                                 } else {
+                                     vec![]
+                                 },
+-                                is_live: true,
++                                is_live: status.duration_us.is_none(),
+                                 title: None,
+                             }));
+                         }
++                        let duration_changed = {
++                            let mut s = shared.lock().unwrap();
++                            let changed = s.duration_us != status.duration_us;
++                            s.duration_us = status.duration_us;
++                            changed
++                        };
++                        if duration_changed {
++                            send(PlayerEvent::DurationChanged(status.duration_us.map(|us| {
++                                std::time::Duration::from_micros(us.max(0) as u64)
++                            })));
++                        }
+                         if status.rendered_frames != old_frames {
+                             send(PlayerEvent::VideoFrameUpdated);
+                         }
+-                        send(PlayerEvent::PositionChanged(
+-                            status.position_us as f64 / 1e6,
+-                        ));
++                        send(PlayerEvent::PositionChanged(if status.finished {
++                            status.duration_us.unwrap_or(status.position_us) as f64 / 1e6
++                        } else {
++                            status.position_us as f64 / 1e6
++                        }));
+                         if status.finished {
+                             {
+                                 let mut s = shared.lock().unwrap();
+@@ -1004,4 +1021,39 @@ mod tests {
+         assert!(p.seekable().is_empty());
+         assert!(!p.can_resume());
+     }
++    #[test]
++    fn eos_sends_finite_duration_before_completion_once() {
++        let (tx, rx) = mpsc::channel();
++        let player = AndroidAppendPlayer::new(
++            79,
++            GenericCallback::new(move |m| {
++                if let Ok(e) = m {
++                    let _ = tx.send(e);
++                }
++            })
++            .unwrap(),
++            None,
++            Box::new(|| {}),
++        )
++        .unwrap();
++        player.lock().unwrap().play().unwrap();
++        player.lock().unwrap().end_of_stream().unwrap();
++        let mut durations = 0;
++        loop {
++            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
++                PlayerEvent::DurationChanged(Some(duration)) => {
++                    assert_eq!(duration, Duration::ZERO);
++                    durations += 1;
++                },
++                PlayerEvent::EndOfStream => break,
++                PlayerEvent::Error(_) => panic!("EOS failed"),
++                _ => (),
++            }
++        }
++        assert_eq!(durations, 1);
++        assert_eq!(
++            player.lock().unwrap().state.lock().unwrap().duration_us,
++            Some(0)
++        );
++    }
+ }
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index 4354a780e..13f9c7c60 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -95,6 +95,7 @@ impl Worker {
+                     let mut previous_frames = 0;
+                     let mut previous_size = None;
+                     let mut previous_audio = false;
++                    let mut previous_duration = None;
+                     let mut previous_playing = false;
+                     let mut last_status = Instant::now();
+                     let mut pending_seek = None;
+@@ -186,7 +187,8 @@ impl Worker {
+                                 break;
+                             },
+                         };
+-                        if status.all_buffers_ready != previous_all_ready
++                        if status.duration_us != previous_duration
++                            || status.all_buffers_ready != previous_all_ready
+                             || status.current_data != previous_current_data
+                             || status.buffer_ranges != previous_ranges
+                             || status.rendered_frames != previous_frames
+@@ -198,6 +200,7 @@ impl Worker {
+                                 && last_status.elapsed() >= Duration::from_millis(250))
+                         {
+                             event(Event::Status(status.clone()));
++                            previous_duration = status.duration_us;
+                             previous_ranges = status.buffer_ranges.clone();
+                             previous_current_data = status.current_data;
+                             previous_all_ready = status.all_buffers_ready;
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index c392c39fe..8910df616 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2805,6 +2805,9 @@ impl HTMLMediaElement {
+                 .map_or(f64::INFINITY, |duration| duration.as_secs_f64()),
+         );
+         self.queue_media_element_task_to_fire_event(atom!("durationchange"));
++        if let Some(source) = self.attached_append_source.get() {
++            source.set_backend_duration(self.duration.get());
++        }
+ 
+         // Step 5. For video elements, set the videoWidth and videoHeight attributes, and queue a
+         // media element task given the media element to fire an event named resize at the media
+@@ -2881,6 +2884,9 @@ impl HTMLMediaElement {
+         }
+ 
+         self.duration.set(duration);
++        if let Some(source) = self.attached_append_source.get() {
++            source.set_backend_duration(duration);
++        }
+ 
+         // When the length of the media resource changes to a known value (e.g. from being unknown
+         // to known, or from a previously established length to a new length), the user agent must
+diff --git a/components/script/dom/mse/mediasource.rs b/components/script/dom/mse/mediasource.rs
+index 04610a0cc..efab5fef9 100644
+--- a/components/script/dom/mse/mediasource.rs
++++ b/components/script/dom/mse/mediasource.rs
+@@ -156,6 +156,11 @@ impl MediaSource {
+             list.clear();
+         }
+     }
++    pub(crate) fn set_backend_duration(&self, duration: f64) {
++        if self.controller.state() != SourceState::Closed {
++            self.duration.set(duration);
++        }
++    }
+     pub(crate) fn sync_tracks(&self, cx: &mut JSContext) {
+         if let Some(list) = self.source_buffers.get() {
+             for buffer in list.buffers() {
