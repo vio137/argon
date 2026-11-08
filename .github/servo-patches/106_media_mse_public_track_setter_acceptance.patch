@@ -1,0 +1,28 @@
+diff --git a/components/script/dom/audio/audiotrack.rs b/components/script/dom/audio/audiotrack.rs
+--- a/components/script/dom/audio/audiotrack.rs
++++ b/components/script/dom/audio/audiotrack.rs
+@@ -130,7 +130,10 @@
+         if let Some(list) = self.track_list.get()
+             && let Some(idx) = list.find(self)
+         {
++            // The owning list commits only after backend acceptance. Do not
++            // overwrite a rejected selection with a DOM-only flag here.
+             list.set_enabled(idx, value);
++            return;
+         }
+         self.set_enabled(value);
+     }
+diff --git a/components/script/dom/media/videotrack.rs b/components/script/dom/media/videotrack.rs
+--- a/components/script/dom/media/videotrack.rs
++++ b/components/script/dom/media/videotrack.rs
+@@ -130,7 +130,10 @@
+         if let Some(list) = self.track_list.get()
+             && let Some(idx) = list.find(self)
+         {
++            // The owning list commits only after backend acceptance. Do not
++            // overwrite a rejected selection with a DOM-only flag here.
+             list.set_selected(idx, value);
++            return;
+         }
+         self.set_selected(value);
+     }
