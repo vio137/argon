@@ -1,0 +1,1272 @@
+diff --git a/components/media/backends/android/android_impl/mse_codec.rs b/components/media/backends/android/android_impl/mse_codec.rs
+index a0fb26ef0..060887a7c 100644
+--- a/components/media/backends/android/android_impl/mse_codec.rs
++++ b/components/media/backends/android/android_impl/mse_codec.rs
+@@ -407,3 +407,13 @@ impl MseCodecInput {
+ #[cfg(all(test, not(target_os = "android")))]
+ #[path = "mse_codec_tests.rs"]
+ mod tests;
++
++#[cfg(all(test, not(target_os = "android")))]
++pub(crate) fn mock_empty_eos_output(enabled: bool) {
++    tests::mock_empty_eos_output(enabled);
++}
++
++#[cfg(all(test, not(target_os = "android")))]
++pub(crate) fn mock_reset_output() {
++    tests::mock_reset_output();
++}
+diff --git a/components/media/backends/android/android_impl/mse_codec_tests.rs b/components/media/backends/android/android_impl/mse_codec_tests.rs
+index db557ea4d..4f77aeedd 100644
+--- a/components/media/backends/android/android_impl/mse_codec_tests.rs
++++ b/components/media/backends/android/android_impl/mse_codec_tests.rs
+@@ -195,3 +195,15 @@ fn seek_target_frame_can_be_released_but_preroll_eos_is_not_rendered() {
+     ));
+     MOCK.with(|m| assert_eq!(m.borrow().releases, [false]));
+ }
++
++pub(super) fn mock_empty_eos_output(enabled: bool) {
++    MOCK.with(|m| {
++        let mut m = m.borrow_mut();
++        m.flags = if enabled { 4 } else { 2 };
++        m.size = 0;
++    });
++}
++
++pub(super) fn mock_reset_output() {
++    MOCK.with(|m| *m.borrow_mut() = Mock::default());
++}
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index f030ced6d..4ff7f4ada 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -19,7 +19,7 @@ use crate::{
+ };
+ use servo_media_player::video::{Buffer, VideoFrame, VideoFrameData, VideoFrameRenderer};
+ use std::{
+-    collections::BTreeMap,
++    collections::{BTreeMap, BTreeSet},
+     ptr,
+     rc::Rc,
+     sync::{Arc, Mutex},
+@@ -224,6 +224,9 @@ struct Decoders {
+     track_ids: BTreeMap<(u32, u32), u32>,
+     next_track: u32,
+     configs: BTreeMap<u32, DecoderConfig>,
++    draining: BTreeSet<u32>,
++    output_drained: BTreeSet<u32>,
++    reconfigured: BTreeSet<u32>,
+     surface: Option<Rc<VideoSurface>>,
+     video_size: Option<(u16, u16)>,
+     video: Option<(u32, MseCodecInput)>,
+@@ -238,12 +241,64 @@ impl Decoders {
+         self.surface.take();
+         self.track_ids.clear();
+         self.configs.clear();
++        self.draining.clear();
++        self.output_drained.clear();
++        self.reconfigured.clear();
+         self.next_track = 1;
+         self.video_size = None;
+         self.first_pts = None;
+     }
+ }
++fn same_configuration(a: &DecoderConfig, b: &DecoderConfig) -> bool {
++    a.mime == b.mime
++        && a.width == b.width
++        && a.height == b.height
++        && a.sample_rate == b.sample_rate
++        && a.channels == b.channels
++        && a.csd0 == b.csd0
++        && a.csd1 == b.csd1
++}
+ impl CodecInput for Decoders {
++    fn prepare_configuration(&mut self, config: &DecoderConfig) -> Result<bool, ()> {
++        let Some(old) = self.configs.get(&config.track_id) else {
++            self.configure(config)?;
++            return Ok(true);
++        };
++        if same_configuration(old, config) {
++            return Ok(true);
++        }
++        if old.mime != config.mime {
++            return Err(());
++        }
++        let id = config.track_id;
++        self.draining.insert(id);
++        let slot = if config.mime == "video/avc" {
++            &mut self.video
++        } else {
++            &mut self.audio
++        };
++        let (track, codec) = slot.as_mut().ok_or(())?;
++        if *track != id {
++            return Err(());
++        }
++        if !codec.queue_eos()? || !self.output_drained.contains(&id) {
++            return Ok(false);
++        }
++        // Both codec EOS and the downstream surface/AAudio queue must be empty.
++        // Only then may old native handles and their surface be destroyed.
++        slot.take();
++        if config.mime == "video/avc" {
++            self.surface.take();
++            self.video_size = None;
++        }
++        self.configs.remove(&id);
++        self.draining.remove(&id);
++        self.output_drained.remove(&id);
++        self.configure(config)?;
++        self.reconfigured.insert(id);
++        Ok(true)
++    }
++
+     fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()> {
+         if let Some(old) = self.configs.get(&config.track_id) {
+             return if old.mime == config.mime
+@@ -321,6 +376,25 @@ struct ScopedDecoder<'a> {
+     decoders: &'a mut Decoders,
+ }
+ impl CodecInput for ScopedDecoder<'_> {
++    fn prepare_configuration(&mut self, config: &DecoderConfig) -> Result<bool, ()> {
++        let key = (self.buffer_id, config.track_id);
++        let mapped = self
++            .decoders
++            .track_ids
++            .get(&key)
++            .copied()
++            .unwrap_or(self.decoders.next_track);
++        let mut config = config.clone();
++        config.track_id = mapped;
++        if !self.decoders.prepare_configuration(&config)? {
++            return Ok(false);
++        }
++        if !self.decoders.track_ids.contains_key(&key) {
++            self.decoders.track_ids.insert(key, mapped);
++            self.decoders.next_track = self.decoders.next_track.checked_add(1).ok_or(())?;
++        }
++        Ok(true)
++    }
+     fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()> {
+         let key = (self.buffer_id, config.track_id);
+         let mapped = if let Some(id) = self.decoders.track_ids.get(&key) {
+@@ -384,6 +458,7 @@ pub struct AppendPlayback {
+     failed: bool,
+     video_pending: Option<Instant>,
+     video_color: (Option<i32>, Option<i32>),
++    format_drain_wait: Option<(Instant, i64, u64)>,
+     drain_wait: Option<(Instant, i64)>,
+     clock_started: bool,
+     rendered_frames: u64,
+@@ -406,6 +481,9 @@ impl AppendPlayback {
+                 track_ids: BTreeMap::new(),
+                 next_track: 1,
+                 configs: BTreeMap::new(),
++                draining: BTreeSet::new(),
++                output_drained: BTreeSet::new(),
++                reconfigured: BTreeSet::new(),
+                 first_pts: None,
+                 surface: None,
+                 video_size: None,
+@@ -424,6 +502,7 @@ impl AppendPlayback {
+             failed: false,
+             video_pending: None,
+             video_color: (None, None),
++            format_drain_wait: None,
+             drain_wait: None,
+             clock_started: false,
+             rendered_frames: 0,
+@@ -479,6 +558,16 @@ impl AppendPlayback {
+     fn input_exhausted(&self) -> bool {
+         self.input_ended && self.sessions.values().all(AppendSession::input_exhausted)
+     }
++    pub fn change_type(&mut self, id: u32) -> Result<(), ()> {
++        if self.failed || self.input_ended {
++            return Err(());
++        }
++        self.sessions
++            .get_mut(&id)
++            .ok_or(())?
++            .change_type()
++            .map_err(|_| ())
++    }
+     pub fn set_sequence_mode(&mut self, id: u32, sequence: bool) -> Result<(), ()> {
+         if self.failed || self.input_ended {
+             return Err(());
+@@ -702,6 +791,7 @@ impl AppendPlayback {
+         self.video_pending = None;
+         self.video_color = (None, None);
+         self.drain_wait = None;
++        self.format_drain_wait = None;
+         self.video_done = false;
+         self.audio_done = false;
+         self.rendered_frames = 0;
+@@ -904,8 +994,20 @@ impl AppendPlayback {
+             if (has_video
+                 && self.video_done
+                 && self.rendered_frames == 0
+-                && self.video_pending.is_none())
+-                || (has_audio && self.audio_done && self.audio.pending.is_none())
++                && self.video_pending.is_none()
++                && !self
++                    .decoders
++                    .video
++                    .as_ref()
++                    .is_some_and(|(id, _)| self.decoders.draining.contains(id)))
++                || (has_audio
++                    && self.audio_done
++                    && self.audio.pending.is_none()
++                    && !self
++                        .decoders
++                        .audio
++                        .as_ref()
++                        .is_some_and(|(id, _)| self.decoders.draining.contains(id)))
+                 || self
+                     .seek_started
+                     .is_some_and(|started| started.elapsed() > Duration::from_secs(5))
+@@ -925,10 +1027,48 @@ impl AppendPlayback {
+         }
+         Ok(())
+     }
++    fn check_format_drain_progress(&mut self) -> Result<(), ()> {
++        if self.decoders.draining.is_empty() || !self.page_playing || self.focus.hold != Hold::None
++        {
++            self.format_drain_wait = None;
++            return Ok(());
++        }
++        // A running video wall clock is not evidence that old output drains.
++        // Only endpoint-consumed audio and acquired frames reset this timer.
++        let position = if self.clock.has_audio {
++            self.clock.now_us()
++        } else {
++            0
++        };
++        match self.format_drain_wait {
++            Some((started, previous, frames))
++                if previous == position && frames == self.rendered_frames =>
++            {
++                if started.elapsed() > Duration::from_secs(5) {
++                    return Err(());
++                }
++            },
++            _ => self.format_drain_wait = Some((Instant::now(), position, self.rendered_frames)),
++        }
++        Ok(())
++    }
++    fn refresh_format_drains(&mut self) {
++        if let Some((id, _)) = &self.decoders.video {
++            if self.video_done && self.video_pending.is_none() {
++                self.decoders.output_drained.insert(*id);
++            }
++        }
++        if let Some((id, _)) = &self.decoders.audio {
++            if self.audio_done && self.audio.pending.is_none() && self.clock.audio_drained() {
++                self.decoders.output_drained.insert(*id);
++            }
++        }
++    }
+     fn pump_inner(&mut self) -> Result<bool, ()> {
+         if self.removed_target.is_some() {
+             return Ok(false);
+         }
++        self.refresh_format_drains();
+         // Fair packet-level pumping keeps a blocked video decoder from
+         // starving an independently appended audio SourceBuffer.
+         for _ in 0..4 {
+@@ -944,6 +1084,20 @@ impl AppendPlayback {
+                 break;
+             }
+         }
++        if let Some((id, _)) = &self.decoders.video {
++            if self.decoders.reconfigured.remove(id) {
++                self.video_done = false;
++                self.video_color = (None, None);
++                self.drain_wait = None;
++            }
++        }
++        if let Some((id, _)) = &self.decoders.audio {
++            if self.decoders.reconfigured.remove(id) {
++                self.audio_done = false;
++                self.audio.close();
++                self.drain_wait = None;
++            }
++        }
+         if !self.clock_started {
+             if let Some(pts) = self.decoders.first_pts {
+                 self.clock.rebase(pts);
+@@ -1064,6 +1218,7 @@ impl AppendPlayback {
+                 }
+             }
+         }
++        self.check_format_drain_progress()?;
+         self.finish_seek_if_ready()?;
+         let decoder_done = self.input_exhausted()
+             && (self.decoders.video.is_none() || self.video_done)
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index fcb3578b8..79682a11b 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -43,6 +43,9 @@ fn identical_init_configuration_is_reused_but_changes_require_drain() {
+         track_ids: BTreeMap::new(),
+         next_track: 1,
+         configs: BTreeMap::new(),
++        draining: BTreeSet::new(),
++        output_drained: BTreeSet::new(),
++        reconfigured: BTreeSet::new(),
+         first_pts: None,
+         surface: None,
+         video_size: None,
+@@ -845,6 +848,7 @@ fn reopen_resets_eos_output_epoch_and_preserves_retained_data_and_finite_duratio
+     p.clock.rebase(250_000);
+     p.rendered_frames = 8;
+     p.video_done = true;
++    p.clock.pause();
+     p.reopen_input().unwrap();
+     assert!(!p.input_ended);
+     assert_eq!(p.duration_us(), Some(1_000_000));
+@@ -867,6 +871,7 @@ fn reopen_at_exclusive_end_waits_for_new_coverage_without_replaying_old_eos() {
+     .unwrap();
+     p.end_input().unwrap();
+     p.clock.rebase(1_000_000);
++    p.clock.pause();
+     p.reopen_input().unwrap();
+     assert_eq!(p.removed_target, Some(1_000_000));
+     assert_eq!(p.seek_target, None);
+@@ -951,3 +956,159 @@ fn sequence_session_mapping_reaches_native_delivery_without_replacing_retained_f
+     p.pump().unwrap();
+     assert!(p.decoders.video.is_some());
+ }
++
++#[test]
++fn changed_native_configuration_retries_until_old_output_is_confirmed_drained() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    let config = DecoderConfig {
++        track_id: 1,
++        mime: "video/avc",
++        width: 8,
++        height: 4,
++        sample_rate: 0,
++        channels: 0,
++        csd0: vec![1],
++        csd1: vec![2],
++    };
++    p.decoders.configure(&config).unwrap();
++    let mut next = config.clone();
++    next.width = 16;
++    assert_eq!(p.decoders.prepare_configuration(&next), Ok(false));
++    assert!(p.decoders.draining.contains(&1));
++    assert_eq!(p.decoders.video_size, Some((8, 4)));
++    assert_eq!(p.decoders.prepare_configuration(&next), Ok(false));
++    p.decoders.output_drained.insert(1);
++    assert_eq!(p.decoders.prepare_configuration(&next), Ok(true));
++    assert_eq!(p.decoders.video_size, Some((16, 4)));
++    assert!(p.decoders.reconfigured.contains(&1));
++    assert!(!p.decoders.draining.contains(&1));
++    assert_eq!(p.decoders.prepare_configuration(&next), Ok(true));
++}
++
++#[test]
++fn adaptive_replacement_packet_waits_for_old_native_eos_then_rebuilds_video_surface() {
++    super::super::mse_codec::mock_empty_eos_output(false);
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    // Pump original packets into the codec before supplying a replacement init.
++    p.pump().unwrap();
++    assert_eq!(p.decoders.video_size, Some((32, 32)));
++    use shiguredo_mp4::{Decode, Encode};
++    let mut f = crate::mse_demux::BoxFramer::new(1 << 20);
++    f.append(include_bytes!(
++        "../hosttest/tests/fixtures/synthetic-fmp4.mp4"
++    ))
++    .unwrap();
++    let mut replacement = vec![];
++    while let Some(b) = f.pop_box().unwrap() {
++        if &b[4..8] == b"moov" {
++            let (mut moov, _) = shiguredo_mp4::boxes::MoovBox::decode(&b).unwrap();
++            for t in &mut moov.trak_boxes {
++                for e in &mut t.mdia_box.minf_box.stbl_box.stsd_box.entries {
++                    if let shiguredo_mp4::boxes::SampleEntry::Avc1(e) = e {
++                        e.visual.width = 64;
++                    }
++                }
++            }
++            replacement.extend(moov.encode_to_vec().unwrap());
++        } else {
++            replacement.extend(b);
++        }
++    }
++    p.set_options(1, 1_000_000, 0..i64::MAX).unwrap();
++    p.append(1, &replacement).unwrap();
++    // The first tick only asks the old codec to drain. It must not replace it.
++    p.pump().unwrap();
++    assert_eq!(p.decoders.video_size, Some((32, 32)));
++    super::super::mse_codec::mock_empty_eos_output(true);
++    p.pump().unwrap();
++    assert_eq!(p.decoders.video_size, Some((32, 32)));
++    p.pump().unwrap();
++    assert_eq!(p.decoders.video_size, Some((64, 32)));
++    assert_eq!(p.buffered(), [0..2_000_000]);
++    assert!(p.decoders.draining.is_empty());
++    super::super::mse_codec::mock_reset_output();
++}
++
++#[test]
++fn native_reconfiguration_waits_for_surface_acquisition_and_consumed_audio_not_just_codec_eos() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.decoders
++        .configure(&DecoderConfig {
++            track_id: 1,
++            mime: "video/avc",
++            width: 8,
++            height: 4,
++            sample_rate: 0,
++            channels: 0,
++            csd0: vec![1],
++            csd1: vec![2],
++        })
++        .unwrap();
++    p.decoders
++        .configure(&DecoderConfig {
++            track_id: 2,
++            mime: "audio/mp4a-latm",
++            width: 0,
++            height: 0,
++            sample_rate: 48_000,
++            channels: 2,
++            csd0: vec![0x11, 0x90],
++            csd1: vec![],
++        })
++        .unwrap();
++    p.video_done = true;
++    p.audio_done = true;
++    p.video_pending = Some(Instant::now());
++    p.audio.pending = Some(AudioQueue::new(vec![1, 2], 2, 0).unwrap());
++    p.refresh_format_drains();
++    assert!(p.decoders.output_drained.is_empty());
++    p.video_pending = None;
++    p.audio.pending = None;
++    p.clock.audio_frames_written = 100;
++    p.clock.reset_audio_epoch(0);
++    p.clock.audio_frames_written = 100;
++    p.refresh_format_drains();
++    assert!(p.decoders.output_drained.contains(&1));
++    assert!(!p.decoders.output_drained.contains(&2));
++    p.clock.observe_audio_consumed(100);
++    p.refresh_format_drains();
++    assert!(p.decoders.output_drained.contains(&2));
++    p.decoders.draining.insert(1);
++    p.decoders.reconfigured.insert(2);
++    p.decoders.reset_epoch();
++    assert!(p.decoders.output_drained.is_empty());
++    assert!(p.decoders.draining.is_empty());
++    assert!(p.decoders.reconfigured.is_empty());
++}
++
++#[test]
++fn stalled_format_drain_times_out_only_while_playing_and_without_output_progress() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.decoders.draining.insert(1);
++    p.page_playing = true;
++    p.clock.rebase(0);
++    p.clock.pause();
++    p.format_drain_wait = Some((Instant::now() - Duration::from_secs(6), 0, 0));
++    assert!(p.check_format_drain_progress().is_err());
++    p.page_playing = false;
++    p.check_format_drain_progress().unwrap();
++    assert!(p.format_drain_wait.is_none());
++    p.page_playing = true;
++    p.format_drain_wait = Some((Instant::now() - Duration::from_secs(6), 0, 0));
++    p.rendered_frames = 1;
++    p.check_format_drain_progress().unwrap();
++    assert_eq!(p.format_drain_wait.unwrap().2, 1);
++    p.decoders.draining.clear();
++    p.check_format_drain_progress().unwrap();
++    assert!(p.format_drain_wait.is_none());
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index d88c1a9a7..0eb597767 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -199,7 +199,9 @@ impl AndroidAppendPlayer {
+                             });
+                         }
+                     },
+-                    Event::CommandApplied(Applied::AppendAborted(id)) => {
++                    Event::CommandApplied(
++                        Applied::AppendAborted(id) | Applied::TypeChanged(id),
++                    ) => {
+                         shared.lock().unwrap().parser_reset_applied(id);
+                     },
+                     Event::CommandApplied(Applied::BufferAdded(id)) => {
+@@ -711,6 +713,15 @@ impl Player for AndroidAppendPlayer {
+         }
+         Ok(())
+     }
++    fn append_change_type(&self, id: u32) -> Result<(), PlayerError> {
++        let mut s = self.state.lock().unwrap();
++        if s.stopped || s.input_ended || s.buffers.get(&id).is_none_or(|b| !b.ready || b.updating) {
++            return Err(error());
++        }
++        self.command(Command::ChangeType(id))?;
++        *s.pending_parser_resets.entry(id).or_default() += 1;
++        Ok(())
++    }
+     fn append_set_sequence(&self, id: u32, sequence: bool) -> Result<(), PlayerError> {
+         let s = self.state.lock().unwrap();
+         if s.stopped
+@@ -1291,6 +1302,33 @@ mod tests {
+         assert!(!s.stopped);
+     }
+     #[test]
++    fn rejected_change_type_queue_does_not_mask_the_existing_parser_state() {
++        let player = seek_test_player();
++        let p = player.lock().unwrap();
++        drop(p.worker.lock().unwrap().take());
++        let (worker, _rx) = Worker::saturated_for_test();
++        *p.worker.lock().unwrap() = Some(worker);
++        {
++            let mut s = p.state.lock().unwrap();
++            s.buffers.insert(
++                1,
++                BufferState {
++                    ready: true,
++                    updating: false,
++                    removing: false,
++                    operation: 7,
++                    callback: Arc::new(|_| {}),
++                },
++            );
++            s.parsing_media_segments.insert(1, true);
++        }
++        assert_eq!(p.append_change_type(1), Err(PlayerError::EnoughData));
++        let s = p.state.lock().unwrap();
++        assert!(s.parsing_media_segment(1));
++        assert!(!s.pending_parser_resets.contains_key(&1));
++        assert_eq!(s.buffers.get(&1).unwrap().operation, 7);
++    }
++    #[test]
+     fn sequence_control_queue_rejection_does_not_change_buffer_operation_or_offset() {
+         let player = seek_test_player();
+         let p = player.lock().unwrap();
+diff --git a/components/media/backends/android/android_impl/mse_worker.rs b/components/media/backends/android/android_impl/mse_worker.rs
+index e2fa9ecfb..c3a4a9c37 100644
+--- a/components/media/backends/android/android_impl/mse_worker.rs
++++ b/components/media/backends/android/android_impl/mse_worker.rs
+@@ -47,6 +47,7 @@ pub enum Command {
+         buffer_id: u32,
+         offset_us: i64,
+     },
++    ChangeType(u32),
+     ReopenInput,
+     EndInput,
+     Playing(bool),
+@@ -70,6 +71,7 @@ pub enum Applied {
+     Options(u32),
+     Sequence(u32),
+     TimestampOffset(u32),
++    TypeChanged(u32),
+     InputReopened,
+     InputEnded,
+     Playing,
+@@ -154,6 +156,7 @@ impl Worker {
+                                     Command::TimestampOffset { buffer_id, .. } => {
+                                         Applied::TimestampOffset(*buffer_id)
+                                     },
++                                    Command::ChangeType(id) => Applied::TypeChanged(*id),
+                                     Command::ReopenInput => Applied::InputReopened,
+                                     Command::EndInput => Applied::InputEnded,
+                                     Command::Playing(_) => Applied::Playing,
+@@ -216,6 +219,7 @@ impl Worker {
+                                         buffer_id,
+                                         offset_us,
+                                     } => playback.set_timestamp_offset(buffer_id, offset_us),
++                                    Command::ChangeType(id) => playback.change_type(id),
+                                     Command::ReopenInput => {
+                                         playback.reopen_input()?;
+                                         output_finished = false;
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index cdfdc9df3..fc307c132 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -121,6 +121,7 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::BufferPushFailed)
+     }
+ 
++    fn append_change_type(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_sequence(&self, _id:u32, _sequence:bool)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_timestamp_offset(&self,_id:u32,_offset:f64)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_timestamp_offset(&self,_id:u32)->Option<f64>{None}
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index eaf5dcf42..e525f7808 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -395,3 +395,23 @@ mod pipeline_tests {
+   b.abort().unwrap();b.set_sequence_mode(true).unwrap();b.set_timestamp_offset(5.0).unwrap();b.append(media).unwrap();await_end(&rx,3);assert_eq!(b.buffered(),[5.0..6.0]);source.detach();
+  }
+ }
++
++#[cfg(test)] mod change_type_control_tests {
++ use crate::{append_source::*,append::AppendEvent,generic_channel::GenericCallback,mse_player::AndroidAppendPlayer,mse_demux::BoxFramer};
++ use std::{sync::{Arc,mpsc},time::Duration};
++ fn await_end(rx:&mpsc::Receiver<SourceEvent>,op:u64){loop{match rx.recv_timeout(Duration::from_secs(2)).unwrap(){SourceEvent::BufferEvent(_,AppendEvent::Error,_)=>panic!("append failed"),SourceEvent::BufferEvent(_,AppendEvent::UpdateEnd,n) if n==op=>break,_=>()}}}
++ #[test] fn change_type_discards_partial_input_without_update_events_and_requires_fresh_initialization() {
++  let p=AndroidAppendPlayer::new(87,GenericCallback::new(|_|{}).unwrap(),None,Box::new(||{})).unwrap();let(tx,rx)=mpsc::channel();let source=AppendSource::new(Arc::new(move|e|{let _=tx.send(e);}));source.attach(p).unwrap();let b=source.add_buffer("video/mp4").unwrap();
++  loop{if matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::BufferEvent(_,AppendEvent::Ready,_)){break;}}
++  let mut f=BoxFramer::new(1<<20);f.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4")).unwrap();let mut init=vec![];let mut media=vec![];
++  while let Some(b)=f.pop_box().unwrap(){match &b[4..8]{b"ftyp"|b"moov"=>init.extend(b),b"moof"|b"mdat"=>media.extend(b),_=>()}}
++  b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();await_end(&rx,1);
++  b.append(media[..8].to_vec()).unwrap();await_end(&rx,2);assert!(b.parsing_media_segment().unwrap());
++  assert_eq!(b.change_type(""),Err(SourceError::Type));assert_eq!(b.change_type("video/webm"),Err(SourceError::NotSupported));assert_eq!(b.change_type("audio/mp4"),Err(SourceError::NotSupported));
++  b.change_type("video/mp4; codecs=\"avc1.42e01e\"").unwrap();assert!(!b.parsing_media_segment().unwrap());assert!(!b.updating());assert!(rx.try_recv().is_err());assert_eq!(b.buffered(),[0.0..1.0]);
++  b.set_timestamp_offset(1.0).unwrap();b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();await_end(&rx,3);assert_eq!(b.buffered(),[0.0..2.0]);
++  source.end_input().unwrap();loop{if rx.recv_timeout(Duration::from_secs(2)).unwrap()==SourceEvent::Ended{break;}}
++  assert!(b.change_type("video/mp4").is_err());source.reopen().unwrap();assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),SourceEvent::Open);
++  b.change_type("video/mp4").unwrap();b.set_timestamp_offset(2.0).unwrap();b.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();await_end(&rx,4);assert_eq!(b.buffered(),[0.0..3.0]);source.detach();assert_eq!(b.change_type("video/mp4"),Err(SourceError::InvalidState));
++ }
++}
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+index 8025c0e9a..0d10e8fa9 100644
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -665,3 +665,47 @@ fn sequence_explicit_offset_remains_visible_before_frames_and_through_empty_appe
+  s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();assert_eq!(s.buffered(),[7_000_000..8_000_000]);
+  s.set_sequence_mode(false).unwrap();assert_eq!(s.timestamp_offset(),7_000_000);
+ }
++
++#[test]
++fn replacement_init_shape_rejection_preserves_the_previous_demux_configuration() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoovBox};
++ let bs=boxes();let init=bs.iter().filter(|b| &b[4..8]==b"ftyp"||&b[4..8]==b"moov").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let mut replacement=vec![];
++ for b in &bs {if &b[4..8]==b"ftyp"{replacement.extend(b);}else if &b[4..8]==b"moov" {
++  let(mut moov,_)=MoovBox::decode(b).unwrap();moov.trak_boxes[0].tkhd_box.track_id=9;
++  moov.mvex_box.as_mut().unwrap().trex_boxes[0].track_id=9;replacement.extend(moov.encode_to_vec().unwrap());
++ }}
++ let mut d=Demux::new(1<<20,100);d.init(&init).unwrap();let old=d.descriptions().to_vec();assert!(d.init(&replacement).is_err());assert_eq!(d.descriptions(),old);
++ let pair=bs.windows(2).find(|p|&p[0][4..8]==b"moof"&&&p[1][4..8]==b"mdat").unwrap();let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);assert!(!d.media(&media).unwrap().is_empty());
++}
++#[test]
++fn old_and_replacement_init_epochs_survive_session_seek_with_their_original_dimensions() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoovBox};
++ use servo_media_android_hosttest::mse_demux::{session::AppendSession,delivery::CodecInput,bridge::DecoderConfig};
++ struct Sink {widths:Vec<u16>,pts:Vec<i64>}
++ impl CodecInput for Sink {fn configure(&mut self,c:&DecoderConfig)->Result<(),()>{self.widths.push(c.width);Ok(())}fn submit(&mut self,_:u32,_:&[u8],pts:i64)->Result<bool,()>{self.pts.push(pts);Ok(true)}}
++ let mut replacement=vec![];for b in boxes(){if &b[4..8]==b"moov"{let(mut moov,_)=MoovBox::decode(&b).unwrap();for t in &mut moov.trak_boxes {for e in &mut t.mdia_box.minf_box.stbl_box.stsd_box.entries {if let shiguredo_mp4::boxes::SampleEntry::Avc1(e)=e{e.visual.width=64;}}}replacement.extend(moov.encode_to_vec().unwrap());}else{replacement.extend(b);}}
++ let mut s=AppendSession::new(1<<20,100);s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();s.set_append_options(1_000_000,0..i64::MAX).unwrap();s.append(&replacement).unwrap();
++ let mut sink=Sink{widths:vec![],pts:vec![]};while s.pump_input(&mut sink).unwrap(){}assert_eq!(sink.widths,[32,64]);assert_eq!(sink.pts,[0,500_000,1_000_000,1_500_000]);
++ s.prepare_seek(0).unwrap();let mut sink=Sink{widths:vec![],pts:vec![]};while s.pump_input(&mut sink).unwrap(){}assert_eq!(sink.widths,[32,64]);
++ s.prepare_seek(1_500_000).unwrap();let mut sink=Sink{widths:vec![],pts:vec![]};while s.pump_input(&mut sink).unwrap(){}assert_eq!(sink.widths,[64]);
++}
++
++#[test]
++fn change_type_requires_a_new_init_even_after_abort_but_preserves_retained_frames() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let bs=boxes();let media=bs.iter().filter(|b|&b[4..8]==b"moof"||&b[4..8]==b"mdat").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let mut s=AppendSession::new(1<<20,100);s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();let before=s.buffered();
++ s.change_type().unwrap();assert_eq!(s.buffered(),before);s.abort_append().unwrap();assert!(s.append(&media).is_err());assert_eq!(s.buffered(),before);
++ let mut s=AppendSession::new(1<<20,100);s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();s.change_type().unwrap();
++ s.set_timestamp_offset(1_000_000).unwrap();s.append(include_bytes!("fixtures/synthetic-fmp4.mp4")).unwrap();assert_eq!(s.buffered(),[0..2_000_000]);
++ s.end_of_stream().unwrap();assert!(s.change_type().is_err());s.reopen().unwrap();s.change_type().unwrap();
++}
++#[test]
++fn change_type_discards_partial_old_segment_and_rejects_partial_replacement_init() {
++ use servo_media_android_hosttest::mse_demux::session::AppendSession;
++ let bs=boxes();let init=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let media=bs.iter().filter(|b|&b[4..8]==b"moof"||&b[4..8]==b"mdat").flat_map(|b|b.iter().copied()).collect::<Vec<_>>();
++ let mut s=AppendSession::new(1<<20,100);s.append(&init).unwrap();s.append(&media[..8]).unwrap();assert!(s.parsing_media_segment());
++ s.change_type().unwrap();assert!(!s.parsing_media_segment());s.append(&init[..8]).unwrap();s.abort_append().unwrap();assert!(s.append(&media).is_err());
++}
+diff --git a/components/media/backends/android/mse_demux/append.rs b/components/media/backends/android/mse_demux/append.rs
+index 8850f0186..874c8b280 100644
+--- a/components/media/backends/android/mse_demux/append.rs
++++ b/components/media/backends/android/mse_demux/append.rs
+@@ -8,6 +8,7 @@ pub struct AppendStream {
+     init: Vec<u8>,
+     media: Vec<u8>,
+     initialized: bool,
++    require_init: bool,
+     has_moof: bool,
+     has_mdat: bool,
+     completed_fragment: bool,
+@@ -22,6 +23,7 @@ impl AppendStream {
+             init: vec![],
+             media: vec![],
+             initialized: false,
++            require_init: false,
+             has_moof: false,
+             has_mdat: false,
+             completed_fragment: false,
+@@ -58,11 +60,12 @@ impl AppendStream {
+                     self.extend_init(&b)?;
+                     self.demux.init(&self.init)?;
+                     self.initialized = true;
++                    self.require_init = false;
+                     self.init.clear();
+                 },
+                 b"moof" => {
+                     self.flush(&mut output)?;
+-                    if !self.initialized || !self.init.is_empty() {
++                    if !self.initialized || self.require_init || !self.init.is_empty() {
+                         return Err(Error::InvalidBox);
+                     }
+                     self.media = b;
+@@ -140,6 +143,10 @@ impl AppendStream {
+         }
+         result
+     }
++    pub fn require_new_initialization(&mut self) {
++        self.abort();
++        self.require_init = true;
++    }
+     pub fn parsing_media_segment(&self) -> bool {
+         self.has_moof || self.framer.pending_box_type() == Some(*b"moof")
+     }
+diff --git a/components/media/backends/android/mse_demux/delivery.rs b/components/media/backends/android/mse_demux/delivery.rs
+index 9af1753fd..bdad21724 100644
+--- a/components/media/backends/android/mse_demux/delivery.rs
++++ b/components/media/backends/android/mse_demux/delivery.rs
+@@ -11,6 +11,11 @@ pub enum DeliveryError {
+ }
+ pub trait CodecInput {
+     fn configure(&mut self, config: &DecoderConfig) -> Result<(), ()>;
++    /// A native owner may need to drain the previous configuration before a
++    /// replacement can be installed. False retains this packet and retries.
++    fn prepare_configuration(&mut self, config: &DecoderConfig) -> Result<bool, ()> {
++        self.configure(config).map(|_| true)
++    }
+     /// true only when the entire packet was accepted; false is retry-later.
+     fn submit(&mut self, track_id: u32, bytes: &[u8], pts_us: i64) -> Result<bool, ()>;
+ }
+@@ -70,9 +75,13 @@ impl Delivery {
+         };
+         if !front.configured {
+             if let Some(c) = front.packet.config.as_ref() {
+-                if sink.configure(c).is_err() {
+-                    self.poisoned = true;
+-                    return Err(DeliveryError::Decoder);
++                match sink.prepare_configuration(c) {
++                    Ok(false) => return Ok(false),
++                    Ok(true) => (),
++                    Err(()) => {
++                        self.poisoned = true;
++                        return Err(DeliveryError::Decoder);
++                    },
+                 }
+             }
+             front.configured = true;
+@@ -149,6 +158,43 @@ mod tests {
+         }
+     }
+     #[test]
++    fn configuration_drain_retry_retains_front_packet_without_submitting_or_poisoning() {
++        struct Drain {
++            ready: bool,
++            prepared: usize,
++            submitted: usize,
++        }
++        impl CodecInput for Drain {
++            fn configure(&mut self, _: &DecoderConfig) -> Result<(), ()> {
++                panic!("prepare override must be used")
++            }
++            fn prepare_configuration(&mut self, _: &DecoderConfig) -> Result<bool, ()> {
++                self.prepared += 1;
++                Ok(self.ready)
++            }
++            fn submit(&mut self, _: u32, _: &[u8], _: i64) -> Result<bool, ()> {
++                self.submitted += 1;
++                Ok(true)
++            }
++        }
++        let mut d = Delivery::new(64);
++        d.push(packet()).unwrap();
++        let mut sink = Drain {
++            ready: false,
++            prepared: 0,
++            submitted: 0,
++        };
++        assert_eq!(d.pump(&mut sink), Ok(false));
++        assert_eq!(d.pump(&mut sink), Ok(false));
++        assert!(!d.is_empty());
++        assert_eq!(sink.submitted, 0);
++        sink.ready = true;
++        assert_eq!(d.pump(&mut sink), Ok(true));
++        assert!(d.is_empty());
++        assert_eq!(sink.prepared, 3);
++        assert_eq!(sink.submitted, 1);
++    }
++    #[test]
+     fn retry_keeps_packet_and_does_not_reconfigure() {
+         let mut d = Delivery::new(16);
+         d.push(packet()).unwrap();
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+index b96bfdc62..289af8954 100644
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -342,6 +342,16 @@ impl Demux {
+             }
+             descriptions.push(description);
+         }
++        if !self.descriptions.is_empty()
++            && (self.descriptions.len() != descriptions.len()
++                || self.descriptions.iter().any(|old| {
++                    !descriptions
++                        .iter()
++                        .any(|next| old.id == next.id && old.mime == next.mime)
++                }))
++        {
++            return Err(Error::UnsupportedLayout);
++        }
+         let defaults = moov
+             .mvex_box
+             .ok_or(Error::InvalidBox)?
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index e720355d2..8f4af49e1 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -60,6 +60,16 @@ impl AppendSession {
+             limit,
+         }
+     }
++    /// Private same-container changeType preparation. Keep retained coded data
++    /// and delivery, but the next media segment must have a new valid init.
++    pub fn change_type(&mut self) -> Result<(), SessionError> {
++        if self.failed || self.ended {
++            return Err(SessionError::Failed);
++        }
++        self.stream.require_new_initialization();
++        self.store.discontinuity();
++        Ok(())
++    }
+     pub fn set_sequence_mode(&mut self, sequence: bool) -> Result<(), SessionError> {
+         if self.failed || self.ended || self.parsing_media_segment() {
+             return Err(SessionError::Failed);
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+index c48ea2266..711e4a060 100644
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -1,6 +1,28 @@
+ //! Bounded coded-frame storage foundation. Not a complete MSE SourceBuffer.
+ use super::AccessUnit;
+-use std::collections::{BTreeMap, BTreeSet};
++use shiguredo_mp4::{Encode, boxes::SampleEntry};
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    ops::Deref,
++    sync::Arc,
++};
++#[derive(Clone)]
++struct ConfigEpoch {
++    entry: SampleEntry,
++    bytes: usize,
++}
++#[derive(Clone)]
++pub struct StoredFrame {
++    unit: AccessUnit,
++    config: Option<Arc<ConfigEpoch>>,
++}
++impl Deref for StoredFrame {
++    type Target = AccessUnit;
++    fn deref(&self) -> &AccessUnit {
++        &self.unit
++    }
++}
++
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum StoreError {
+     Quota,
+@@ -13,9 +35,10 @@ pub struct FrameStore {
+     group_start: Option<i64>,
+     group_end: i64,
+     sequence_offset: i64,
+-    tracks: BTreeMap<u32, Vec<AccessUnit>>,
+-    configs: BTreeMap<u32, shiguredo_mp4::boxes::SampleEntry>,
++    tracks: BTreeMap<u32, Vec<StoredFrame>>,
++    configs: BTreeMap<u32, Arc<ConfigEpoch>>,
+     output_configured: BTreeSet<u32>,
++    output_configs: BTreeMap<u32, Arc<ConfigEpoch>>,
+     need_random_access: BTreeSet<u32>,
+     last_decode: BTreeMap<u32, (i64, i64)>,
+     bytes: usize,
+@@ -31,6 +54,7 @@ impl FrameStore {
+             tracks: BTreeMap::new(),
+             configs: BTreeMap::new(),
+             output_configured: BTreeSet::new(),
++            output_configs: BTreeMap::new(),
+             need_random_access: BTreeSet::new(),
+             last_decode: BTreeMap::new(),
+             bytes: 0,
+@@ -64,11 +88,12 @@ impl FrameStore {
+     /// A reset delivery bridge needs configuration on the next accepted unit.
+     pub fn rearm_output_configuration(&mut self) {
+         self.output_configured.clear();
++        self.output_configs.clear();
+     }
+     pub fn bytes(&self) -> usize {
+         self.bytes
+     }
+-    pub fn frames(&self, track: u32) -> &[AccessUnit] {
++    pub fn frames(&self, track: u32) -> &[StoredFrame] {
+         self.tracks.get(&track).map(Vec::as_slice).unwrap_or(&[])
+     }
+     pub fn discontinuity(&mut self) {
+@@ -115,21 +140,6 @@ impl FrameStore {
+         if window.start < 0 || window.end <= window.start {
+             return Err(StoreError::Window);
+         }
+-        let mut configs = self.configs.clone();
+-        for f in &input {
+-            if let Some(config) = &f.codec_config {
+-                if let Some(old) = configs.get(&f.track_id) {
+-                    if old != config {
+-                        return Err(StoreError::Timestamp);
+-                    }
+-                } else {
+-                    if configs.len() >= 2 {
+-                        return Err(StoreError::Quota);
+-                    }
+-                    configs.insert(f.track_id, config.clone());
+-                }
+-            }
+-        }
+         let mut bytes = 0usize;
+         // Validate transaction before changing existing buffered frames.
+         for f in &input {
+@@ -141,7 +151,6 @@ impl FrameStore {
+         if self.bytes.checked_add(bytes).ok_or(StoreError::Quota)? > self.limit {
+             return Err(StoreError::Quota);
+         }
+-        self.configs = configs;
+         let mut accepted = vec![];
+         for mut frame in input {
+             let track = frame.track_id;
+@@ -149,6 +158,26 @@ impl FrameStore {
+                 self.need_random_access.insert(track);
+                 self.tracks.insert(track, vec![]);
+             }
++            if let Some(entry) = frame.codec_config.take() {
++                let changed = self
++                    .configs
++                    .get(&track)
++                    .is_none_or(|old| old.entry != entry);
++                if changed {
++                    // Configuration changes start a new dependency chain. Native
++                    // replacement still requires the owner to drain/reset output.
++                    if let Some(old) = self.configs.get(&track) {
++                        if std::mem::discriminant(&old.entry) != std::mem::discriminant(&entry) {
++                            return Err(StoreError::Timestamp);
++                        }
++                    }
++                    let mut encoded = vec![0; self.limit.min(64 * 1024)];
++                    let bytes = entry.encode(&mut encoded).map_err(|_| StoreError::Quota)?;
++                    self.configs
++                        .insert(track, Arc::new(ConfigEpoch { entry, bytes }));
++                    self.need_random_access.insert(track);
++                }
++            }
+             let raw_pts = frame.pts_us;
+             let raw_dts = frame.dts_us;
+             loop {
+@@ -219,19 +248,55 @@ impl FrameStore {
+                 }
+             }
+             self.bytes += frame.data.len();
+-            // Cache one configuration per track, never clone the init payload
+-            // into every stored frame. Format replacement is not supported yet.
++            // Frames pin immutable shared epochs, so replay never substitutes
++            // the latest init for samples that were encoded with an older init.
++            let config = self.configs.get(&track).cloned();
+             frame.codec_config = None;
+             let mut output = frame.clone();
+-            if self.output_configured.insert(track) {
+-                output.codec_config = self.configs.get(&track).cloned();
++            let changed = config.as_ref().is_some_and(|c| {
++                self.output_configs
++                    .get(&track)
++                    .is_none_or(|old| !Arc::ptr_eq(old, c))
++            });
++            if self.output_configured.insert(track) || changed {
++                output.codec_config = config.as_ref().map(|c| c.entry.clone());
++                if let Some(c) = &config {
++                    self.output_configs.insert(track, c.clone());
++                }
+             }
+             accepted.push(output);
+-            frames.push(frame);
++            frames.push(StoredFrame {
++                unit: frame,
++                config,
++            });
+             frames.sort_by_key(|f| f.dts_us);
+         }
++        self.configuration_budget()?;
+         Ok(accepted)
+     }
++    fn configuration_budget(&self) -> Result<usize, StoreError> {
++        let mut seen = BTreeSet::new();
++        let mut bytes = 0usize;
++        for c in self
++            .configs
++            .values()
++            .chain(self.output_configs.values())
++            .chain(
++                self.tracks
++                    .values()
++                    .flatten()
++                    .filter_map(|f| f.config.as_ref()),
++            )
++        {
++            if seen.insert(Arc::as_ptr(c) as usize) {
++                bytes = bytes.checked_add(c.bytes).ok_or(StoreError::Quota)?;
++                if seen.len() > 64 || bytes > self.limit {
++                    return Err(StoreError::Quota);
++                }
++            }
++        }
++        Ok(bytes)
++    }
+     /// Automatic back-buffer eviction, not script remove(). Keep the random
+     /// access point preceding the retained window plus every dependent frame.
+     /// Call only with a cutoff safely behind consumed/displayed playback.
+@@ -350,7 +415,7 @@ impl FrameStore {
+             return Err(StoreError::Timestamp);
+         }
+         let mut output = vec![];
+-        for (track, frames) in &self.tracks {
++        for frames in self.tracks.values() {
+             let start = frames
+                 .iter()
+                 .enumerate()
+@@ -358,11 +423,19 @@ impl FrameStore {
+                 .map(|(i, _)| i)
+                 .last()
+                 .ok_or(StoreError::Timestamp)?;
+-            let mut replay = frames[start..].to_vec();
+-            if let Some(first) = replay.first_mut() {
+-                first.codec_config = self.configs.get(track).cloned();
++            let mut previous: Option<Arc<ConfigEpoch>> = None;
++            for stored in &frames[start..] {
++                let mut frame = stored.unit.clone();
++                let changed = stored
++                    .config
++                    .as_ref()
++                    .is_some_and(|c| previous.as_ref().is_none_or(|old| !Arc::ptr_eq(old, c)));
++                if changed {
++                    frame.codec_config = stored.config.as_ref().map(|c| c.entry.clone());
++                }
++                previous = stored.config.clone();
++                output.push(frame);
+             }
+-            output.extend(replay);
+         }
+         output.sort_by_key(|f| (f.dts_us, f.track_id));
+         Ok(output)
+@@ -401,6 +474,117 @@ mod tests {
+             data: vec![1; 4],
+         }
+     }
++    fn avc_entry() -> SampleEntry {
++        let mut stream = super::super::append::AppendStream::new(1 << 20, 100);
++        stream
++            .append(include_bytes!(
++                "../hosttest/tests/fixtures/synthetic-fmp4.mp4"
++            ))
++            .unwrap()
++            .into_iter()
++            .find_map(|u| u.codec_config)
++            .unwrap()
++    }
++    fn alternate(entry: &SampleEntry) -> SampleEntry {
++        let mut next = entry.clone();
++        if let SampleEntry::Avc1(e) = &mut next {
++            e.visual.width += 2;
++        } else {
++            panic!("fixture is not AVC")
++        };
++        next
++    }
++    #[test]
++    fn format_epochs_replay_original_configuration_and_each_later_transition() {
++        let old = avc_entry();
++        let next = alternate(&old);
++        let mut s = FrameStore::new(1 << 20);
++        let mut a = f(0, true);
++        a.codec_config = Some(old.clone());
++        let mut b = f(20, true);
++        b.codec_config = Some(next.clone());
++        let accepted = s
++            .append_collect(vec![a, f(10, false), b, f(30, false)], 0, 0..100)
++            .unwrap();
++        assert_eq!(accepted[0].codec_config.as_ref(), Some(&old));
++        assert!(accepted[1].codec_config.is_none());
++        assert_eq!(accepted[2].codec_config.as_ref(), Some(&next));
++        assert!(accepted[3].codec_config.is_none());
++        assert!(Arc::ptr_eq(
++            s.frames(1)[0].config.as_ref().unwrap(),
++            s.frames(1)[1].config.as_ref().unwrap()
++        ));
++        assert!(!Arc::ptr_eq(
++            s.frames(1)[0].config.as_ref().unwrap(),
++            s.frames(1)[2].config.as_ref().unwrap()
++        ));
++        let replay = s.replay_from(10).unwrap();
++        assert_eq!(replay[0].codec_config.as_ref(), Some(&old));
++        assert_eq!(replay[2].codec_config.as_ref(), Some(&next));
++        let replay = s.replay_from(30).unwrap();
++        assert_eq!(replay.len(), 2);
++        assert_eq!(replay[0].codec_config.as_ref(), Some(&next));
++        s.rearm_output_configuration();
++        let accepted = s.append_collect(vec![f(40, false)], 0, 0..100).unwrap();
++        assert_eq!(accepted[0].codec_config.as_ref(), Some(&next));
++    }
++    #[test]
++    fn format_change_requires_new_rap_and_window_drop_does_not_lose_new_configuration() {
++        let old = avc_entry();
++        let next = alternate(&old);
++        let mut s = FrameStore::new(1 << 20);
++        let mut a = f(0, true);
++        a.codec_config = Some(old);
++        s.append(vec![a], 0, 0..100).unwrap();
++        let mut b = f(10, false);
++        b.codec_config = Some(next.clone());
++        assert!(s.append_collect(vec![b], 0, 0..100).unwrap().is_empty());
++        assert!(
++            s.append_collect(vec![f(20, true)], 0, 30..100)
++                .unwrap()
++                .is_empty()
++        );
++        let accepted = s.append_collect(vec![f(30, true)], 0, 0..100).unwrap();
++        assert_eq!(accepted[0].codec_config.as_ref(), Some(&next));
++        assert_eq!(s.ranges(1), [0..10, 30..40]);
++    }
++    #[test]
++    fn eviction_and_removal_release_unreferenced_configuration_epochs() {
++        let old = avc_entry();
++        let next = alternate(&old);
++        let mut s = FrameStore::new(1 << 20);
++        let mut a = f(0, true);
++        a.codec_config = Some(old);
++        let mut b = f(20, true);
++        b.codec_config = Some(next.clone());
++        s.append(vec![a, f(10, false), b], 0, 0..100).unwrap();
++        let weak = Arc::downgrade(s.frames(1)[0].config.as_ref().unwrap());
++        let before = s.configuration_budget().unwrap();
++        s.evict_before(20);
++        assert!(weak.upgrade().is_none());
++        assert!(s.configuration_budget().unwrap() < before);
++        let replay = s.replay_from(20).unwrap();
++        assert_eq!(replay[0].codec_config.as_ref(), Some(&next));
++        s.remove(20, 30).unwrap();
++        assert!(s.frames(1).is_empty());
++    }
++    #[test]
++    fn excessive_retained_format_history_rejects_atomically() {
++        let mut entry = avc_entry();
++        let mut s = FrameStore::new(1 << 20);
++        for n in 0..64 {
++            let mut a = f(n * 10, true);
++            a.codec_config = Some(entry.clone());
++            s.append(vec![a], 0, 0..1000).unwrap();
++            entry = alternate(&entry);
++        }
++        let before = s.bytes();
++        let mut a = f(640, true);
++        a.codec_config = Some(entry);
++        assert_eq!(s.append(vec![a], 0, 0..1000), Err(StoreError::Quota));
++        assert_eq!(s.bytes(), before);
++        assert_eq!(s.frames(1).len(), 64);
++    }
+     #[test]
+     fn sequence_mode_rebases_timestamp_regressions_and_honors_explicit_group_start() {
+         let mut s = FrameStore::new(128);
+diff --git a/components/media/player/append_source.rs b/components/media/player/append_source.rs
+index 477e1739e..a037e1d73 100644
+--- a/components/media/player/append_source.rs
++++ b/components/media/player/append_source.rs
+@@ -33,6 +33,7 @@ pub enum SourceError {
+ }
+ type Callback = Arc<dyn Fn(SourceEvent) + Send + Sync>;
+ struct Buffer {
++    mime: String,
+     sequence: bool,
+     offset_from_append: bool,
+     offset: f64,
+@@ -123,7 +124,8 @@ impl AppendSource {
+             s.buffers.insert(
+                 id,
+                 Buffer {
+-                    sequence: false,
++                    mime: mime.to_owned(),
++                sequence: false,
+                 offset_from_append: false,
+                 offset: 0.0,
+                     window: 0.0..f64::INFINITY,
+@@ -255,6 +257,21 @@ impl AppendBuffer {
+             s.epoch == self.epoch && s.buffers.get(&self.id).is_some_and(|b| b.updating)
+         })
+     }
++    pub fn validate_change_type(&self,mime:&str)->Result<(),SourceError> {
++        if mime.is_empty(){return Err(SourceError::Type);}
++        let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;let s=inner.state.lock().unwrap();
++        if s.epoch!=self.epoch || s.state==SourceState::Closed || s.buffers.get(&self.id).is_none_or(|b|b.updating){return Err(SourceError::InvalidState);}
++        let b=s.buffers.get(&self.id).unwrap();
++        if !supported_type(mime) || !b.mime.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case(mime.split(';').next().unwrap_or("").trim()){return Err(SourceError::NotSupported);}
++        Ok(())
++    }
++    pub fn change_type(&self,mime:&str)->Result<(),SourceError> {
++        self.validate_change_type(mime)?;
++        let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;let mut s=inner.state.lock().unwrap();
++        if s.epoch!=self.epoch || s.state!=SourceState::Open || s.buffers.get(&self.id).is_none_or(|b|b.updating){return Err(SourceError::InvalidState);}
++        s.player.as_ref().ok_or(SourceError::InvalidState)?.lock().unwrap().append_change_type(self.id).map_err(|e|if e==PlayerError::EnoughData{SourceError::Quota}else{SourceError::Backend})?;
++        s.buffers.get_mut(&self.id).unwrap().mime=mime.to_owned();Ok(())
++    }
+     pub fn sequence_mode(&self)->Result<bool,SourceError> {
+         let inner=self.owner.upgrade().ok_or(SourceError::InvalidState)?;let s=inner.state.lock().unwrap();
+         if s.epoch!=self.epoch{return Err(SourceError::InvalidState);}
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index 2fd4c04e2..fcf03833f 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -159,6 +159,7 @@ pub trait Player: Send + MediaInstance {
+         Err(PlayerError::BufferPushFailed)
+     }
+ 
++    fn append_change_type(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_sequence(&self, _id:u32, _sequence:bool)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_timestamp_offset(&self,_id:u32,_offset:f64)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_timestamp_offset(&self,_id:u32)->Option<f64>{None}
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+index 94336be1b..db6831e25 100644
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -342,10 +342,18 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
+         }
+         Ok(())
+     }
+-    fn ChangeType(&self, _: DOMString) -> Fallible<()> {
+-        Err(Error::NotSupported(Some(
+-            "Decoder format replacement is not implemented".to_owned(),
+-        )))
++    fn ChangeType(&self, mime: DOMString) -> Fallible<()> {
++        if mime.is_empty() {
++            return Err(Error::Type(c"Empty SourceBuffer type".to_owned()));
++        }
++        if self.updating.get() {
++            return Err(Error::InvalidState(None));
++        }
++        self.buffer
++            .validate_change_type(&mime)
++            .map_err(source_error)?;
++        self.source.reopen_if_ended()?;
++        self.buffer.change_type(&mime).map_err(source_error)
+     }
+     fn Remove(&self, start: Finite<f64>, end: f64) -> Fallible<()> {
+         self.buffer.options().map_err(source_error)?;
