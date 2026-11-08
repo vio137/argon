@@ -1,0 +1,148 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -993,3 +993,48 @@
+   }
+  }
+ }
++
++#[test]
++fn duplicate_init_singletons_fail_without_replacing_valid_configuration() {
++ use servo_media_android_hosttest::mse_demux::Error;
++ fn duplicate(data:&[u8],path:&[[u8;4]])->Vec<u8> {
++  let mut result=vec![];let mut offset=0;
++  while offset<data.len() {
++   let len=u32::from_be_bytes(data[offset..offset+4].try_into().unwrap())as usize;
++   let b=&data[offset..offset+len];
++   if b[4..8]==path[0] {
++    if path.len()==1 {result.extend_from_slice(b);result.extend_from_slice(b);}
++    else {let payload=duplicate(&b[8..],&path[1..]);let size=(payload.len()+8)as u32;result.extend_from_slice(&size.to_be_bytes());result.extend_from_slice(&b[4..8]);result.extend(payload);}
++   }else{result.extend_from_slice(b);}
++   offset+=len;
++  }
++  result
++ }
++ let paths:Vec<Vec<[u8;4]>>=vec![
++  vec![*b"moov",*b"mvhd"],vec![*b"moov",*b"mvex"],
++  vec![*b"moov",*b"trak",*b"tkhd"],vec![*b"moov",*b"trak",*b"mdia"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"mdhd"],vec![*b"moov",*b"trak",*b"mdia",*b"hdlr"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"minf"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"minf",*b"dinf"],vec![*b"moov",*b"trak",*b"mdia",*b"minf",*b"stbl"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"minf",*b"stbl",*b"stsd"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"minf",*b"stbl",*b"stts"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"minf",*b"stbl",*b"stsc"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"minf",*b"stbl",*b"stsz"],
++  vec![*b"moov",*b"trak",*b"mdia",*b"minf",*b"stbl",*b"stco"],
++ ];
++ for fixture in [include_bytes!("fixtures/synthetic-fmp4.mp4").as_slice(),include_bytes!("fixtures/synthetic-aac.mp4").as_slice()] {
++  let mut framer=BoxFramer::new(1<<20);framer.append(fixture).unwrap();let mut bs=vec![];
++  while let Some(b)=framer.pop_box().unwrap(){bs.push(b);}
++  let mut init=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap().clone();init.extend_from_slice(bs.iter().find(|b|&b[4..8]==b"moov").unwrap());
++  for path in &paths {
++   let bad=duplicate(&init,path);assert!(bad.len()>init.len(),"fixture path {path:?}");
++   let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert_eq!(d.init(&bad),Err(Error::InvalidBox),"path={path:?}");
++   let mut baseline=Demux::new(1<<20,64);baseline.init(&init).unwrap();
++   for pair in bs.windows(2) {if &pair[0][4..8]==b"moof"&&&pair[1][4..8]==b"mdat" {
++    let mut segment=pair[0].clone();segment.extend_from_slice(&pair[1]);
++    let got=d.media(&segment).unwrap();let expected=baseline.media(&segment).unwrap();
++    assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.track_id,a.pts_us,a.duration_us),(b.track_id,b.pts_us,b.duration_us));}
++   }}
++  }
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -145,7 +145,7 @@
+     }
+     let mut budget = 4096usize;
+     let mut tracks = 0usize;
+-    validate_init_children(&data[m.2.clone()], 0, &mut budget, &mut tracks)?;
++    validate_init_children(&data[m.2.clone()], *b"moov", 0, &mut budget, &mut tracks)?;
+     if tracks == 0 || tracks > 16 {
+         return Err(Error::Quota);
+     }
+@@ -159,6 +159,7 @@
+ }
+ fn validate_init_children(
+     data: &[u8],
++    parent: [u8;4],
+     depth: usize,
+     budget: &mut usize,
+     tracks: &mut usize,
+@@ -167,6 +168,24 @@
+         return Err(Error::Quota);
+     }
+     let children=top_boxes(data)?;
++    // Known singleton headers must not become ignored duplicates in the
++    // dependency. The parent determines which headers are singleton; trak
++    // and trex remain repeatable and are validated by their track identity.
++    let singleton:&[[u8;4]]=match &parent {
++        b"moov"=>&[*b"mvhd",*b"mvex"],
++        b"trak"=>&[*b"tkhd",*b"mdia"],
++        b"mdia"=>&[*b"mdhd",*b"hdlr",*b"minf"],
++        b"minf"=>&[*b"vmhd",*b"smhd",*b"dinf",*b"stbl"],
++        b"dinf"=>&[*b"dref"],
++        b"stbl"=>&[*b"stsd",*b"stts",*b"ctts",*b"stsc",*b"stsz",*b"stco",*b"co64",*b"stss"],
++        b"mvex"=>&[*b"mehd"],
++        _=>&[],
++    };
++    if singleton.iter().any(|kind|children.iter().filter(|x|&x.0==kind).count()>1) {
++        return Err(Error::InvalidBox);
++    }
++    if parent==*b"stbl" && children.iter().any(|x|x.0==*b"stco")
++        && children.iter().any(|x|x.0==*b"co64") {return Err(Error::InvalidBox);}
+     if children.iter().filter(|x|x.0==*b"edts").count()>1 {return Err(Error::UnsupportedLayout);}
+     for (kind, _, payload) in children {
+         if kind==*b"edts" {
+@@ -202,8 +221,8 @@
+         if [*b"pssh", *b"senc"].contains(&kind) {
+             return Err(Error::UnsupportedLayout);
+         }
+-        if [*b"trak", *b"mdia", *b"minf", *b"stbl", *b"mvex"].contains(&kind) {
+-            validate_init_children(&data[payload], depth + 1, budget, tracks)?;
++        if [*b"trak", *b"mdia", *b"minf", *b"dinf", *b"stbl", *b"mvex"].contains(&kind) {
++            validate_init_children(&data[payload], kind, depth + 1, budget, tracks)?;
+         }
+     }
+     Ok(())
+@@ -698,3 +717,39 @@
+   assert_eq!(duration_micros(0,1,u32::MAX),Err(Error::Timestamp));
+  }
+ }
++
++#[cfg(test)]
++mod init_singleton_tests {
++ use super::*;
++ fn boxed(kind:[u8;4],payload:&[u8])->Vec<u8> {
++  let mut out=((payload.len()+8)as u32).to_be_bytes().to_vec();out.extend(kind);out.extend(payload);out
++ }
++ fn check(parent:[u8;4],data:&[u8])->Result<(),Error> {
++  validate_init_children(data,parent,0,&mut 4096,&mut 0)
++ }
++ #[test]
++ fn every_known_singleton_rejects_duplicates_but_repeated_tracks_defaults_and_free_are_allowed() {
++  for (parent,kinds) in [
++   (*b"moov",&[*b"mvhd",*b"mvex"][..]),
++   (*b"trak",&[*b"tkhd",*b"mdia"][..]),
++   (*b"mdia",&[*b"mdhd",*b"hdlr",*b"minf"][..]),
++   (*b"minf",&[*b"vmhd",*b"smhd",*b"dinf",*b"stbl"][..]),
++   (*b"dinf",&[*b"dref"][..]),
++   (*b"stbl",&[*b"stsd",*b"stts",*b"ctts",*b"stsc",*b"stsz",*b"stco",*b"co64",*b"stss"][..]),
++   (*b"mvex",&[*b"mehd"][..]),
++  ] {
++   for &kind in kinds {let mut body=boxed(kind,&[]);body.extend(body.clone());assert_eq!(check(parent,&body),Err(Error::InvalidBox),"parent={parent:?} kind={kind:?}");}
++  }
++  for (parent,kind) in [(*b"moov",*b"trak"),(*b"mvex",*b"trex"),(*b"moov",*b"free")] {
++   let mut body=boxed(kind,&[]);body.extend(body.clone());assert_eq!(check(parent,&body),Ok(()));
++  }
++ }
++ #[test]
++ fn alternate_chunk_offset_tables_must_not_coexist() {
++  for order in [[*b"stco",*b"co64"],[*b"co64",*b"stco"]] {
++   let mut body=boxed(order[0],&[0;8]);body.extend(boxed(order[1],&[0;8]));
++   assert_eq!(check(*b"stbl",&body),Err(Error::InvalidBox));
++   assert_eq!(check(*b"stbl",&boxed(order[0],&[0;8])),Ok(()));
++  }
++ }
++}
