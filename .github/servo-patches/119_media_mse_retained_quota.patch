@@ -1,0 +1,58 @@
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -177,7 +177,9 @@
+             }
+             bytes = bytes.checked_add(f.data.len()).ok_or(StoreError::Quota)?;
+         }
+-        if self.bytes.checked_add(bytes).ok_or(StoreError::Quota)? > self.limit {
++        // Bound the incoming batch independently. Removed overlap and filtered
++        // samples must not count twice against retained coded-frame storage.
++        if bytes > self.limit {
+             return Err(StoreError::Quota);
+         }
+         let mut accepted = vec![];
+@@ -278,7 +280,8 @@
+                     self.bytes -= old.data.len();
+                 }
+             }
+-            self.bytes += frame.data.len();
++            self.bytes=self.bytes.checked_add(frame.data.len()).ok_or(StoreError::Quota)?;
++            if self.bytes>self.limit {return Err(StoreError::Quota);}
+             // Frames pin immutable shared epochs, so replay never substitutes
+             // the latest init for samples that were encoded with an older init.
+             let config = self.configs.get(&track).cloned();
+@@ -742,6 +745,33 @@
+         assert_eq!(s.ranges(1), vec![20..40]);
+     }
+     #[test]
++    fn quota_counts_retained_replacement_bytes_not_removed_history() {
++        let mut s=FrameStore::new(4);
++        s.append(vec![f(0,true)],0,0..100).unwrap();
++        let generation=s.replacement_generation();
++        let mut next=f(0,true);next.data=vec![9;4];
++        s.append(vec![next],0,0..100).unwrap();
++        assert_eq!(s.bytes(),4);assert_eq!(s.frames(1)[0].data,vec![9;4]);
++        assert!(s.replacement_generation()>generation);
++        // A filtered input consumes no retained space or invalidation epoch.
++        let generation=s.replacement_generation();
++        assert!(s.append_collect(vec![f(100,true)],0,0..100).unwrap().is_empty());
++        assert_eq!(s.bytes(),4);assert_eq!(s.replacement_generation(),generation);
++    }
++    #[test]
++    fn replacement_quota_failure_rolls_back_data_and_invalidation_generation() {
++        let mut s=FrameStore::new(8);
++        s.append(vec![f(0,true),f(20,true)],0,0..100).unwrap();
++        let generation=s.replacement_generation();
++        let mut replacement=f(0,true);replacement.data=vec![9;5];
++        assert_eq!(s.append(vec![replacement],0,0..100),Err(StoreError::Quota));
++        assert_eq!(s.bytes(),8);assert_eq!(s.frames(1)[0].data,vec![1;4]);
++        assert_eq!(s.replacement_generation(),generation);
++        assert_eq!(s.ranges(1),[0..10,20..30]);
++        assert_eq!(s.append(vec![f(0,true),f(10,true),f(20,true)],0,0..100),Err(StoreError::Quota));
++        assert_eq!(s.bytes(),8);
++    }
++    #[test]
+     fn quota_failure_is_atomic() {
+         let mut s = FrameStore::new(4);
+         s.append(vec![f(0, true)], 0, 0..100).unwrap();
