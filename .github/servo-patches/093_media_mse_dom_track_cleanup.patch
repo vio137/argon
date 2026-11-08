@@ -1,0 +1,306 @@
+diff --git a/components/script/dom/audio/audiotracklist.rs b/components/script/dom/audio/audiotracklist.rs
+--- a/components/script/dom/audio/audiotracklist.rs
++++ b/components/script/dom/audio/audiotracklist.rs
+@@ -121,6 +121,37 @@
+         track.add_track_list(self);
+     }
+ 
++    /// Remove this exact shared track without clearing another SourceBuffer's
++    /// tracks. Owning lists also release the track's selection callback route.
++    pub(crate) fn remove(&self, track: &AudioTrack) {
++        let Some(index) = self.find(track) else {
++            return;
++        };
++        let changed = track.enabled();
++        self.tracks.borrow_mut().remove(index);
++        if self.owns_tracks {
++            track.remove_track_list();
++        }
++        let track = Trusted::new(track);
++        let this = Trusted::new(self);
++        self.global().task_manager().media_element_task_source().queue(task!(append_track_removed: move |cx| {
++            let this = this.root();
++            let event = crate::dom::trackevent::TrackEvent::new(
++                cx, this.global().as_window(), atom!("removetrack"), false, false,
++                &Some(script_bindings::codegen::GenericUnionTypes::VideoTrackOrAudioTrackOrTextTrack::AudioTrack(track.root())),
++            );
++            event.upcast::<crate::dom::event::Event>().fire(cx, this.upcast::<EventTarget>());
++        }));
++        if changed {
++            let this = Trusted::new(self);
++            self.global()
++                .task_manager()
++                .media_element_task_source()
++                .queue(task!(append_track_removed_change: move |cx| {
++                    this.root().upcast::<EventTarget>().fire_event(cx, atom!("change"));
++                }));
++        }
++    }
+     pub(crate) fn clear(&self) {
+         if self.owns_tracks {
+             self.tracks
+diff --git a/components/script/dom/audio/audiotrack.rs b/components/script/dom/audio/audiotrack.rs
+--- a/components/script/dom/audio/audiotrack.rs
++++ b/components/script/dom/audio/audiotrack.rs
+@@ -23,6 +23,7 @@
+     label: TracedDOMString,
+     language: TracedDOMString,
+     enabled: Cell<bool>,
++    source_buffer: MutNullableDom<crate::dom::sourcebuffer::SourceBuffer>,
+     track_list: MutNullableDom<AudioTrackList>,
+ }
+ 
+@@ -41,6 +42,7 @@
+             label: label.traced(),
+             language: language.traced(),
+             enabled: Cell::new(false),
++            source_buffer: MutNullableDom::new(None),
+             track_list: MutNullableDom::new(track_list),
+         }
+     }
+@@ -83,12 +85,21 @@
+         self.track_list.set(Some(track_list));
+     }
+ 
++    pub(crate) fn set_source_buffer(
++        &self,
++        source: Option<&crate::dom::sourcebuffer::SourceBuffer>,
++    ) {
++        self.source_buffer.set(source);
++    }
+     pub(crate) fn remove_track_list(&self) {
+         self.track_list.set(None);
+     }
+ }
+ 
+ impl AudioTrackMethods<crate::DomTypeHolder> for AudioTrack {
++    fn GetSourceBuffer(&self) -> Option<DomRoot<crate::dom::sourcebuffer::SourceBuffer>> {
++        self.source_buffer.get()
++    }
+     /// <https://html.spec.whatwg.org/multipage/#dom-audiotrack-id>
+     fn Id(&self) -> DOMString {
+         self.id()
+@@ -116,8 +127,8 @@
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dom-audiotrack-enabled>
+     fn SetEnabled(&self, value: bool) {
+-        if let Some(list) = self.track_list.get() &&
+-            let Some(idx) = list.find(self)
++        if let Some(list) = self.track_list.get()
++            && let Some(idx) = list.find(self)
+         {
+             list.set_enabled(idx, value);
+         }
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -2467,6 +2467,8 @@
+         }
+     }
+ 
++    pub(crate) fn existing_audio_tracks(&self) -> Option<DomRoot<AudioTrackList>> { self.audio_tracks_list.get() }
++    pub(crate) fn existing_video_tracks(&self) -> Option<DomRoot<VideoTrackList>> { self.video_tracks_list.get() }
+     pub(crate) fn set_audio_track(&self, idx: usize, enabled: bool) {
+         if let Some(ref player) = *self.player.borrow() &&
+             let Err(error) = player.lock().unwrap().set_audio_track(idx as i32, enabled)
+diff --git a/components/script/dom/media/videotracklist.rs b/components/script/dom/media/videotracklist.rs
+--- a/components/script/dom/media/videotracklist.rs
++++ b/components/script/dom/media/videotracklist.rs
+@@ -129,6 +129,37 @@
+         track.add_track_list(self);
+     }
+ 
++    /// Remove this exact shared track without clearing another SourceBuffer's
++    /// tracks. Owning lists also release the track's selection callback route.
++    pub(crate) fn remove(&self, track: &VideoTrack) {
++        let Some(index) = self.find(track) else {
++            return;
++        };
++        let changed = track.selected();
++        self.tracks.borrow_mut().remove(index);
++        if self.owns_tracks {
++            track.remove_track_list();
++        }
++        let track = Trusted::new(track);
++        let this = Trusted::new(self);
++        self.global().task_manager().media_element_task_source().queue(task!(append_track_removed: move |cx| {
++            let this = this.root();
++            let event = crate::dom::trackevent::TrackEvent::new(
++                cx, this.global().as_window(), atom!("removetrack"), false, false,
++                &Some(script_bindings::codegen::GenericUnionTypes::VideoTrackOrAudioTrackOrTextTrack::VideoTrack(track.root())),
++            );
++            event.upcast::<crate::dom::event::Event>().fire(cx, this.upcast::<EventTarget>());
++        }));
++        if changed {
++            let this = Trusted::new(self);
++            self.global()
++                .task_manager()
++                .media_element_task_source()
++                .queue(task!(append_track_removed_change: move |cx| {
++                    this.root().upcast::<EventTarget>().fire_event(cx, atom!("change"));
++                }));
++        }
++    }
+     pub(crate) fn clear(&self) {
+         if self.owns_tracks {
+             self.tracks
+diff --git a/components/script/dom/media/videotrack.rs b/components/script/dom/media/videotrack.rs
+--- a/components/script/dom/media/videotrack.rs
++++ b/components/script/dom/media/videotrack.rs
+@@ -23,6 +23,7 @@
+     label: TracedDOMString,
+     language: TracedDOMString,
+     selected: Cell<bool>,
++    source_buffer: MutNullableDom<crate::dom::sourcebuffer::SourceBuffer>,
+     track_list: MutNullableDom<VideoTrackList>,
+ }
+ 
+@@ -41,6 +42,7 @@
+             label: label.traced(),
+             language: language.traced(),
+             selected: Cell::new(false),
++            source_buffer: MutNullableDom::new(None),
+             track_list: MutNullableDom::new(track_list),
+         }
+     }
+@@ -83,12 +85,21 @@
+         self.track_list.set(Some(track_list));
+     }
+ 
++    pub(crate) fn set_source_buffer(
++        &self,
++        source: Option<&crate::dom::sourcebuffer::SourceBuffer>,
++    ) {
++        self.source_buffer.set(source);
++    }
+     pub(crate) fn remove_track_list(&self) {
+         self.track_list.set(None);
+     }
+ }
+ 
+ impl VideoTrackMethods<crate::DomTypeHolder> for VideoTrack {
++    fn GetSourceBuffer(&self) -> Option<DomRoot<crate::dom::sourcebuffer::SourceBuffer>> {
++        self.source_buffer.get()
++    }
+     /// <https://html.spec.whatwg.org/multipage/#dom-videotrack-id>
+     fn Id(&self) -> DOMString {
+         self.id()
+@@ -116,8 +127,8 @@
+ 
+     /// <https://html.spec.whatwg.org/multipage/#dom-videotrack-selected>
+     fn SetSelected(&self, value: bool) {
+-        if let Some(list) = self.track_list.get() &&
+-            let Some(idx) = list.find(self)
++        if let Some(list) = self.track_list.get()
++            && let Some(idx) = list.find(self)
+         {
+             list.set_selected(idx, value);
+         }
+diff --git a/components/script/dom/mse/sourcebuffer.rs b/components/script/dom/mse/sourcebuffer.rs
+--- a/components/script/dom/mse/sourcebuffer.rs
++++ b/components/script/dom/mse/sourcebuffer.rs
+@@ -127,6 +127,7 @@
+             return false;
+         }
+         if let Some(track) = audio {
++            track.set_source_buffer(Some(self));
+             let list = self.AudioTracks(cx);
+             list.add_shared(&track);
+             let event = TrackEvent::new(
+@@ -142,6 +143,7 @@
+             self.global().task_manager().media_element_task_source().queue(task!(append_audio_track_added:move|cx| {event.root().upcast::<Event>().fire(cx,list.root().upcast::<EventTarget>());}));
+         }
+         if let Some(track) = video {
++            track.set_source_buffer(Some(self));
+             let list = self.VideoTracks(cx);
+             list.add_shared(&track);
+             let event = TrackEvent::new(
+@@ -159,7 +161,66 @@
+         self.tracks_synced.set(true);
+         true
+     }
++    /// Called only after the backend has accepted removal of this buffer.
++    /// Queued append notifications are separately rejected by controller identity.
++    pub(crate) fn removed(&self) {
++        if self.updating.replace(false) {
++            let this = Trusted::new(self);
++            self.global()
++                .task_manager()
++                .media_element_task_source()
++                .queue(task!(removed_source_buffer_abort: move |cx| {
++                    this.root().upcast::<EventTarget>().fire_event(cx, atom!("abort"));
++                }));
++            let this = Trusted::new(self);
++            self.global()
++                .task_manager()
++                .media_element_task_source()
++                .queue(task!(removed_source_buffer_updateend: move |cx| {
++                    this.root().upcast::<EventTarget>().fire_event(cx, atom!("updateend"));
++                }));
++        }
++        self.removing.set(false);
++        if let Some(list) = self.audio_tracks.get() {
++            let tracks: Vec<_> = (0..list.len()).filter_map(|i| list.item(i)).collect();
++            for track in tracks {
++                track.set_source_buffer(None);
++                list.remove(&track);
++                if let Some(owner) = self.media.existing_audio_tracks() {
++                    owner.remove(&track);
++                }
++            }
++        }
++        if let Some(list) = self.video_tracks.get() {
++            let tracks: Vec<_> = (0..list.len()).filter_map(|i| list.item(i)).collect();
++            for track in tracks {
++                track.set_source_buffer(None);
++                list.remove(&track);
++                if let Some(owner) = self.media.existing_video_tracks() {
++                    owner.remove(&track);
++                }
++            }
++        }
++        self.tracks_synced.set(false);
++    }
+     pub(crate) fn detached(&self) {
++        if let Some(list) = self.audio_tracks.get() {
++            for index in 0..list.len() {
++                if let Some(track) = list.item(index) {
++                    track.set_source_buffer(None);
++                }
++            }
++            list.clear();
++        }
++        if let Some(list) = self.video_tracks.get() {
++            for index in 0..list.len() {
++                if let Some(track) = list.item(index) {
++                    track.set_source_buffer(None);
++                }
++            }
++            list.clear();
++        }
++        self.tracks_synced.set(false);
+         self.updating.set(false);
+         self.removing.set(false);
+     }
+diff --git a/components/script_bindings/webidls/VideoTrack.webidl b/components/script_bindings/webidls/VideoTrack.webidl
+--- a/components/script_bindings/webidls/VideoTrack.webidl
++++ b/components/script_bindings/webidls/VideoTrack.webidl
+@@ -6,6 +6,7 @@
+ 
+ [Exposed=Window]
+ interface VideoTrack {
++  [Pref="dom_media_source_extensions_enabled"] readonly attribute SourceBuffer? sourceBuffer;
+   readonly attribute DOMString id;
+   readonly attribute DOMString kind;
+   readonly attribute DOMString label;
+diff --git a/components/script_bindings/webidls/AudioTrack.webidl b/components/script_bindings/webidls/AudioTrack.webidl
+--- a/components/script_bindings/webidls/AudioTrack.webidl
++++ b/components/script_bindings/webidls/AudioTrack.webidl
+@@ -6,6 +6,7 @@
+ 
+ [Exposed=Window]
+ interface AudioTrack {
++  [Pref="dom_media_source_extensions_enabled"] readonly attribute SourceBuffer? sourceBuffer;
+   readonly attribute DOMString id;
+   readonly attribute DOMString kind;
+   readonly attribute DOMString label;
