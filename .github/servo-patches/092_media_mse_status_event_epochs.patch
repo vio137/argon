@@ -1,0 +1,191 @@
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -4532,7 +4532,16 @@
+             return;
+         }
+ 
++        let event=match event {
++            PlayerEvent::AppendEpoch{generation,event}=>{
++                let current=element.player.borrow().as_ref().map(|player|player.lock().unwrap().append_event_epoch());
++                if element.attached_append_source.get().is_none()||current!=Some(generation){return;}
++                *event
++            },
++            event=>event,
++        };
+         match event {
++            PlayerEvent::AppendEpoch{..}=>return,
+             PlayerEvent::DurationChanged(duration) => element.playback_duration_changed(duration),
+             PlayerEvent::AppendDurationChanged { generation, duration } => {
+                 if let Some(source) = element.attached_append_source.get() {
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -67,6 +67,7 @@
+ 
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+ pub enum PlayerEvent {
++    AppendEpoch {generation:u64,event:Box<PlayerEvent>},
+     EndOfStream,
+     /// The player has enough data. The client should stop pushing data into.
+     EnoughData,
+@@ -139,6 +140,7 @@
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_event_epoch(&self)->u64{0}
+     fn append_remove_buffer(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -275,6 +275,13 @@
+                     },
+                     Event::CommandApplied(_) => (),
+                     Event::Status(status) => {
++                        let generation = status.removal_generation;
++                        let send = |event| {
++                            send(PlayerEvent::AppendEpoch {
++                                generation,
++                                event: Box::new(event),
++                            })
++                        };
+                         let duration_changed = {
+                             let mut s = shared.lock().unwrap();
+                             if status.removal_generation < s.removal_generation {
+@@ -554,6 +561,9 @@
+     fn seek(&self, _: f64) -> Result<(), PlayerError> {
+         Err(PlayerError::NonSeekableStream)
+     }
++    fn append_event_epoch(&self) -> u64 {
++        self.state.lock().unwrap().removal_generation
++    }
+     fn append_remove_buffer(&self, id: u32) -> Result<(), PlayerError> {
+         let mut s = self.state.lock().unwrap();
+         if s.stopped || !s.buffers.contains_key(&id) {
+@@ -947,7 +957,10 @@
+             1,
+             GenericCallback::new(move |message| {
+                 if let Ok(event) = message {
+-                    let _ = tx.send(event);
++                    let _ = tx.send(match event {
++                        crate::PlayerEvent::AppendEpoch { event, .. } => *event,
++                        other => other,
++                    });
+                 }
+             })
+             .unwrap(),
+@@ -1213,7 +1226,10 @@
+             77,
+             GenericCallback::new(move |m| {
+                 if let Ok(e) = m {
+-                    let _ = tx.send(e);
++                    let _ = tx.send(match e {
++                        crate::PlayerEvent::AppendEpoch { event, .. } => *event,
++                        other => other,
++                    });
+                 }
+             })
+             .unwrap(),
+@@ -1262,7 +1278,10 @@
+             78,
+             GenericCallback::new(move |m| {
+                 if let Ok(e) = m {
+-                    let _ = tx.send(e);
++                    let _ = tx.send(match e {
++                        crate::PlayerEvent::AppendEpoch { event, .. } => *event,
++                        other => other,
++                    });
+                 }
+             })
+             .unwrap(),
+@@ -1303,7 +1322,10 @@
+             79,
+             GenericCallback::new(move |m| {
+                 if let Ok(e) = m {
+-                    let _ = tx.send(e);
++                    let _ = tx.send(match e {
++                        crate::PlayerEvent::AppendEpoch { event, .. } => *event,
++                        other => other,
++                    });
+                 }
+             })
+             .unwrap(),
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -19,7 +19,7 @@
+             1,
+             GenericCallback::new(move |message| {
+                 if let Ok(event) = message {
+-                    let _ = tx.send(event);
++                    let _ = tx.send(match event {crate::PlayerEvent::AppendEpoch{event,..}=>*event,other=>other});
+                 }
+             })
+             .unwrap(),
+@@ -111,7 +111,7 @@
+             3,
+             GenericCallback::new(move |message| {
+                 if let Ok(event) = message {
+-                    let _ = tx.send(event);
++                    let _ = tx.send(match event {crate::PlayerEvent::AppendEpoch{event,..}=>*event,other=>other});
+                 }
+             })
+             .unwrap(),
+@@ -160,7 +160,7 @@
+     }
+     #[test] fn initialization_only_updates_all_track_metadata_without_claiming_decoded_current_data() {
+         let (tx, events) = mpsc::channel();
+-        let player = AndroidAppendPlayer::new(8, GenericCallback::new(move |m| { if let Ok(m)=m { let _=tx.send(m); } }).unwrap(), None, Box::new(||{})).unwrap();
++        let player = AndroidAppendPlayer::new(8, GenericCallback::new(move |m| { if let Ok(m)=m { let _=tx.send(match m {crate::PlayerEvent::AppendEpoch{event,..}=>*event,other=>other}); } }).unwrap(), None, Box::new(||{})).unwrap();
+         let (tx, updates) = mpsc::channel();
+         for id in [1,2] { let tx=tx.clone(); player.lock().unwrap().append_add_buffer(id,Box::new(move|e|{let _=tx.send((id,e));})).unwrap(); }
+         for _ in 0..2 { assert_eq!(updates.recv_timeout(Duration::from_secs(2)).unwrap().1, AppendEvent::Ready); }
+@@ -521,7 +521,7 @@
+             91,
+             GenericCallback::new(move |e| {
+                 if let Ok(e) = e {
+-                    let _ = tx.send(e);
++                    let _ = tx.send(match e {crate::PlayerEvent::AppendEpoch{event,..}=>*event,other=>other});
+                 }
+             })
+             .unwrap(),
+@@ -604,3 +604,18 @@
+   next.append(include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();s.remove_buffer(&next).unwrap();assert!(s.buffers().is_empty());assert_eq!(next.append(vec![]),Err(SourceError::InvalidState));s.detach();
+  }
+ }
++
++#[cfg(test)] mod epoch_event_tests {
++ use crate::{generic_channel::GenericCallback,mse_player::AndroidAppendPlayer,Player,PlayerEvent,append::AppendEvent};
++ use std::{sync::mpsc,time::Duration};
++ #[test] fn queued_status_payload_retains_old_epoch_and_new_status_matches_removed_buffer_epoch() {
++  let(tx,events)=mpsc::channel();let player=AndroidAppendPlayer::new(98,GenericCallback::new(move|e|{if let Ok(e)=e{let _=tx.send(e);}}).unwrap(),None,Box::new(||{})).unwrap();
++  let(tx,updates)=mpsc::channel();player.lock().unwrap().append_add_buffer(1,Box::new(move|e|{let _=tx.send(e);})).unwrap();assert_eq!(updates.recv_timeout(Duration::from_secs(2)).unwrap(),AppendEvent::Ready);
++  player.lock().unwrap().append_to_buffer(1,include_bytes!("../tests/fixtures/synthetic-fmp4.mp4").to_vec()).unwrap();
++  let old=loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){e@PlayerEvent::AppendEpoch{generation:0,..}=>break e,PlayerEvent::Error(e)=>panic!("{e}"),_=>()}};
++  loop{if updates.recv_timeout(Duration::from_secs(2)).unwrap()==AppendEvent::UpdateEnd{break;}}
++  player.lock().unwrap().append_remove_buffer(1).unwrap();assert_eq!(player.lock().unwrap().append_event_epoch(),1);
++  match old{PlayerEvent::AppendEpoch{generation,event}=>{assert_eq!(generation,0);assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}));assert_ne!(generation,player.lock().unwrap().append_event_epoch());},_=>panic!("unversioned status")}
++  loop{match events.recv_timeout(Duration::from_secs(2)).unwrap(){PlayerEvent::AppendEpoch{generation:1,event}=>{assert!(!matches!(*event,PlayerEvent::AppendEpoch{..}));break;},PlayerEvent::Error(e)=>panic!("{e}"),_=>()}}
++ }
++}
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -30,6 +30,7 @@
+ }
+ #[derive(Clone,Debug)]
+ pub enum PlayerEvent {
++    AppendEpoch {generation:u64,event:Box<PlayerEvent>},
+     EndOfStream,
+     /// The player has enough data. The client should stop pushing data into.
+     EnoughData,
+@@ -101,6 +102,7 @@
+     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+     /// Private append seeks carry script operation identity across worker callbacks.
++    fn append_event_epoch(&self)->u64{0}
+     fn append_remove_buffer(&self,_id:u32)->Result<(),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_set_duration(&self,_duration:f64)->Result<(f64,u64),PlayerError>{Err(PlayerError::BufferPushFailed)}
+     fn append_seek(&self, _operation: u64, _time: f64) -> Result<(), PlayerError> {
