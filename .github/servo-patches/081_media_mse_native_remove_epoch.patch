@@ -1,0 +1,489 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index c7898bba2..3fb5a16ff 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -387,6 +387,7 @@ pub struct AppendPlayback {
+     video_done: bool,
+     audio_done: bool,
+     seek_target: Option<i64>,
++    removed_target: Option<i64>,
+     video_seek_floor: Option<i64>,
+     seek_ready: bool,
+     seek_started: Option<Instant>,
+@@ -424,6 +425,7 @@ impl AppendPlayback {
+             video_done: false,
+             audio_done: false,
+             seek_target: None,
++            removed_target: None,
+             video_seek_floor: None,
+             seek_ready: false,
+             seek_started: None,
+@@ -530,7 +532,14 @@ impl AppendPlayback {
+             session.evict_before(cutoff);
+         }
+         let r = session.append(bytes).map_err(|_| ());
+-        self.checked(r)
++        self.checked(r)?;
++        if let Some(target) = self.removed_target {
++            if self.buffered().iter().any(|r| r.contains(&target)) {
++                self.reset_seek_epoch(target)?;
++                self.removed_target = None;
++            }
++        }
++        Ok(())
+     }
+     /// Serialized worker-side parser reset. Decoder/output queues retain
+     /// accepted samples; public abort still needs its own event handshake.
+@@ -561,6 +570,106 @@ impl AppendPlayback {
+             .values()
+             .filter_map(|s| s.video_frame_at(target_us))
+             .max();
++        self.removed_target = None;
++        self.reset_output_epoch(target_us, video_floor);
++        for (id, plan) in plans {
++            self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
++        }
++        Ok(())
++    }
++    /// Restricted internal removal primitive. The current replay target must
++    /// survive in every session. Current-position deletion/stalling still
++    /// needs another plan and is not made public by this method.
++    pub fn remove_retaining_target(
++        &mut self,
++        buffer: u32,
++        start: i64,
++        end: i64,
++        target: i64,
++    ) -> Result<(), ()> {
++        if self.failed || self.seek_target.is_some() {
++            return Err(());
++        }
++        let removal = self
++            .sessions
++            .get(&buffer)
++            .ok_or(())?
++            .stage_remove_retaining_target(start, end, target)
++            .map_err(|_| ())?;
++        let other = self
++            .sessions
++            .iter()
++            .filter(|(id, _)| **id != buffer)
++            .map(|(id, s)| Ok((*id, s.stage_seek(target).map_err(|_| ())?)))
++            .collect::<Result<Vec<_>, ()>>()?;
++        let floor = self
++            .sessions
++            .iter()
++            .filter(|(id, _)| **id != buffer)
++            .filter_map(|(_, s)| s.video_frame_at(target))
++            .chain(removal.video_floor())
++            .max();
++        // Every source-buffer snapshot is valid before old decoder/PCM/image
++        // output is discarded. Commit cannot reintroduce removed packets.
++        self.removed_target = None;
++        self.reset_output_epoch(target, floor);
++        self.sessions
++            .get_mut(&buffer)
++            .ok_or(())?
++            .commit_remove(removal);
++        for (id, plan) in other {
++            self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
++        }
++        Ok(())
++    }
++    /// Current-position deletion stalls instead of seeking to a different
++    /// retained time. Every queued decoder input and output epoch is reset.
++    pub fn remove_and_stall_if_needed(
++        &mut self,
++        buffer: u32,
++        start: i64,
++        end: i64,
++        target: i64,
++    ) -> Result<(), ()> {
++        if self.failed || self.seek_target.is_some() || target < 0 {
++            return Err(());
++        }
++        let removal = self
++            .sessions
++            .get(&buffer)
++            .ok_or(())?
++            .stage_remove(start, end, None)
++            .map_err(|_| ())?;
++        let covered = removal.covers(target)
++            && self
++                .sessions
++                .iter()
++                .filter(|(id, _)| **id != buffer)
++                .all(|(_, s)| s.buffered().iter().any(|r| r.contains(&target)));
++        if covered {
++            return self.remove_retaining_target(buffer, start, end, target);
++        }
++        let other = self
++            .sessions
++            .iter()
++            .filter(|(id, _)| **id != buffer)
++            .map(|(id, s)| Ok((*id, s.empty_delivery_plan().map_err(|_| ())?)))
++            .collect::<Result<Vec<_>, ()>>()?;
++        self.reset_output_epoch(target, None);
++        self.seek_target = None;
++        self.seek_started = None;
++        self.seek_ready = false;
++        self.removed_target = Some(target);
++        self.sessions
++            .get_mut(&buffer)
++            .ok_or(())?
++            .commit_remove(removal);
++        for (id, plan) in other {
++            self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
++        }
++        Ok(())
++    }
++    fn reset_output_epoch(&mut self, target_us: i64, video_floor: Option<i64>) {
+         self.audio.close();
+         self.audio.pending = None;
+         self.decoders.reset_epoch();
+@@ -580,10 +689,6 @@ impl AppendPlayback {
+         self.seek_ready = false;
+         self.seek_started = Some(Instant::now());
+         focus::set_counted(&mut self.focus_counted, false);
+-        for (id, plan) in plans {
+-            self.sessions.get_mut(&id).ok_or(())?.commit_seek(plan);
+-        }
+-        Ok(())
+     }
+     pub fn take_seek_ready(&mut self) -> bool {
+         std::mem::take(&mut self.seek_ready)
+@@ -644,7 +749,8 @@ impl AppendPlayback {
+         let playing = self.page_playing
+             && self.focus.hold == Hold::None
+             && buffered
+-            && self.seek_target.is_none();
++            && self.seek_target.is_none()
++            && self.removed_target.is_none();
+         if playing != self.playing {
+             self.audio.set_running(playing)?;
+             self.playing = playing;
+@@ -732,6 +838,9 @@ impl AppendPlayback {
+         Ok(())
+     }
+     fn pump_inner(&mut self) -> Result<bool, ()> {
++        if self.removed_target.is_some() {
++            return Ok(false);
++        }
+         // Fair packet-level pumping keeps a blocked video decoder from
+         // starving an independently appended audio SourceBuffer.
+         for _ in 0..4 {
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index bff063a8a..4813e6b5e 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -660,3 +660,173 @@ fn current_data_requires_both_initialized_audio_and_video_outputs() {
+     p.rendered_frames = 0;
+     assert!(!p.has_current_data());
+ }
++
++#[test]
++fn retained_target_removal_resets_native_epoch_before_committing_replay() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    loop {
++        let mut sink = ScopedDecoder {
++            buffer_id: 1,
++            decoders: &mut p.decoders,
++        };
++        if !p
++            .sessions
++            .get_mut(&1)
++            .unwrap()
++            .pump_input(&mut sink)
++            .unwrap()
++        {
++            break;
++        }
++    }
++    assert!(p.decoders.video.is_some());
++    p.rendered_frames = 9;
++    p.video_pending = Some(Instant::now());
++    p.video_done = true;
++    p.remove_retaining_target(1, 0, 250_000, 750_000).unwrap();
++    assert!(p.decoders.video.is_none());
++    assert!(p.decoders.surface.is_none());
++    assert!(p.video_pending.is_none());
++    assert!(!p.video_done);
++    assert_eq!(p.rendered_frames, 0);
++    assert_eq!(p.buffered(), [500_000..1_000_000]);
++    assert_eq!(p.video_seek_floor, Some(500_000));
++    assert_eq!(p.clock.now_us(), 750_000);
++    assert_eq!(p.seek_target, Some(750_000));
++    loop {
++        let mut sink = ScopedDecoder {
++            buffer_id: 1,
++            decoders: &mut p.decoders,
++        };
++        if !p
++            .sessions
++            .get_mut(&1)
++            .unwrap()
++            .pump_input(&mut sink)
++            .unwrap()
++        {
++            break;
++        }
++    }
++    assert!(p.decoders.video.is_some());
++    assert_eq!(p.decoders.first_pts, Some(500_000));
++}
++#[test]
++fn removal_missing_other_buffer_target_cannot_mutate_store_or_output_epoch() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.add_buffer(2).unwrap();
++    p.rendered_frames = 13;
++    p.video_pending = Some(Instant::now());
++    assert!(p.remove_retaining_target(1, 0, 250_000, 750_000).is_err());
++    assert_eq!(p.sessions.get(&1).unwrap().buffered(), [0..1_000_000]);
++    assert_eq!(p.rendered_frames, 13);
++    assert!(p.video_pending.is_some());
++    assert_eq!(p.seek_target, None);
++}
++#[test]
++fn removal_rejects_a_removed_target_or_pending_seek_without_mutation() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    assert!(p.remove_retaining_target(1, 0, 250_000, 100_000).is_err());
++    assert_eq!(p.buffered(), [0..1_000_000]);
++    p.reset_seek_epoch(750_000).unwrap();
++    assert!(p.remove_retaining_target(1, 0, 250_000, 750_000).is_err());
++    assert_eq!(p.buffered(), [0..1_000_000]);
++    assert_eq!(p.seek_target, Some(750_000));
++}
++
++#[test]
++fn current_position_removal_stalls_without_fake_seek_completion_or_timeout() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.rendered_frames = 8;
++    p.video_pending = Some(Instant::now());
++    p.remove_and_stall_if_needed(1, 0, 250_000, 100_000)
++        .unwrap();
++    assert_eq!(p.buffered(), [500_000..1_000_000]);
++    assert_eq!(p.removed_target, Some(100_000));
++    assert_eq!(p.seek_target, None);
++    assert_eq!(p.seek_started, None);
++    assert!(!p.take_seek_ready());
++    assert_eq!(p.rendered_frames, 0);
++    assert!(p.video_pending.is_none());
++    let status = p.pump().unwrap();
++    assert!(!status.finished);
++    assert!(!status.current_data);
++    assert!(!status.playing);
++    assert_eq!(status.position_us, 100_000);
++    assert!(p.decoders.video.is_none());
++    // No new coded data covers the target: an empty append cannot resume it.
++    p.append(1, &[]).unwrap();
++    assert_eq!(p.removed_target, Some(100_000));
++    // A later append covers the missing target and stages a fresh native epoch,
++    // still waiting for real decoded output rather than signalling ready here.
++    let mut framer = crate::mse_demux::BoxFramer::new(1 << 20);
++    framer
++        .append(include_bytes!(
++            "../hosttest/tests/fixtures/synthetic-fmp4.mp4"
++        ))
++        .unwrap();
++    let mut media = vec![];
++    while let Some(b) = framer.pop_box().unwrap() {
++        if &b[4..8] == b"moof" || &b[4..8] == b"mdat" {
++            media.extend(b);
++        }
++    }
++    p.append(1, &media).unwrap();
++    assert_eq!(p.removed_target, None);
++    assert_eq!(p.seek_target, Some(100_000));
++    assert!(!p.take_seek_ready());
++    assert_eq!(p.buffered(), [0..1_000_000]);
++}
++#[test]
++fn invalid_current_removal_cannot_discard_live_output_or_frames() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.rendered_frames = 7;
++    for (id, start, end, target) in [
++        (8, 0, 250_000, 100_000),
++        (1, -1, 250_000, 100_000),
++        (1, 0, 250_000, -1),
++    ] {
++        assert!(
++            p.remove_and_stall_if_needed(id, start, end, target)
++                .is_err()
++        );
++        assert_eq!(p.buffered(), [0..1_000_000]);
++        assert_eq!(p.rendered_frames, 7);
++        assert_eq!(p.removed_target, None);
++    }
++}
+diff --git a/components/media/backends/android/mse_demux/session.rs b/components/media/backends/android/mse_demux/session.rs
+index 5b898aa3f..d5856b3a0 100644
+--- a/components/media/backends/android/mse_demux/session.rs
++++ b/components/media/backends/android/mse_demux/session.rs
+@@ -15,6 +15,7 @@ pub enum SessionError {
+ /// Prepared retained-frame cursor, owned independently until native reset.
+ /// Construct every source-buffer plan before committing any of them.
+ pub struct SeekPlan {
++    rearm_configuration: bool,
+     bridge: DecoderBridge,
+     delivery: Delivery,
+ }
+@@ -22,9 +23,18 @@ pub struct SeekPlan {
+ /// native codecs/output before committing. A removed/unbuffered resume target
+ /// rejects the plan without altering the live store or its queued packets.
+ pub struct RemovePlan {
++    video_floor: Option<i64>,
+     store: super::timeline::FrameStore,
+     seek: SeekPlan,
+ }
++impl RemovePlan {
++    pub fn covers(&self, target: i64) -> bool {
++        self.store.buffered().iter().any(|r| r.contains(&target))
++    }
++    pub fn video_floor(&self) -> Option<i64> {
++        self.video_floor
++    }
++}
+ pub struct AppendSession {
+     stream: AppendStream,
+     store: super::timeline::FrameStore,
+@@ -159,13 +169,27 @@ impl AppendSession {
+                 .map_err(|_| SessionError::Configuration)?;
+             delivery.push(packet).map_err(|_| SessionError::Delivery)?;
+         }
+-        Ok(SeekPlan { bridge, delivery })
++        Ok(SeekPlan {
++            rearm_configuration: false,
++            bridge,
++            delivery,
++        })
+     }
+     pub fn stage_remove_retaining_target(
+         &self,
+         start: i64,
+         end: i64,
+         target: i64,
++    ) -> Result<RemovePlan, SessionError> {
++        self.stage_remove(start, end, Some(target))
++    }
++    /// None pauses all packet delivery until the coordinator can replay a
++    /// newly covered target. This does not implicitly satisfy seek readiness.
++    pub fn stage_remove(
++        &self,
++        start: i64,
++        end: i64,
++        target: Option<i64>,
+     ) -> Result<RemovePlan, SessionError> {
+         if self.failed {
+             return Err(SessionError::Failed);
+@@ -174,9 +198,12 @@ impl AppendSession {
+             .store
+             .stage_remove(start, end)
+             .map_err(|_| SessionError::Append)?;
+-        let units = store
+-            .replay_from(target)
+-            .map_err(|_| SessionError::Append)?;
++        let units = match target {
++            Some(target) => store
++                .replay_from(target)
++                .map_err(|_| SessionError::Append)?,
++            None => vec![],
++        };
+         let mut bridge = DecoderBridge::new(self.limit);
+         let mut delivery = Delivery::new(self.limit);
+         for unit in units {
+@@ -185,9 +212,23 @@ impl AppendSession {
+                 .map_err(|_| SessionError::Configuration)?;
+             delivery.push(packet).map_err(|_| SessionError::Delivery)?;
+         }
++        let video_floor = target.and_then(|target| {
++            self.descriptions()
++                .iter()
++                .filter(|t| t.mime == "video/avc")
++                .flat_map(|t| store.frames(t.id))
++                .filter(|f| f.pts_us <= target && target < f.pts_us.saturating_add(f.duration_us))
++                .map(|f| f.pts_us)
++                .max()
++        });
+         Ok(RemovePlan {
++            video_floor,
+             store,
+-            seek: SeekPlan { bridge, delivery },
++            seek: SeekPlan {
++                rearm_configuration: target.is_none(),
++                bridge,
++                delivery,
++            },
+         })
+     }
+     /// Internal primitive only. Requires successful native reset before this
+@@ -196,7 +237,20 @@ impl AppendSession {
+         self.store = plan.store;
+         self.commit_seek(plan.seek);
+     }
++    pub fn empty_delivery_plan(&self) -> Result<SeekPlan, SessionError> {
++        if self.failed {
++            return Err(SessionError::Failed);
++        }
++        Ok(SeekPlan {
++            rearm_configuration: true,
++            bridge: DecoderBridge::new(self.limit),
++            delivery: Delivery::new(self.limit),
++        })
++    }
+     pub fn commit_seek(&mut self, plan: SeekPlan) {
++        if plan.rearm_configuration {
++            self.store.rearm_output_configuration();
++        }
+         self.bridge = plan.bridge;
+         self.delivery = plan.delivery;
+     }
+diff --git a/components/media/backends/android/mse_demux/timeline.rs b/components/media/backends/android/mse_demux/timeline.rs
+index 62e6d16c7..3c8171a6e 100644
+--- a/components/media/backends/android/mse_demux/timeline.rs
++++ b/components/media/backends/android/mse_demux/timeline.rs
+@@ -39,6 +39,10 @@ impl FrameStore {
+         }
+         Ok(())
+     }
++    /// A reset delivery bridge needs configuration on the next accepted unit.
++    pub fn rearm_output_configuration(&mut self) {
++        self.output_configured.clear();
++    }
+     pub fn bytes(&self) -> usize {
+         self.bytes
+     }
