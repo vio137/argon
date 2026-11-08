@@ -1,0 +1,347 @@
+diff --git a/components/media/backends/android/android_impl/mse_playback.rs b/components/media/backends/android/android_impl/mse_playback.rs
+index e8ef27e07..c7898bba2 100644
+--- a/components/media/backends/android/android_impl/mse_playback.rs
++++ b/components/media/backends/android/android_impl/mse_playback.rs
+@@ -449,6 +449,14 @@ impl AppendPlayback {
+             .insert(id, AppendSession::new(16 * 1024 * 1024, 8192));
+         Ok(())
+     }
++    fn has_current_data(&self) -> bool {
++        let tracks = self.sessions.values().flat_map(|s| s.descriptions());
++        let has_video = tracks.clone().any(|t| t.mime == "video/avc");
++        let has_audio = tracks.clone().any(|t| t.mime == "audio/mp4a-latm");
++        (has_video || has_audio)
++            && (!has_video || self.rendered_frames > 0)
++            && (!has_audio || self.audio.pending.is_some() || self.clock.audio_frames_written > 0)
++    }
+     fn duration_us(&self) -> Option<i64> {
+         if !self.input_ended {
+             return None;
+@@ -680,9 +688,7 @@ impl AppendPlayback {
+                 .any(|d| d.mime == "audio/mp4a-latm"),
+             all_buffers_ready: !self.sessions.is_empty()
+                 && self.sessions.values().all(|s| !s.descriptions().is_empty()),
+-            current_data: self.rendered_frames > 0
+-                || self.audio.pending.is_some()
+-                || self.clock.audio_frames_written > 0,
++            current_data: self.has_current_data(),
+             buffered: self.buffered(),
+             buffer_ranges: self.buffer_ranges(),
+             buffer_tracks: self
+diff --git a/components/media/backends/android/android_impl/mse_playback_tests.rs b/components/media/backends/android/android_impl/mse_playback_tests.rs
+index a7feee90d..bff063a8a 100644
+--- a/components/media/backends/android/android_impl/mse_playback_tests.rs
++++ b/components/media/backends/android/android_impl/mse_playback_tests.rs
+@@ -635,3 +635,28 @@ fn empty_eos_has_zero_duration_instead_of_infinite() {
+     p.end_input().unwrap();
+     assert_eq!(p.duration_us(), Some(0));
+ }
++
++#[test]
++fn current_data_requires_both_initialized_audio_and_video_outputs() {
++    let frames = Arc::new(Mutex::new(Vec::new()));
++    let mut p = AppendPlayback::new(Arc::new(Mutex::new(Capture(frames))));
++    p.add_buffer(1).unwrap();
++    p.add_buffer(2).unwrap();
++    p.append(
++        1,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-fmp4.mp4"),
++    )
++    .unwrap();
++    p.append(
++        2,
++        include_bytes!("../hosttest/tests/fixtures/synthetic-aac.mp4"),
++    )
++    .unwrap();
++    assert!(!p.has_current_data());
++    p.rendered_frames = 1;
++    assert!(!p.has_current_data());
++    p.clock.audio_frames_written = 1;
++    assert!(p.has_current_data());
++    p.rendered_frames = 0;
++    assert!(!p.has_current_data());
++}
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+index 939147fa9..1fabc8f17 100644
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -37,6 +37,7 @@ struct State {
+     input_ended: bool,
+     output_ended: bool,
+     duration_us: Option<i64>,
++    readiness: Option<servo_media_player::append::AppendReadiness>,
+     pending_seek: Option<u64>,
+     buffers: BTreeMap<u32, BufferState>,
+     buffered: Vec<Range<f64>>,
+@@ -77,6 +78,7 @@ impl AndroidAppendPlayer {
+             input_ended: false,
+             output_ended: false,
+             duration_us: None,
++            readiness: None,
+             pending_seek: None,
+             buffers: BTreeMap::new(),
+             buffered: vec![],
+@@ -251,6 +253,23 @@ impl AndroidAppendPlayer {
+                                 title: None,
+                             }));
+                         }
++                        if status.all_buffers_ready {
++                            let readiness = servo_media_player::append::readiness(
++                                status.position_us,
++                                &status.buffered,
++                                status.current_data,
++                                status.duration_us,
++                            );
++                            let changed = {
++                                let mut s = shared.lock().unwrap();
++                                let changed = s.readiness != Some(readiness);
++                                s.readiness = Some(readiness);
++                                changed
++                            };
++                            if changed {
++                                send(PlayerEvent::AppendReadiness(readiness));
++                            }
++                        }
+                         let duration_changed = {
+                             let mut s = shared.lock().unwrap();
+                             let changed = s.duration_us != status.duration_us;
+diff --git a/components/media/backends/android/hosttest/Cargo.lock b/components/media/backends/android/hosttest/Cargo.lock
+index 5dc8a0d4a..fb1281949 100644
+--- a/components/media/backends/android/hosttest/Cargo.lock
++++ b/components/media/backends/android/hosttest/Cargo.lock
+@@ -60,6 +60,24 @@ dependencies = [
+  "autocfg",
+ ]
+ 
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
+ [[package]]
+ name = "rayon"
+ version = "1.12.0"
+@@ -80,12 +98,43 @@ dependencies = [
+  "crossbeam-utils",
+ ]
+ 
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
+ [[package]]
+ name = "servo-media-android-hosttest"
+ version = "0.0.0"
+ dependencies = [
+  "log",
+  "mime",
++ "serde",
+  "shiguredo_mp4",
+  "yuv",
+ ]
+@@ -96,6 +145,23 @@ version = "2026.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "82e773aead88d11a806c8b78dbc2577afb3a20fcc80108aafb3724f6dbb9fbe0"
+ 
++[[package]]
++name = "syn"
++version = "3.0.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
++
+ [[package]]
+ name = "yuv"
+ version = "0.8.14"
+diff --git a/components/media/backends/android/hosttest/Cargo.toml b/components/media/backends/android/hosttest/Cargo.toml
+index 4ec3d0869..c279467c2 100644
+--- a/components/media/backends/android/hosttest/Cargo.toml
++++ b/components/media/backends/android/hosttest/Cargo.toml
+@@ -13,6 +13,7 @@ publish = false
+ shiguredo_mp4 = "=2026.5.0"
+ log = "0.4"
+ mime = "0.3"
++serde = { version = "1", features = ["derive"] }
+ 
+ yuv = { version = "=0.8.14", features = ["rayon"], optional = true }
+ 
+diff --git a/components/media/backends/android/hosttest/src/player_api.rs b/components/media/backends/android/hosttest/src/player_api.rs
+index 92db0508c..cd02f3ea8 100644
+--- a/components/media/backends/android/hosttest/src/player_api.rs
++++ b/components/media/backends/android/hosttest/src/player_api.rs
+@@ -53,6 +53,7 @@ pub enum PlayerEvent {
+     /// Append output is ready for this exact seek, not a superseded target.
+     AppendSeekDone { operation: u64, position: f64 },
+     AppendSeekRejected(u64),
++    AppendReadiness(append::AppendReadiness),
+     StateChanged(PlaybackState),
+ }
+ #[derive(Clone,Copy,Debug,PartialEq)]
+diff --git a/components/media/backends/android/hosttest/src/source_tests.rs b/components/media/backends/android/hosttest/src/source_tests.rs
+index 5bb4272b9..7f4ddbb56 100644
+--- a/components/media/backends/android/hosttest/src/source_tests.rs
++++ b/components/media/backends/android/hosttest/src/source_tests.rs
+@@ -175,6 +175,12 @@ mod pipeline_tests {
+         assert_eq!(player.lock().unwrap().append_tracks(1).iter().map(|t|t.mime.as_str()).collect::<Vec<_>>(), ["video/avc"]);
+         assert_eq!(player.lock().unwrap().append_tracks(2).iter().map(|t|t.mime.as_str()).collect::<Vec<_>>(), ["audio/mp4a-latm"]);
+         assert!(metadata.width>0 && metadata.height>0);
++        loop { match events.recv_timeout(Duration::from_secs(2)).unwrap() {
++            PlayerEvent::AppendReadiness(crate::append::AppendReadiness::Metadata)=>break,
++            PlayerEvent::AppendReadiness(_)=>panic!("initialization only claimed decoded readiness"),
++            PlayerEvent::StateChanged(_)=>panic!("initialization only claimed playing readiness"),
++            _=>(),
++        }}
+         assert!(player.lock().unwrap().buffered().is_empty());
+         assert!(events.try_iter().all(|e| !matches!(e,PlayerEvent::NeedData|PlayerEvent::StateChanged(_))));
+         player.lock().unwrap().stop().unwrap();
+diff --git a/components/media/player/append.rs b/components/media/player/append.rs
+index 9906bcaa7..c4d047ca3 100644
+--- a/components/media/player/append.rs
++++ b/components/media/player/append.rs
+@@ -22,3 +22,44 @@ pub struct AppendTrack { pub id:u32, pub mime:String }
+ #[derive(Clone,Copy,Debug,PartialEq,Eq)]
+ pub struct AppendNotification {pub operation:u64,pub event:AppendEvent}
+ pub type AppendOperationCallback=Box<dyn Fn(AppendNotification)+Send+Sync>;
++
++/// Private append-source ready-state decision. Buffered future data alone
++/// never counts as decoded current data. The 500ms horizon is a buffering
++/// policy, not a promise of device decoding or uninterrupted network delivery.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub enum AppendReadiness { Metadata, Current, Future, Enough }
++pub fn readiness(position: i64, ranges: &[std::ops::Range<i64>], decoded: bool,
++                 duration: Option<i64>) -> AppendReadiness {
++    let covering = ranges.iter().find(|r| r.start <= position && position < r.end);
++    if !decoded { return AppendReadiness::Metadata; }
++    if let Some(range) = covering {
++        if duration.is_some_and(|end| range.end >= end) || range.end.saturating_sub(position) >= 500_000 {
++            AppendReadiness::Enough
++        } else { AppendReadiness::Future }
++    } else if ranges.iter().any(|r| r.end == position) {
++        AppendReadiness::Current
++    } else { AppendReadiness::Metadata }
++}
++#[cfg(test)] mod readiness_tests {
++    use super::*;
++    #[test] fn decoded_output_is_required_even_for_large_buffer() {
++        assert_eq!(readiness(0,&[0..2_000_000],false,None),AppendReadiness::Metadata);
++    }
++    #[test] fn gap_cannot_use_an_old_decoded_frame_or_future_range() {
++        assert_eq!(readiness(1_000_000,&[0..500_000,1_500_000..2_000_000],true,None),AppendReadiness::Metadata);
++    }
++    #[test] fn buffered_horizon_transitions_before_starvation() {
++        assert_eq!(readiness(0,&[0..1_000_000],true,None),AppendReadiness::Enough);
++        assert_eq!(readiness(500_000,&[0..1_000_000],true,None),AppendReadiness::Enough);
++        assert_eq!(readiness(500_001,&[0..1_000_000],true,None),AppendReadiness::Future);
++        assert_eq!(readiness(1_000_000,&[0..1_000_000],true,None),AppendReadiness::Current);
++        assert_eq!(readiness(1_000_001,&[0..1_000_000],true,None),AppendReadiness::Metadata);
++    }
++    #[test] fn short_ended_range_before_a_gap_is_not_enough_to_finish() {
++        assert_eq!(readiness(0,&[0..100_000,200_000..300_000],true,Some(300_000)),AppendReadiness::Future);
++    }
++    #[test] fn short_ended_stream_needs_no_additional_future_input() {
++        assert_eq!(readiness(0,&[0..100_000],true,Some(100_000)),AppendReadiness::Enough);
++        assert_eq!(readiness(0,&[0..100_000],false,Some(100_000)),AppendReadiness::Metadata);
++    }
++}
+diff --git a/components/media/player/lib.rs b/components/media/player/lib.rs
+index d8e7ca236..39185623d 100644
+--- a/components/media/player/lib.rs
++++ b/components/media/player/lib.rs
+@@ -90,6 +90,7 @@ pub enum PlayerEvent {
+     /// Append output is ready for this exact seek, not a superseded target.
+     AppendSeekDone { operation: u64, position: f64 },
+     AppendSeekRejected(u64),
++    AppendReadiness(append::AppendReadiness),
+     StateChanged(PlaybackState),
+ }
+ 
+diff --git a/components/script/dom/html/embedded_content/htmlmediaelement.rs b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+index 8910df616..0de68ca45 100644
+--- a/components/script/dom/html/embedded_content/htmlmediaelement.rs
++++ b/components/script/dom/html/embedded_content/htmlmediaelement.rs
+@@ -3045,13 +3045,15 @@ impl HTMLMediaElement {
+         match *state {
+             PlaybackState::Paused => {
+                 media_session_playback_state = MediaSessionPlaybackState::Paused;
+-                if self.ready_state.get() == ReadyState::HaveMetadata {
++                if self.attached_append_source.get().is_none()
++                    && self.ready_state.get() == ReadyState::HaveMetadata {
+                     self.change_ready_state(cx, ReadyState::HaveEnoughData);
+                 }
+             },
+             PlaybackState::Playing => {
+                 media_session_playback_state = MediaSessionPlaybackState::Playing;
+-                if self.ready_state.get() == ReadyState::HaveMetadata {
++                if self.attached_append_source.get().is_none()
++                    && self.ready_state.get() == ReadyState::HaveMetadata {
+                     self.change_ready_state(cx, ReadyState::HaveEnoughData);
+                 }
+             },
+@@ -4526,6 +4528,18 @@ impl HTMLMediaElementEventHandler {
+                     element.playback_seek_done(cx, position);
+                 }
+             },
++            PlayerEvent::AppendReadiness(readiness) => {
++                if element.attached_append_source.get().is_some()
++                    && element.ready_state.get() >= ReadyState::HaveMetadata {
++                    use servo_media::player::append::AppendReadiness;
++                    element.change_ready_state(cx, match readiness {
++                        AppendReadiness::Metadata => ReadyState::HaveMetadata,
++                        AppendReadiness::Current => ReadyState::HaveCurrentData,
++                        AppendReadiness::Future => ReadyState::HaveFutureData,
++                        AppendReadiness::Enough => ReadyState::HaveEnoughData,
++                    });
++                }
++            },
+             PlayerEvent::AppendSeekRejected(operation) => {
+                 if element.attached_append_source.get().is_some()
+                     && operation == element.append_seek_operation.get() {
