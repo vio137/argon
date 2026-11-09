@@ -1,0 +1,72 @@
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -121,6 +121,17 @@
+     [*b"senc",*b"saiz",*b"saio",*b"pssh"].contains(&kind)
+         || ([*b"sgpd",*b"sbgp"].contains(&kind) && payload.get(4..8)==Some(&b"seig"[..]))
+ }
++// Reject unknown field widths/signedness before the dependency's fallback
++// version-zero interpretation. This is fragment-scoped, not a claim of full
++// ISO BMFF conformance.
++fn validate_fragment_version(kind: [u8;4], payload: &[u8]) -> Result<(),Error> {
++    if [*b"mfhd",*b"tfhd",*b"tfdt",*b"trun"].contains(&kind) {
++        if payload.len()<4 {return Err(Error::Truncated);}
++        let maximum=if kind==*b"tfdt" || kind==*b"trun" {1} else {0};
++        if payload[0]>maximum {return Err(Error::UnsupportedLayout);}
++    }
++    Ok(())
++}
+ fn validate_auxiliary_boxes(data: &[u8]) -> Result<(),Error> {
+     for (kind,_,payload) in top_boxes(data)? {
+         if unsupported_auxiliary(kind,&data[payload]) {return Err(Error::UnsupportedLayout);}
+@@ -251,6 +262,7 @@
+     // The dependency retains duplicate singleton headers as unknown boxes.
+     // Reject ambiguity before either coverage probing or demux state changes.
+     if children.iter().filter(|x|x.0==*b"mfhd").count()!=1 {return Err(Error::InvalidBox);}
++    for (kind,_,payload) in &children {validate_fragment_version(*kind,&data[moof.2.start+payload.start..moof.2.start+payload.end])?;}
+     let trafs: Vec<_> = children.iter().filter(|x| x.0 == *b"traf").collect();
+     if trafs.is_empty() || trafs.len() > 16 {
+         return Err(Error::InvalidBox);
+@@ -260,6 +272,7 @@
+         let body = &data[moof.2.start + traf.2.start..moof.2.start + traf.2.end];
+         validate_auxiliary_boxes(body)?;
+         let fields = top_boxes(body)?;
++        for (kind,_,payload) in &fields {validate_fragment_version(*kind,&body[payload.clone()])?;}
+         if fields.iter().filter(|x| x.0 == *b"tfdt").count() != 1
+             || fields.iter().filter(|x| x.0 == *b"tfhd").count() != 1 {
+             return Err(Error::InvalidBox);
+@@ -789,3 +802,17 @@
+   assert_eq!(validate_init_children(&trailing,*b"stbl",0,&mut 4096,&mut 0),Err(Error::InvalidBox));
+  }
+ }
++
++#[cfg(test)]
++mod fragment_version_tests {
++ use super::*;
++ #[test]
++ fn explicit_supported_versions_and_short_fullbox_headers() {
++  for kind in [*b"mfhd",*b"tfhd",*b"tfdt",*b"trun"] {
++   assert_eq!(validate_fragment_version(kind,&[0,0,0,0]),Ok(()));
++   assert_eq!(validate_fragment_version(kind,&[0,0,0]),Err(Error::Truncated));
++   let expected=if kind==*b"tfdt"||kind==*b"trun"{Ok(())}else{Err(Error::UnsupportedLayout)};
++   assert_eq!(validate_fragment_version(kind,&[1,0,0,0]),expected);
++  }
++ }
++}
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1180,3 +1180,15 @@
+   assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.pts_us,a.duration_us),(b.pts_us,b.duration_us));}
+  }}
+ }
++
++#[test]
++fn unsupported_fragment_fullbox_versions_reject_without_consuming_configuration() {
++ use servo_media_android_hosttest::mse_demux::Error;
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);
++ for (kind,version) in [(*b"mfhd",1),(*b"tfhd",1),(*b"tfdt",2),(*b"trun",2),(*b"tfdt",255),(*b"trun",255)] {
++  let mut bad=media.clone();let pos=bad.windows(4).position(|b|b==kind).unwrap()+4;bad[pos]=version;
++  let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert_eq!(d.media_complete(&bad),Err(Error::UnsupportedLayout));assert!(matches!(d.media(&bad),Err(Error::UnsupportedLayout)));
++  let good=d.media(&media).unwrap();assert!(!good.is_empty());assert!(good[0].codec_config.is_some(),"rejection cannot consume first config");assert_eq!(good[0].pts_us,0);
++ }
++}
