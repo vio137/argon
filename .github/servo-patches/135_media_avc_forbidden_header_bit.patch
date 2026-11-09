@@ -1,0 +1,68 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1165,3 +1165,18 @@
+  // Multi-traf implicit base is still unsupported, despite valid payloads.
+  vf.traf_boxes[1].tfhd_box.default_base_is_moof=false;let mut bad=vf.encode_to_vec().unwrap();bad.extend_from_slice(&segment[header..]);assert_eq!(d.media_complete(&bad),Err(Error::UnsupportedLayout));
+ }
++
++#[test]
++fn forbidden_parameter_header_replacement_preserves_last_valid_avc_configuration() {
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoovBox,SampleEntry}};
++ use servo_media_android_hosttest::mse_demux::Error;
++ let bs=boxes();let ftyp=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap();let bytes=bs.iter().find(|b|&b[4..8]==b"moov").unwrap();
++ let(mut moov,_)=MoovBox::decode(bytes).unwrap();let mut original=ftyp.clone();original.extend_from_slice(bytes);
++ if let SampleEntry::Avc1(e)=&mut moov.trak_boxes[0].mdia_box.minf_box.stbl_box.stsd_box.entries[0]{e.avcc_box.sps_list[0][0]|=0x80;}else{panic!();}
++ let mut bad=ftyp.clone();bad.extend(moov.encode_to_vec().unwrap());let mut d=Demux::new(1<<20,64);d.init(&original).unwrap();assert_eq!(d.init(&bad),Err(Error::InvalidSample));
++ let mut baseline=Demux::new(1<<20,64);baseline.init(&original).unwrap();
++ for pair in bs.windows(2) {if &pair[0][4..8]==b"moof"&&&pair[1][4..8]==b"mdat" {
++  let mut segment=pair[0].clone();segment.extend_from_slice(&pair[1]);let got=d.media(&segment).unwrap();let expected=baseline.media(&segment).unwrap();
++  assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.pts_us,a.duration_us),(b.pts_us,b.duration_us));}
++ }}
++}
+diff --git a/components/media/backends/android/mse_demux/avc.rs b/components/media/backends/android/mse_demux/avc.rs
+--- a/components/media/backends/android/mse_demux/avc.rs
++++ b/components/media/backends/android/mse_demux/avc.rs
+@@ -20,7 +20,7 @@
+     }
+     let mut out = vec![];
+     for nal in list {
+-        if nal.is_empty() || nal[0] & 31 != nal_type {
++        if nal.is_empty() || nal[0] & 0x80 != 0 || nal[0] & 31 != nal_type {
+             return Err(AvcError::Invalid);
+         }
+         if out
+@@ -77,6 +77,7 @@
+         }
+         let end = pos.checked_add(n).ok_or(AvcError::Invalid)?;
+         let nal = sample.get(pos..end).ok_or(AvcError::Invalid)?;
++        if nal[0]&0x80!=0 {return Err(AvcError::Invalid);}
+         if out.len().checked_add(n + 4).ok_or(AvcError::Quota)? > limit {
+             return Err(AvcError::Quota);
+         }
+@@ -125,3 +126,25 @@
+         assert_eq!(parameters(&[], 7, 16), Err(AvcError::Invalid));
+     }
+ }
++
++#[cfg(test)]
++mod forbidden_bit_tests {
++ use super::*;
++ #[test]
++ fn invalid_parameter_headers_reject_even_when_the_masked_type_matches() {
++  for (nal,kind) in [(vec![0xe7,1],7),(vec![0xe8,1],8)] {
++   assert_eq!(parameters(&[nal],kind,64),Err(AvcError::Invalid));
++  }
++  assert_eq!(parameters(&[vec![0x67,1],vec![0xe7,2]],7,64),Err(AvcError::Invalid));
++ }
++ #[test]
++ fn forbidden_bit_in_any_access_unit_nal_rejects_all_length_widths() {
++  for width in [1,2,4] {
++   let length=|n:u32|n.to_be_bytes()[4-width..].to_vec();
++   let mut bytes=length(2);bytes.extend([0x65,1]);bytes.extend(length(2));bytes.extend([0xe1,2]);
++   assert_eq!(convert(&bytes,width,64),Err(AvcError::Invalid));
++   *bytes.last_mut().unwrap()=0xff;bytes[width+2+width]=0x61;
++   assert!(convert(&bytes,width,64).is_ok(),"payload high bits are not header bits");
++  }
++ }
++}
