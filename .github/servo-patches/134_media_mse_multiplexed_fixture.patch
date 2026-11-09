@@ -1,0 +1,44 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1128,3 +1128,40 @@
+   let mut init=ftyp.clone();init.extend(empty.encode_to_vec().unwrap());assert_eq!(Demux::new(1<<20,64).init(&init),Ok(()));
+  }
+ }
++
++#[test]
++fn multiplexed_avc_aac_uses_distinct_track_defaults_and_intersected_coverage() {
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoovBox,MoofBox}};
++ use servo_media_android_hosttest::mse_demux::{Error,session::AppendSession,delivery::CodecInput,bridge::DecoderConfig};
++ fn read(data:&[u8])->Vec<Vec<u8>> {let mut f=BoxFramer::new(1<<20);f.append(data).unwrap();let mut out=vec![];while let Some(b)=f.pop_box().unwrap(){out.push(b);}out}
++ let video=read(include_bytes!("fixtures/synthetic-fmp4.mp4"));let audio=read(include_bytes!("fixtures/synthetic-aac.mp4"));
++ let moov=|bs:&Vec<Vec<u8>>|MoovBox::decode(bs.iter().find(|b|&b[4..8]==b"moov").unwrap()).unwrap().0;
++ let mut vm=moov(&video);let mut am=moov(&audio);
++ am.trak_boxes[0].tkhd_box.track_id=2;am.mvex_box.as_mut().unwrap().trex_boxes[0].track_id=2;
++ vm.trak_boxes.push(am.trak_boxes.remove(0));vm.mvex_box.as_mut().unwrap().trex_boxes.extend(am.mvex_box.unwrap().trex_boxes);
++ let mut init=video.iter().find(|b|&b[4..8]==b"ftyp").unwrap().clone();init.extend(vm.encode_to_vec().unwrap());
++ let vp=video.windows(2).find(|p|&p[0][4..8]==b"moof"&&&p[1][4..8]==b"mdat").unwrap();
++ let ap=audio.windows(2).find(|p|&p[0][4..8]==b"moof"&&&p[1][4..8]==b"mdat").unwrap();
++ let(mut vf,_)=MoofBox::decode(&vp[0]).unwrap();let(mut af,_)=MoofBox::decode(&ap[0]).unwrap();
++ af.traf_boxes[0].tfhd_box.track_id=2;vf.traf_boxes.push(af.traf_boxes.remove(0));
++ let header=vf.encode_to_vec().unwrap().len();vf.traf_boxes[0].trun_boxes[0].data_offset=Some((header+8)as i32);
++ vf.traf_boxes[1].trun_boxes[0].data_offset=Some((header+8+vp[1].len()-8)as i32);
++ let mut segment=vf.encode_to_vec().unwrap();let payload=[&vp[1][8..],&ap[1][8..]].concat();
++ segment.extend_from_slice(&((payload.len()+8)as u32).to_be_bytes());segment.extend_from_slice(b"mdat");segment.extend(payload);
++ let mut d=Demux::new(1<<20,256);d.init(&init).unwrap();assert_eq!(d.descriptions().iter().map(|t|(t.id,t.mime)).collect::<Vec<_>>(),[(1,"video/avc"),(2,"audio/mp4a-latm")]);
++ assert_eq!(d.media_complete(&segment),Ok(true));let units=d.media(&segment).unwrap();
++ for (id,bs,pair) in [(1,&video,vp),(2,&audio,ap)] {
++  let mut separate=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap().clone();separate.extend_from_slice(bs.iter().find(|b|&b[4..8]==b"moov").unwrap());
++  let mut solo=Demux::new(1<<20,256);solo.init(&separate).unwrap();let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);let expected=solo.media(&media).unwrap();let got=units.iter().filter(|u|u.track_id==id).collect::<Vec<_>>();
++  assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.pts_us,a.dts_us,a.duration_us),(b.pts_us,b.dts_us,b.duration_us));}
++ }
++ let mut session=AppendSession::new(1<<20,256);session.append(&init).unwrap();for chunk in segment.chunks(7){session.append(chunk).unwrap();}
++ let v=session.ranges(1);let a=session.ranges(2);assert_eq!(v.len(),1);assert_eq!(a.len(),1);assert_eq!(session.buffered(),vec![v[0].start.max(a[0].start)..v[0].end.min(a[0].end)]);
++ struct Sink{configs:Vec<(u32,&'static str)>,packets:Vec<u32>}
++ impl CodecInput for Sink{fn configure(&mut self,c:&DecoderConfig)->Result<(),()>{self.configs.push((c.track_id,c.mime));Ok(())}fn submit(&mut self,id:u32,_:&[u8],_:i64)->Result<bool,()>{self.packets.push(id);Ok(true)}}
++ session.end_of_stream().unwrap();let mut sink=Sink{configs:vec![],packets:vec![]};
++ for _ in 0..units.len(){assert!(session.pump_input(&mut sink).unwrap());}assert!(session.input_exhausted());
++ assert_eq!(sink.configs,[(1,"video/avc"),(2,"audio/mp4a-latm")]);assert_eq!(sink.packets.len(),units.len());
++ // Multi-traf implicit base is still unsupported, despite valid payloads.
++ vf.traf_boxes[1].tfhd_box.default_base_is_moof=false;let mut bad=vf.encode_to_vec().unwrap();bad.extend_from_slice(&segment[header..]);assert_eq!(d.media_complete(&bad),Err(Error::UnsupportedLayout));
++}
