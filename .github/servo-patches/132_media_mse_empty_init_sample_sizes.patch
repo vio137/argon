@@ -1,0 +1,70 @@
+diff --git a/components/media/backends/android/hosttest/tests/mse_fixture.rs b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1102,3 +1102,29 @@
+   }
+  }
+ }
++
++#[test]
++fn initialization_sample_sizes_must_be_empty_before_replacing_configuration() {
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoovBox,StszBox}};
++ use servo_media_android_hosttest::mse_demux::Error;
++ for fixture in [include_bytes!("fixtures/synthetic-fmp4.mp4").as_slice(),include_bytes!("fixtures/synthetic-aac.mp4").as_slice()] {
++  let mut framer=BoxFramer::new(1<<20);framer.append(fixture).unwrap();let mut bs=vec![];
++  while let Some(b)=framer.pop_box().unwrap(){bs.push(b);}
++  let ftyp=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap();let bytes=bs.iter().find(|b|&b[4..8]==b"moov").unwrap();
++  let(moov,_)=MoovBox::decode(bytes).unwrap();let mut original=ftyp.clone();original.extend_from_slice(bytes);
++  for sizes in [StszBox::Variable{entry_sizes:vec![1]},StszBox::Fixed{sample_size:std::num::NonZeroU32::new(1).unwrap(),sample_count:1},StszBox::Fixed{sample_size:std::num::NonZeroU32::new(1).unwrap(),sample_count:u32::MAX}] {
++   let mut bad=moov.clone();bad.trak_boxes[0].mdia_box.minf_box.stbl_box.stsz_box=sizes;
++   let mut init=ftyp.clone();init.extend(bad.encode_to_vec().unwrap());
++   let mut d=Demux::new(1<<20,64);d.init(&original).unwrap();assert_eq!(d.init(&init),Err(Error::InvalidBox));
++   let mut baseline=Demux::new(1<<20,64);baseline.init(&original).unwrap();
++   for pair in bs.windows(2) {if &pair[0][4..8]==b"moof"&&&pair[1][4..8]==b"mdat" {
++    let mut segment=pair[0].clone();segment.extend_from_slice(&pair[1]);
++    let got=d.media(&segment).unwrap();let expected=baseline.media(&segment).unwrap();
++    assert_eq!(got.len(),expected.len());for(a,b)in got.iter().zip(expected.iter()){assert_eq!(a.data,b.data);assert_eq!((a.track_id,a.pts_us,a.duration_us),(b.track_id,b.pts_us,b.duration_us));}
++   }}
++  }
++  // Nonzero fixed size is harmless when no initialization samples exist.
++  let mut empty=moov.clone();empty.trak_boxes[0].mdia_box.minf_box.stbl_box.stsz_box=StszBox::Fixed{sample_size:std::num::NonZeroU32::new(1).unwrap(),sample_count:0};
++  let mut init=ftyp.clone();init.extend(empty.encode_to_vec().unwrap());assert_eq!(Demux::new(1<<20,64).init(&init),Ok(()));
++ }
++}
+diff --git a/components/media/backends/android/mse_demux/mod.rs b/components/media/backends/android/mse_demux/mod.rs
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -205,6 +205,15 @@
+             *tracks += 1;
+             if *tracks > 16 {
+                 return Err(Error::Quota);
++            }
++        }
++        if kind==*b"stsz" {
++            let bytes=&data[payload.clone()];
++            if bytes.len()<12 {return Err(Error::Truncated);}
++            // Initialization segments carry no samples. Check the count
++            // before the dependency materializes variable-size entries.
++            if bytes[8..12]!=[0,0,0,0] || bytes.len()!=12 {
++                return Err(Error::InvalidBox);
+             }
+         }
+         if [*b"stts", *b"stsc", *b"stco", *b"co64"].contains(&kind) {
+@@ -766,3 +775,17 @@
+   }
+  }
+ }
++
++#[cfg(test)]
++mod init_sample_size_tests {
++ use super::*;
++ #[test]
++ fn hostile_variable_counts_and_truncated_size_headers_fail_preflight() {
++  let mut body=vec![0,0,0,20,b's',b't',b's',b'z'];body.extend_from_slice(&[0;8]);body.extend_from_slice(&u32::MAX.to_be_bytes());
++  assert_eq!(validate_init_children(&body,*b"stbl",0,&mut 4096,&mut 0),Err(Error::InvalidBox));
++  body.truncate(16);body[..4].copy_from_slice(&16u32.to_be_bytes());
++  assert_eq!(validate_init_children(&body,*b"stbl",0,&mut 4096,&mut 0),Err(Error::Truncated));
++  let mut trailing=vec![0,0,0,21,b's',b't',b's',b'z'];trailing.extend_from_slice(&[0;13]);
++  assert_eq!(validate_init_children(&trailing,*b"stbl",0,&mut 4096,&mut 0),Err(Error::InvalidBox));
++ }
++}
