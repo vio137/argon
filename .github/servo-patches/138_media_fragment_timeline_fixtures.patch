@@ -1,0 +1,40 @@
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1227,3 +1227,37 @@
+   let good=d.media(&media).unwrap();assert!(!good.is_empty());assert!(good[0].codec_config.is_some());
+  }
+ }
++
++#[test]
++fn full_fragment_path_preserves_long_decode_times_and_composition_signedness() {
++ use shiguredo_mp4::{Decode,Encode,boxes::{MoofBox,MoovBox}};
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let(moov,_)=MoovBox::decode(bs.iter().find(|b|&b[4..8]==b"moov").unwrap()).unwrap();let scale=i128::from(moov.trak_boxes[0].mdia_box.mdhd_box.timescale.get());
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();
++ let(base,_)=MoofBox::decode(&pair[0]).unwrap();let raw=&pair[1][8..];
++ for (version,decode) in [(0,0),(0,u64::from(u32::MAX)),(1,u64::from(u32::MAX)+17)] {
++  for offset in [None,Some(0),Some(-1),Some(i64::from(i32::MIN)),Some(i64::from(u32::MAX))] {
++   let mut moof=base.clone();let traf=&mut moof.traf_boxes[0];let tfdt=traf.tfdt_box.as_mut().unwrap();tfdt.version=version;tfdt.base_media_decode_time=decode;
++   let run=&mut traf.trun_boxes[0];assert_eq!(run.samples.len(),1);run.samples[0].composition_time_offset=offset;
++   let ticks=run.samples[0].duration.or(traf.tfhd_box.default_sample_duration).unwrap();
++   let len=moof.encode_to_vec().unwrap().len();moof.traf_boxes[0].trun_boxes[0].data_offset=Some(len as i32+8);
++   let mut media=moof.encode_to_vec().unwrap();let trun=media.windows(4).position(|b|b==b"trun").unwrap();assert_eq!(media[trun+4],u8::from(offset.is_some_and(|v|v<0)));
++   media.extend_from_slice(&pair[1]);let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert_eq!(d.media_complete(&media),Ok(true));
++   let got=d.media(&media).unwrap();assert_eq!(got.len(),1);let unit=&got[0];let pts=i128::from(decode)+i128::from(offset.unwrap_or(0));
++   let us=|v:i128|i64::try_from(v*1_000_000/scale).unwrap();
++   assert_eq!(unit.dts_us,us(i128::from(decode)));assert_eq!(unit.pts_us,us(pts));assert_eq!(unit.duration_us,us(pts+i128::from(ticks))-us(pts));assert_eq!(unit.data,raw);assert!(unit.codec_config.is_some());
++  }
++ }
++}
++
++#[test]
++fn timestamp_overflow_rejects_atomically_before_first_codec_config_is_consumed() {
++ use shiguredo_mp4::{Decode,Encode,boxes::MoofBox};
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();let(mut moof,_)=MoofBox::decode(&pair[0]).unwrap();
++ let tfdt=moof.traf_boxes[0].tfdt_box.as_mut().unwrap();tfdt.version=1;tfdt.base_media_decode_time=u64::MAX;
++ let len=moof.encode_to_vec().unwrap().len();moof.traf_boxes[0].trun_boxes[0].data_offset=Some(len as i32+8);
++ let mut bad=moof.encode_to_vec().unwrap();bad.extend_from_slice(&pair[1]);
++ let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert!(d.media(&bad).is_err());
++ let mut good=pair[0].clone();good.extend_from_slice(&pair[1]);let got=d.media(&good).unwrap();assert_eq!(got[0].dts_us,0);assert!(got[0].codec_config.is_some());assert_eq!(got[0].data,&pair[1][8..]);
++}
