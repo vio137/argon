@@ -1,0 +1,122 @@
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -163,6 +163,24 @@
+     }
+     Ok(())
+ }
++// Empty initialization tables and trex defaults have fixed version-zero
++// layouts. Reject ignored metadata before the dependency can materialize or
++// commit it. This intentionally covers only the adapter's no-sample profile.
++fn validate_init_table(kind: [u8;4], p:&[u8])->Result<(),Error> {
++    let (length,count)=match &kind {
++        b"stts"|b"stsc"|b"stco"|b"co64"=>(8,Some(4)),
++        b"stsz"=>(12,Some(8)),
++        b"trex"=>(24,None),
++        _=>return Ok(()),
++    };
++    if p.len()<4 {return Err(Error::Truncated);}
++    if p[..4]!=[0,0,0,0] {return Err(Error::UnsupportedLayout);}
++    if p.len()<length {return Err(Error::Truncated);}
++    if p.len()!=length || count.is_some_and(|at|p[at..at+4]!=[0,0,0,0]) {
++        return Err(Error::InvalidBox);
++    }
++    Ok(())
++}
+ fn validate_init(data: &[u8]) -> Result<(), Error> {
+     if data.len() > 2 * 1024 * 1024 {
+         return Err(Error::Quota);
+@@ -243,24 +261,7 @@
+                 return Err(Error::Quota);
+             }
+         }
+-        if kind==*b"stsz" {
+-            let bytes=&data[payload.clone()];
+-            if bytes.len()<12 {return Err(Error::Truncated);}
+-            // Initialization segments carry no samples. Check the count
+-            // before the dependency materializes variable-size entries.
+-            if bytes[8..12]!=[0,0,0,0] || bytes.len()!=12 {
+-                return Err(Error::InvalidBox);
+-            }
+-        }
+-        if [*b"stts", *b"stsc", *b"stco", *b"co64"].contains(&kind) {
+-            let bytes = &data[payload.clone()];
+-            if bytes.len() < 8 {
+-                return Err(Error::Truncated);
+-            }
+-            if bytes[4..8] != [0, 0, 0, 0] {
+-                return Err(Error::InvalidBox);
+-            }
+-        }
++        validate_init_table(kind,&data[payload.clone()])?;
+         // Encryption requires explicit decryption handling, never silent ignore.
+         // Nontrivial edit support is rejected separately before library decode.
+         if [*b"pssh", *b"senc"].contains(&kind) {
+@@ -801,7 +802,8 @@
+    for &kind in kinds {let mut body=boxed(kind,&[]);body.extend(body.clone());assert_eq!(check(parent,&body),Err(Error::InvalidBox),"parent={parent:?} kind={kind:?}");}
+   }
+   for (parent,kind) in [(*b"moov",*b"trak"),(*b"mvex",*b"trex"),(*b"moov",*b"free")] {
+-   let mut body=boxed(kind,&[]);body.extend(body.clone());assert_eq!(check(parent,&body),Ok(()));
++   let payload=if kind==*b"trex" {vec![0;24]} else {vec![]};
++   let mut body=boxed(kind,&payload);body.extend(body.clone());assert_eq!(check(parent,&body),Ok(()));
+   }
+  }
+  #[test]
+@@ -879,3 +881,19 @@
+   assert_eq!(validate_fragment_layout(*b"trun",&payload(0,0,u32::MAX,8),64),Err(Error::Quota));
+  }
+ }
++
++#[cfg(test)]
++mod init_table_layout_tests {
++ use super::*;
++ #[test]
++ fn empty_table_layouts_reject_ignored_bytes_versions_and_flags() {
++  for(kind,len,count)in[(*b"stts",8,Some(4)),(*b"stsc",8,Some(4)),(*b"stco",8,Some(4)),(*b"co64",8,Some(4)),(*b"stsz",12,Some(8)),(*b"trex",24,None)] {
++   let p=vec![0;len];assert_eq!(validate_init_table(kind,&p),Ok(()));
++   assert_eq!(validate_init_table(kind,&p[..len-1]),Err(Error::Truncated));
++   let mut padded=p.clone();padded.push(0);assert_eq!(validate_init_table(kind,&padded),Err(Error::InvalidBox));
++   for at in 0..4 {let mut bad=p.clone();bad[at]=1;assert_eq!(validate_init_table(kind,&bad),Err(Error::UnsupportedLayout));}
++   if let Some(at)=count {let mut bad=p.clone();bad[at..at+4].copy_from_slice(&u32::MAX.to_be_bytes());assert_eq!(validate_init_table(kind,&bad),Err(Error::InvalidBox));}
++  }
++  let mut fixed=vec![0;12];fixed[4..8].copy_from_slice(&123u32.to_be_bytes());assert_eq!(validate_init_table(*b"stsz",&fixed),Ok(()));
++ }
++}
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1261,3 +1261,36 @@
+  let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert!(d.media(&bad).is_err());
+  let mut good=pair[0].clone();good.extend_from_slice(&pair[1]);let got=d.media(&good).unwrap();assert_eq!(got[0].dts_us,0);assert!(got[0].codec_config.is_some());assert_eq!(got[0].data,&pair[1][8..]);
+ }
++
++#[test]
++fn init_table_and_default_unknown_versions_or_flags_cannot_replace_valid_configuration() {
++ use servo_media_android_hosttest::mse_demux::Error;
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);
++ for kind in [*b"stts",*b"stsc",*b"stsz",*b"stco",*b"trex"] {for byte in[4,7] {
++  let mut bad=init.clone();let pos=bad.windows(4).position(|b|b==kind).unwrap();bad[pos+byte]=1;
++  let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();let previous=d.descriptions().to_vec();assert_eq!(d.init(&bad),Err(Error::UnsupportedLayout));assert_eq!(d.descriptions(),previous);
++  let got=d.media(&media).unwrap();assert_eq!(got[0].data,&pair[1][8..]);assert!(got[0].codec_config.is_some());
++ }}
++}
++
++#[test]
++fn init_table_padding_rejects_and_empty_co64_remains_valid() {
++ use servo_media_android_hosttest::mse_demux::Error;
++ fn pad_box(b:&[u8],kind:&[u8;4])->Vec<u8>{
++  let mut out=b[..8].to_vec();
++  if [b"moov",b"trak",b"mdia",b"minf",b"stbl",b"mvex"].iter().any(|k|&b[4..8]==*k) {
++   let mut pos=8;while pos<b.len(){let len=u32::from_be_bytes(b[pos..pos+4].try_into().unwrap())as usize;out.extend(pad_box(&b[pos..pos+len],kind));pos+=len;}
++  }else{out.extend_from_slice(&b[8..]);if &b[4..8]==kind{out.push(0);}}
++  let len=out.len()as u32;out[..4].copy_from_slice(&len.to_be_bytes());out
++ }
++ let bs=boxes();let ftyp=bs.iter().find(|b|&b[4..8]==b"ftyp").unwrap();let moov=bs.iter().find(|b|&b[4..8]==b"moov").unwrap();let init=[ftyp.as_slice(),moov.as_slice()].concat();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();let media=[pair[0].as_slice(),pair[1].as_slice()].concat();
++ for kind in [*b"stts",*b"stsc",*b"stsz",*b"stco",*b"trex"] {
++  let mut bad=ftyp.clone();bad.extend(pad_box(moov,&kind));assert_eq!(bad.len(),init.len()+1);
++  let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert_eq!(d.init(&bad),Err(Error::InvalidBox));assert!(d.media(&media).unwrap()[0].codec_config.is_some());
++ }
++ let mut wide=init.clone();let pos=wide.windows(4).position(|b|b==b"stco").unwrap();wide[pos..pos+4].copy_from_slice(b"co64");
++ let mut d=Demux::new(1<<20,64);d.init(&wide).unwrap();let unit=d.media(&media).unwrap().remove(0);assert_eq!(unit.data,&pair[1][8..]);
++ for byte in [4,7] {let mut bad=wide.clone();bad[pos+byte]=1;assert_eq!(d.init(&bad),Err(Error::UnsupportedLayout));}
++}
