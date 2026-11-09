@@ -1,0 +1,93 @@
+diff --git a/components/media/backends/android/mse_demux/README.md b/components/media/backends/android/mse_demux/README.md
+--- a/components/media/backends/android/mse_demux/README.md
++++ b/components/media/backends/android/mse_demux/README.md
+@@ -1,3 +1,65 @@
++# Private append-media implementation status
++
++Status after129,2026-11-09. This is implementation and compile evidence, not
++Android playback evidence. The historical notes below describe earlier stages;
++their "missing" lists and test counts are not the current status.
++
++## Current implementation
++
++- Bounded incremental fMP4 framing and transactional AVC/AAC extraction,
++  original-mdat payload bounds, pre-allocation fragment count checks, local
++  sample data references, parent-aware init/fragment singleton validation,
++  unique per-track fragment defaults and codec/handler identity checks.
++- Later implicit trun offsets and ignored prefixes preserve original sample
++  positions. One nonnegative-media-time, rate-one edit maps timestamps before
++  endpoint quantization. Complex/empty/negative-time/nonunit edits still reject.
++- Coded-frame storage includes offset/window processing, random-access gating,
++  overlap/dependent-frame replacement, sequence groups, discontinuity handling,
++  track-range intersection, removal, eviction and retained configuration epochs.
++- Private AppendSource/AppendBuffer, AndroidAppendPlayer, bounded worker,
++  decoder-input/output adapters, renderer handoff and AAudio output wiring are
++  implemented. Private DOM wrappers include source/buffer identity, attachment,
++  operations/events, duration/EOS, seek/replay and track-selection epoch guards.
++  Existence of these paths does not establish complete standards conformance.
++
++## Verification and activation are separate
++
++The129 host run passed298 checks (245 unit/native-mock and53 fixture checks).
++These compile the included backend sources with deterministic native symbols,
++not Android codecs or audio hardware. Android owner-source build129 passed:
++https://github.com/vio137/argon/actions/runs/42536136885
++The artifact digest, matching root/deps library CRC+size, exact26Servo+3focus JNI
++exports and onFavicon marker were checked. Compilation does not prove playback.
++
++Both media_android_backend_enabled and dom_media_source_extensions_enabled
++remain false. MediaSource.isTypeSupported remains false. No feature is enabled
++or advertised by these changes, and no delivered APK contains activated media.
++
++Still unverified: actual MediaCodec configure/decode, ImageReader interoperability,
++real decoded video in the renderer, audible AAudio output, device clock/A/V sync,
++browser event behavior under live decoding, and site playback. No emulator/device
++or Firebase tests were run. A real runtime test needs its own permitted scope.
++
++Known format/conformance limits include WebM, inband AVC sample-entry variants,
++brand compatibility validation, broader codec/profile/device support, complex
++edits, encrypted sample support and a full parser/resource/conformance review.
++Recognized unsupported protection layouts reject; that is not DRM support or
++proof that every possible protection layout is detected. Reader/View DOM and
++legacy patches040/041 remain excluded from candidates.
++
++## Dependency and fixture provenance
++
++shiguredo_mp4=2026.5.0, Apache-2.0. Effective dependency MSRV1.93; owner
++compilation uses Rust1.99.1. Registry checksum
++82e773aead88d11a806c8b78dbc2577afb3a20fcc80108aafb3724f6dbb9fbe0,
++source commit30e9b347f8863cd7d377e728ca7a81ac5a1b7770.
++Synthetic local AVC/AAC fMP4 fixtures contain no user media. They prove byte,
++timestamp and mock-boundary behavior, not native decoding.
++Requirements: https://www.w3.org/TR/mse-byte-stream-format-isobmff/
++and https://developer.android.com/reference/android/media/MediaCodec .
++
++## Historical milestones through066
++
+ # Dormant adaptive-media foundation
+ 
+ Not connected to SourceBuffer, HTMLMediaElement or NDK decoders yet. Does not enable MSE support or change capability reporting. Existing DOM drafts040/041 must stay excluded from candidates.
+diff --git a/components/media/backends/android/hosttest/README.md b/components/media/backends/android/hosttest/README.md
+--- a/components/media/backends/android/hosttest/README.md
++++ b/components/media/backends/android/hosttest/README.md
+@@ -1,3 +1,20 @@
++# Current host evidence after129
++
++2026-11-09:298 checks pass (245 unit/native-mock +53 fMP4 fixture checks).
++The older counts below are historical. Run with the actual tested toolchain:
++
++    CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1 cargo +1.99.1 test --features native-harness
++
++The harness includes shipped logic and private native adapters with deterministic
++native-symbol mocks. It does not exercise real Android decoders, ImageReader,
++audio hardware, live A/V sync, browser visual playback or sites. Android
++owner-source compilation remains a separate gate;129 passed at
++https://github.com/vio137/argon/actions/runs/42536136885 .
++See ../mse_demux/README.md for implemented paths, remaining format limits and
++activation gates. Both media preferences stay off.
++
++## Historical harness notes
++
+ # Host tests for the Android media backend
+ 
+ The pure logic of the backend (buffering, MIME table, YUV packing) is
