@@ -1,0 +1,122 @@
+diff --git a/components/media/backends/android/mime_table.rs b/components/media/backends/android/mime_table.rs
+--- a/components/media/backends/android/mime_table.rs
++++ b/components/media/backends/android/mime_table.rs
+@@ -32,8 +32,8 @@
+ ];
+ 
+ const KNOWN_CODECS: [&str; 13] = [
+-    "avc1", "avc3", "hvc1", "hev1", "vp8", "vp08", "vp9", "vp09", "av01", "mp4a", "opus",
+-    "vorbis", "mp3",
++    "avc1", "avc3", "hvc1", "hev1", "vp8", "vp08", "vp9", "vp09", "av01", "mp4a", "opus", "vorbis",
++    "mp3",
+ ];
+ 
+ pub fn can_play_type(media_type: &str) -> Support {
+@@ -53,13 +53,22 @@
+                 .as_str()
+                 .split(',')
+                 .map(|c| c.trim().trim_matches('"'))
+-                .all(|c| KNOWN_CODECS.iter().any(|k| c.starts_with(k)));
++                // Match a whole family token, not an arbitrary prefix.
++                // Qualified values need nonempty alphanumeric components;
++                // this is token hygiene, not device/profile validation.
++                .all(|c| {
++                    let mut parts = c.split('.');
++                    let family = parts.next().unwrap_or("");
++                    KNOWN_CODECS.contains(&family)
++                        && parts
++                            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric()))
++                });
+             if all_known {
+                 Support::Maybe
+             } else {
+                 Support::No
+             }
+-        },
++        }
+     }
+ }
+ 
+@@ -75,8 +84,14 @@
+             can_play_type("video/mp4; codecs=\"avc1.42E01E, mp4a.40.2\""),
+             Support::Maybe
+         );
+-        assert_eq!(can_play_type("video/webm; codecs=\"vp9, opus\""), Support::Maybe);
+-        assert_eq!(can_play_type("audio/mp4; codecs=\"mp4a.40.5\""), Support::Maybe);
++        assert_eq!(
++            can_play_type("video/webm; codecs=\"vp9, opus\""),
++            Support::Maybe
++        );
++        assert_eq!(
++            can_play_type("audio/mp4; codecs=\"mp4a.40.5\""),
++            Support::Maybe
++        );
+     }
+ 
+     #[test]
+@@ -97,3 +112,65 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod codec_token_tests {
++    use super::*;
++    #[test]
++    fn known_family_prefix_is_not_enough_for_unknown_codec_names() {
++        for token in [
++            "avc1garbage",
++            "avc3evil.42E01E",
++            "mp4audio",
++            "opusfake",
++            "vp09extra.00",
++            "mp3evil",
++        ] {
++            assert_eq!(
++                can_play_type(&format!("video/mp4; codecs=\"{token}\"")),
++                Support::No,
++                "{token}"
++            );
++        }
++    }
++    #[test]
++    fn qualified_tokens_require_nonempty_alphanumeric_components() {
++        for token in [
++            "avc1.",
++            "avc1..42E01E",
++            "avc1.42E01E.",
++            "mp4a.40..2",
++            "vp09.00_10",
++            "opus.-x",
++        ] {
++            assert_eq!(
++                can_play_type(&format!("video/mp4; codecs=\"{token}\"")),
++                Support::No,
++                "{token}"
++            );
++        }
++    }
++    #[test]
++    fn recognized_family_and_profile_tokens_keep_the_maybe_ceiling() {
++        for token in [
++            "avc1",
++            "avc1.42E01E",
++            "avc3.640028",
++            "mp4a.40.2",
++            "vp09.00.10.08",
++            "av01.0.04M.08",
++            "opus",
++            "mp3",
++        ] {
++            assert_eq!(
++                can_play_type(&format!("video/mp4; codecs=\"{token}\"")),
++                Support::Maybe,
++                "{token}"
++            );
++        }
++        assert_eq!(
++            can_play_type("video/mp4; codecs=\"avc1.42E01E,mp4audio\""),
++            Support::No
++        );
++    }
++}
