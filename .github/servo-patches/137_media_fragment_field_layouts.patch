@@ -1,0 +1,135 @@
+--- a/components/media/backends/android/mse_demux/mod.rs
++++ b/components/media/backends/android/mse_demux/mod.rs
+@@ -132,6 +132,31 @@
+     }
+     Ok(())
+ }
++// Known fragment layouts must account for every byte. Unknown flag bits can
++// add fields the dependency would otherwise ignore. Count caps precede any
++// sample-vector allocation and apply even to zero-width sample records.
++fn validate_fragment_layout(kind: [u8;4], p: &[u8], sample_limit: usize) -> Result<(),Error> {
++    if ![*b"mfhd",*b"tfhd",*b"tfdt",*b"trun"].contains(&kind) {return Ok(());}
++    validate_fragment_version(kind,p)?;
++    let flags=u32::from_be_bytes(p[..4].try_into().unwrap())&0x00ff_ffff;
++    let allowed=match &kind {b"tfhd"=>0x03003b,b"trun"=>0x000f05,_=>0};
++    if flags&!allowed!=0 {return Err(Error::UnsupportedLayout);}
++    let expected=match &kind {
++        b"mfhd"=>8,
++        b"tfdt"=>if p[0]==1 {12} else {8},
++        b"tfhd"=>8+if flags&1!=0 {8} else {0}+4*(flags&0x3a).count_ones() as usize,
++        b"trun"=>{
++            if p.len()<8 {return Err(Error::Truncated);}
++            let count=u32::from_be_bytes(p[4..8].try_into().unwrap()) as usize;
++            if count>sample_limit {return Err(Error::Quota);}
++            let width=4*(flags&0x0f00).count_ones() as usize;
++            8usize.checked_add(4*(flags&5).count_ones() as usize)
++                .and_then(|n|count.checked_mul(width).and_then(|v|n.checked_add(v))).ok_or(Error::Quota)?
++        },
++        _=>unreachable!(),
++    };
++    if p.len()<expected {Err(Error::Truncated)} else if p.len()!=expected {Err(Error::InvalidBox)} else {Ok(())}
++}
+ fn validate_auxiliary_boxes(data: &[u8]) -> Result<(),Error> {
+     for (kind,_,payload) in top_boxes(data)? {
+         if unsupported_auxiliary(kind,&data[payload]) {return Err(Error::UnsupportedLayout);}
+@@ -262,7 +287,7 @@
+     // The dependency retains duplicate singleton headers as unknown boxes.
+     // Reject ambiguity before either coverage probing or demux state changes.
+     if children.iter().filter(|x|x.0==*b"mfhd").count()!=1 {return Err(Error::InvalidBox);}
+-    for (kind,_,payload) in &children {validate_fragment_version(*kind,&data[moof.2.start+payload.start..moof.2.start+payload.end])?;}
++    for (kind,_,payload) in &children {validate_fragment_layout(*kind,&data[moof.2.start+payload.start..moof.2.start+payload.end],sample_limit)?;}
+     let trafs: Vec<_> = children.iter().filter(|x| x.0 == *b"traf").collect();
+     if trafs.is_empty() || trafs.len() > 16 {
+         return Err(Error::InvalidBox);
+@@ -272,7 +297,7 @@
+         let body = &data[moof.2.start + traf.2.start..moof.2.start + traf.2.end];
+         validate_auxiliary_boxes(body)?;
+         let fields = top_boxes(body)?;
+-        for (kind,_,payload) in &fields {validate_fragment_version(*kind,&body[payload.clone()])?;}
++        for (kind,_,payload) in &fields {validate_fragment_layout(*kind,&body[payload.clone()],sample_limit)?;}
+         if fields.iter().filter(|x| x.0 == *b"tfdt").count() != 1
+             || fields.iter().filter(|x| x.0 == *b"tfhd").count() != 1 {
+             return Err(Error::InvalidBox);
+@@ -816,3 +841,41 @@
+   }
+  }
+ }
++
++#[cfg(test)]
++mod fragment_layout_tests {
++ use super::*;
++ fn payload(version:u8,flags:u32,count:u32,len:usize)->Vec<u8>{
++  let mut p=vec![0;len];p[..4].copy_from_slice(&((u32::from(version)<<24)|flags).to_be_bytes());
++  if len>=8 {p[4..8].copy_from_slice(&count.to_be_bytes());}p
++ }
++ #[test]
++ fn fixed_headers_and_each_optional_tfhd_field_have_exact_sizes() {
++  for(kind,version,len)in[(*b"mfhd",0,8),(*b"tfdt",0,8),(*b"tfdt",1,12)]{
++   assert_eq!(validate_fragment_layout(kind,&payload(version,0,0,len),64),Ok(()));
++   assert_eq!(validate_fragment_layout(kind,&payload(version,0,0,len+1),64),Err(Error::InvalidBox));
++   assert_eq!(validate_fragment_layout(kind,&payload(version,0,0,len-1),64),Err(Error::Truncated));
++  }
++  for bits in 0u32..32 {
++   let mut flags=0;let mut len=8;
++   for(i,bit)in[1,2,8,16,32].into_iter().enumerate(){if bits&(1<<i)!=0{flags|=bit;len+=if bit==1{8}else{4};}}
++   for modifier in[0,0x010000,0x020000,0x030000] {
++    assert_eq!(validate_fragment_layout(*b"tfhd",&payload(0,flags|modifier,1,len),64),Ok(()));
++    assert_eq!(validate_fragment_layout(*b"tfhd",&payload(0,flags|modifier,1,len+1),64),Err(Error::InvalidBox));
++    assert_eq!(validate_fragment_layout(*b"tfhd",&payload(0,flags|modifier,1,len-1),64),Err(Error::Truncated));
++   }
++  }
++ }
++ #[test]
++ fn all_trun_widths_and_optional_fields_are_bounded_before_decode() {
++  for bits in 0u32..64 {let mut flags=0;let mut fixed=8;let mut width=0;
++   for(i,bit)in[1,4,0x100,0x200,0x400,0x800].into_iter().enumerate(){if bits&(1<<i)!=0{flags|=bit;if i<2{fixed+=4}else{width+=4};}}
++   for count in[0,1,3] {for version in[0,1]{let len=fixed+width*count;
++    assert_eq!(validate_fragment_layout(*b"trun",&payload(version,flags,count as u32,len),64),Ok(()));
++    assert_eq!(validate_fragment_layout(*b"trun",&payload(version,flags,count as u32,len+1),64),Err(Error::InvalidBox));
++    assert_eq!(validate_fragment_layout(*b"trun",&payload(version,flags,count as u32,len-1),64),Err(Error::Truncated));
++   }}
++  }
++  assert_eq!(validate_fragment_layout(*b"trun",&payload(0,0,u32::MAX,8),64),Err(Error::Quota));
++ }
++}
+--- a/components/media/backends/android/hosttest/tests/mse_fixture.rs
++++ b/components/media/backends/android/hosttest/tests/mse_fixture.rs
+@@ -1192,3 +1192,38 @@
+   let good=d.media(&media).unwrap();assert!(!good.is_empty());assert!(good[0].codec_config.is_some(),"rejection cannot consume first config");assert_eq!(good[0].pts_us,0);
+  }
+ }
++
++#[test]
++fn reserved_fragment_flags_reject_without_consuming_first_config() {
++ use servo_media_android_hosttest::mse_demux::Error;
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);
++ for kind in [*b"mfhd",*b"tfhd",*b"tfdt",*b"trun"] {
++  let mut bad=media.clone();let pos=bad.windows(4).position(|b|b==kind).unwrap()+5;bad[pos]|=0x80;
++  let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert_eq!(d.media_complete(&bad),Err(Error::UnsupportedLayout));assert!(matches!(d.media(&bad),Err(Error::UnsupportedLayout)));
++  let good=d.media(&media).unwrap();assert!(!good.is_empty());assert!(good[0].codec_config.is_some());assert_eq!(good[0].pts_us,0);
++ }
++}
++
++#[test]
++fn fragment_field_padding_is_not_silently_swallowed() {
++ use servo_media_android_hosttest::mse_demux::Error;
++ fn pad_box(b:&[u8],kind:&[u8;4])->Vec<u8>{
++  let mut out=b[..8].to_vec();
++  if &b[4..8]==b"moof" || &b[4..8]==b"traf" {
++   let mut pos=8;while pos<b.len(){let len=u32::from_be_bytes(b[pos..pos+4].try_into().unwrap())as usize;out.extend(pad_box(&b[pos..pos+len],kind));pos+=len;}
++  }else{out.extend_from_slice(&b[8..]);if &b[4..8]==kind{out.push(0);}}
++  let len=out.len()as u32;out[..4].copy_from_slice(&len.to_be_bytes());out
++ }
++ let bs=boxes();let init:Vec<u8>=bs.iter().filter(|b|&b[4..8]==b"ftyp"||&b[4..8]==b"moov").flatten().copied().collect();
++ let pair=bs.windows(2).find(|b|&b[0][4..8]==b"moof"&&&b[1][4..8]==b"mdat").unwrap();
++ let mut media=pair[0].clone();media.extend_from_slice(&pair[1]);
++ for kind in [*b"mfhd",*b"tfhd",*b"tfdt",*b"trun"] {
++  let mut bad=pad_box(&pair[0],&kind);assert_eq!(bad.len(),pair[0].len()+1);
++  // Keep the referenced mdat sample correct; only the extra field byte is bad.
++  let trun=bad.windows(4).position(|b|b==b"trun").unwrap();let pos=trun+12;
++  let offset=i32::from_be_bytes(bad[pos..pos+4].try_into().unwrap());bad[pos..pos+4].copy_from_slice(&(offset+1).to_be_bytes());bad.extend_from_slice(&pair[1]);
++  let mut d=Demux::new(1<<20,64);d.init(&init).unwrap();assert_eq!(d.media_complete(&bad),Err(Error::InvalidBox));assert!(matches!(d.media(&bad),Err(Error::InvalidBox)));
++  let good=d.media(&media).unwrap();assert!(!good.is_empty());assert!(good[0].codec_config.is_some());
++ }
++}
