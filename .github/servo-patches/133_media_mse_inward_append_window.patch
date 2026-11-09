@@ -1,0 +1,79 @@
+diff --git a/components/media/backends/android/android_impl/mse_player.rs b/components/media/backends/android/android_impl/mse_player.rs
+--- a/components/media/backends/android/android_impl/mse_player.rs
++++ b/components/media/backends/android/android_impl/mse_player.rs
+@@ -172,6 +172,24 @@
+     } else {
+         (end * 1e6).ceil() as i64
+     })
++}
++// Kept separate from timestampOffset conversion: a window filters whole
++// frames, while the offset translates timestamps.
++fn append_window_us(window: Range<f64>) -> Result<Range<i64>, PlayerError> {
++    let convert=|value:f64,start:bool| {
++        let micros=value*1e6;
++        if !micros.is_finite() || micros<0.0 || micros>=i64::MAX as f64 {
++            Err(error())
++        } else {Ok(if start {micros.ceil()}else{micros.floor()} as i64)}
++    };
++    // start <= integer frame PTS, integer frame end <= end. Round inward
++    // so fractional boundaries cannot admit out-of-window coded frames.
++    // The private microsecond API rejects intervals with no representable
++    // positive-duration frame; this is not full submicrosecond support.
++    let start=convert(window.start,true)?;
++    let end=if window.end==f64::INFINITY {i64::MAX}else{convert(window.end,false)?};
++    if end<=start {return Err(error());}
++    Ok(start..end)
+ }
+ impl AndroidAppendPlayer {
+     pub fn new(
+@@ -982,15 +1000,7 @@
+             }
+         }
+         let offset_us = micros(offset).ok_or_else(error)?;
+-        let start = micros(window.start).ok_or_else(error)?;
+-        let end = if window.end == f64::INFINITY {
+-            i64::MAX
+-        } else {
+-            micros(window.end).ok_or_else(error)?
+-        };
+-        if start < 0 || end <= start {
+-            return Err(error());
+-        }
++        let window=append_window_us(window)?;
+         let s = self.state.lock().unwrap();
+         if s.stopped || s.buffers.get(&id).is_none_or(|b| b.updating) {
+             return Err(error());
+@@ -998,7 +1008,7 @@
+         self.command(Command::Options {
+             buffer_id: id,
+             offset_us,
+-            window: start..end,
++            window,
+         })
+     }
+     fn append_parsing_media_segment(&self, id: u32) -> bool {
+@@ -2008,3 +2018,24 @@
+     }
+ 
+ }
++
++#[cfg(test)]
++mod append_window_quantization_tests {
++ use super::*;
++ #[test]
++ fn fractional_start_never_retains_a_frame_beginning_below_the_window() {
++  let w=append_window_us(0.1e-6..10e-6).unwrap();assert_eq!(w,1..10);
++  assert!(!(0>=w.start && 1<=w.end));assert!(1>=w.start && 2<=w.end);
++ }
++ #[test]
++ fn fractional_end_never_retains_a_frame_ending_above_the_window() {
++  let w=append_window_us(0.0..1.9e-6).unwrap();assert_eq!(w,0..1);
++  assert!(!(0>=w.start && 2<=w.end));assert!(0>=w.start && 1<=w.end);
++ }
++ #[test]
++ fn exact_and_infinite_windows_remain_supported_and_unrepresentable_ranges_reject() {
++  assert_eq!(append_window_us(1.0..2.0).unwrap(),1_000_000..2_000_000);
++  assert_eq!(append_window_us(0.0..f64::INFINITY).unwrap(),0..i64::MAX);
++  for w in [-0.1e-6..1.0,0.0..f64::NAN,f64::NAN..1.0,1.0..0.0,0.1e-6..0.9e-6] {assert!(append_window_us(w).is_err());}
++ }
++}
